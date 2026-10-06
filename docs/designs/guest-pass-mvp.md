@@ -97,7 +97,7 @@ install.sh                      copies units, creates the state directories, dis
 
 - The owner starts the model by hand with sparkrun and `templates/pair.yaml`. Model start is not a `pass` command in this build. The exact sparkrun command comes from its documentation at build time.
 - The API port of the model server binds to 127.0.0.1 only. The gateway is on the same host. The ports between the two units use the QSFP interface only. If the recipe cannot set these bind addresses, `firewall/rules.sh` blocks the ports on all other addresses. The second unit gets the same rules through `install.sh --second-unit`, and one boot unit loads them at each start of that unit.
-- `pass` reads two fields from the template: the model name and the endpoint port. It uses them for the health check and for the pass text.
+- `pass` reads two fields from the template: the model name and the endpoint port. It uses them for the health check and for the pass text. Build phase 1 does not read the template, because its schema is known only after milestone 1: the port comes from `MODEL_PORT` in the settings file, and the model name comes from the answer of `/v1/models`.
 
 ### The gateway
 
@@ -133,12 +133,12 @@ install.sh                      copies units, creates the state directories, dis
 
 1. Validate the inputs before any state is written. The name must match `^[a-z][a-z0-9-]{0,30}$`. The key file must have exactly one non-empty line, that line must start with a public key type (for example `ssh-ed25519`, `ssh-rsa`, or `ecdsa-sha2-`), and `ssh-keygen -l -f` must accept it. A private key file is thus refused. Check that the model endpoint is healthy and that no lease exists. Check that the state filesystem has free space for the home image plus a reserve of 5 GB, and refuse if not (eng review D11; build phase 2, with the home image). Run `firewall/rules.sh`.
 2. Write the lease file with the absolute deadline.
-3. Create the end timer for that deadline: a transient systemd timer with a unique name (it includes the deadline), `AccuracySec=1s`, that calls `pass revoke <name>`. Nothing is handed out before this step.
+3. Create the end timer for that deadline: a transient systemd timer with a unique name (it includes the deadline), `AccuracySec=1s`, that calls `pass revoke <name>`. The timer has two triggers, the calendar time and the monotonic time to the deadline (`--on-active`), so a backward clock step cannot delay the end (ship review, 2026-10-06). Nothing is handed out before this step.
 4. Make a random token. It is not active yet.
 5. Create a fixed-size ext4 image file, fully allocated at this step (`fallocate`, not a sparse file), and mount it on the host at `/var/lib/sparkpass/mnt/<name>` through a loop device. Write `authorized_keys`, the host key of this lease, and the profile file into it (see "State and secrets").
 6. Start the workspace container (see "Workspace boundary") with the home mount and with `--dns` set to two public resolvers. Publish its SSH port only on the bind address and port from the settings file.
 7. Activate the token: write it to the token file and reload the gateway. The model server is not touched.
-8. Self-check (eng review D5): send one request with the new token to `/v1/models` through the public listener. Then send the same request with no token; it must get 401. (Owner decision of 2026-10-06, after the build review: without the second request, a gateway that does not import the token file passes the check and is open to all.) In build phase 2, also send one through the workspace listener, and check that the published SSH port answers with the host key of this lease. A failed check runs revoke and exits with a non-zero code.
+8. Self-check (eng review D5): send one request with the new token to `/v1/models` through the public listener. Then send the same request with a wrong token; it must get 401. (Owner decisions of 2026-10-06: without the second request, a gateway that does not import the token file passes the check and is open to all; a wrong token, not a missing header, also catches a rule that checks only that a header exists.) In build phase 2, also send one through the workspace listener, and check that the published SSH port answers with the host key of this lease. A failed check runs revoke and exits with a non-zero code.
 9. Print the pass: public endpoint, key, SSH command, the fingerprint of the SSH host key, deadline, model name, and the rules (erase rule, failure rule, acceptable use).
 
 If a step after step 2 fails, grant runs revoke for that lease and exits with a non-zero code.
@@ -147,16 +147,16 @@ If a step after step 2 fails, grant runs revoke for that lease and exits with a 
 
 Three callers use revoke: the owner, the end timer, and reconcile. Revoke is idempotent. It cuts access first and erases second:
 
-1. Stop the end timer of that lease.
-2. Write the deny-all rule to the token file.
-3. Run `systemctl try-restart caddy`. This closes each open connection after the 2-second grace period. It does nothing if Caddy is not active, for example at boot. Fail-closed rule (eng review D7): if the deny-all write in step 2 failed, revoke stops Caddy and does not restart it, and it marks the lease `REVOKE-FAILED`.
+1. Write the deny-all rule to the token file.
+2. Run `systemctl try-restart caddy`. This closes each open connection after the 2-second grace period. It does nothing if Caddy is not active, for example at boot. Fail-closed rule (eng review D7): if the deny-all write in step 1 failed, revoke stops Caddy and does not restart it, and it marks the lease `REVOKE-FAILED`.
+3. Stop the end timer of that lease. (Order changed in the ship review of 2026-10-06: the access cut is first in every caller, because the timer stop can take two commands.)
 4. Remove the workspace container with a kill (`docker rm -f`). A graceful stop has no value, because the data is erased in any case. This ends each SSH session and removes the guest's key.
 5. Unmount and delete the home image.
 6. Write the end time to the lease record, move the record to `/var/lib/sparkpass/history/`, and delete the lease file.
 
 Revoke continues past a failed step. It deletes the lease file only if each step succeeded. If not, it marks the lease `REVOKE-FAILED`, exits with a non-zero code, and writes to the system journal. The retry timer runs reconcile each 5 minutes, and reconcile runs revoke again. `pass list` shows the `REVOKE-FAILED` state.
 
-Order with the lock (eng review D8): steps 2 and 3 run first, before revoke takes the lock. They only close the gateway, so they are safe at any time. Steps 1, 4, 5, and 6 run under the lock. After revoke has the lock, it reads the token file again. If the file is not the deny-all rule (a grant wrote a token in the meantime), revoke repeats steps 2 and 3.
+Order with the lock (eng review D8): steps 1 and 2 run first, before revoke takes the lock. They only close the gateway, so they are safe at any time. Steps 3, 4, 5, and 6 run under the lock. After revoke has the lock, it reads the token file again. If the file is not the deny-all rule (a grant wrote a token in the meantime), revoke repeats steps 1 and 2.
 
 Timing: an open stream ends not later than 15 seconds after the deadline in all cases. An open SSH session ends within 15 seconds in the normal case, and within about 60 seconds when a different command holds the lock.
 

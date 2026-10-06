@@ -1,0 +1,21 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test:
+    # Same architecture as the DGX Spark, so the release binary runs on the pair.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: python3 tests/stub-model.py --self-test
+      - run: git ls-files '*.sh' | xargs -r shellcheck
+      # The deployable binary comes only from a push to main, never from a pull request.
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo build --locked --release
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sparkpass-aarch64-linux
+          path: target/release/sparkpass
