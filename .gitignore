@@ -6,3 +6,6 @@ token.caddy
 /leases/
 /history/
 *.img
+
+# QA evidence of /qa and /ship runs
+/.gstack/qa-reports/
