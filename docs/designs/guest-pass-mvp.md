@@ -90,7 +90,7 @@ install.sh                      copies units, creates the state directories, dis
 - Lease file: `/var/lib/sparkpass/leases/<name>.json`, owner root, mode 0600. It holds the name, the start time, the absolute deadline, and the revoke state. The lease file is the single source of truth. The tool writes it in one atomic step (a temporary file, then a rename). If reconcile cannot read a lease file, it stops Caddy and the workspace, writes to the journal, and exits with a non-zero code (eng review D7).
 - Token file: `/etc/sparkpass/token.caddy`, owner root, group caddy, mode 0640. It is outside the repository. The tracked Caddyfile only imports it.
 - With no active lease, the token file holds a deny-all rule: the gateway answers 401 to each request.
-- Settings file: `/etc/sparkpass/config`. It holds the public host name, the bind address and port for guest SSH, and the workspace limits. The owner fills it after milestone 1.
+- Settings file: `/etc/sparkpass/config`. It holds the public host name, the bind address and port for guest SSH, and the workspace limits. The owner fills it after milestone 1. Build phase 1 reads three keys: `PUBLIC_URL` (https only), `MODEL_PORT`, and `GATEWAY_CHECK_ADDRESS` (an IP address of the public listener on this host, for the gateway check of reconcile; without it, reconcile keeps Caddy stopped and grant refuses). (TODO branch of 2026-10-06)
 - There is no SSH certificate authority. Before the workspace starts, `pass grant` writes three things into the home image of that lease: `~/.ssh/authorized_keys` with the guest's public key (with the owner and mode that sshd accepts), one SSH host key for this lease, and one profile file that exports the base URL, the API key, `TMPDIR`, and the pip cache path. A new SSH session thus has these settings with no manual setup. Revoke deletes all three with the image.
 
 ### The model and the template
@@ -117,28 +117,30 @@ install.sh                      copies units, creates the state directories, dis
 - The workspace container has restart policy `no`. Only `pass grant` and `pass reconcile` start it.
 - `pass-reconcile.service` is a oneshot unit that becomes inactive after each run, so the retry timer can start it again. It is ordered after `docker.service` and `time-sync.target`.
 - `install.sh` enables the wait service that matches the time daemon of DGX OS (`systemd-time-wait-sync.service` or `chrony-wait.service`) and stops with an error if none exists. `time-sync.target` then waits for a real clock. With no internet at boot, reconcile waits and the gateway stays closed.
-- Time limits: `pass-reconcile.service` and the service of the end timer have `TimeoutStartSec=120`. Each Docker, mount, and unmount command runs with a time limit of 10 seconds. The command-runner interface applies the limit in one place. systemd thus stops a run that hangs, and the lock opens. A revoke that systemd stops has a deadline in the past, so the next reconcile runs it again.
+- Time limits: `pass-reconcile.service` and the service of the end timer have `TimeoutStartSec=120`. Each system command (for example systemctl, systemd-run, curl, `firewall/rules.sh`, Docker, mount, and unmount) runs with a time limit of 10 seconds. The command-runner interface applies the limit in one place. systemd thus stops a run that hangs, and the lock opens. A revoke that systemd stops has a deadline in the past, so the next reconcile runs it again. Budget: with one lease, reconcile runs at most 11 commands (110 seconds) plus the wait for the lock. If systemd stops a run between the start of Caddy and the check with a wrong key, Caddy runs without that check until the next run, 5 minutes later.
 - `firewall/rules.sh` keeps its rules in its own chains and replaces each chain in one atomic `iptables-restore` operation. It never removes a rule while a workspace runs. The jump to these chains is the first rule in `DOCKER-USER` and in `INPUT`.
 
 `pass reconcile` does these steps in this order:
 
 1. Run `firewall/rules.sh`. If the rules do not load: stop the workspace container if it runs, stop Caddy, write to the journal, and exit with a non-zero code. This rule applies at boot and in each run during an active lease. The next run with no failure starts them again.
-2. For each lease with a deadline in the past or with state `REVOKE-FAILED`: run revoke.
-3. For each lease with a deadline in the future: attach the home image again if it is not mounted, create the end timer if it does not exist (a reboot removes transient timers), and start the workspace if it does not run. If the image does not attach, the workspace does not start.
-4. If no step failed, start Caddy (no effect if it runs). If step 2 or step 3 failed, do not start Caddy, but do not stop a Caddy that runs: an overdue lease already has the deny-all rule, and an active lease keeps its API access while its workspace is down. Exception: an unreadable lease file stops Caddy and the workspace (see "State and secrets").
+2. For each lease with a deadline in the past or with state `REVOKE-FAILED`: run revoke. Then the token-file gate runs, also after a failed step: a rule with no lease closes the gateway, and an active lease whose token file is not its complete rule is revoked, because its key is dead. Then read the settings file; if it is missing or bad, stop Caddy and exit with a non-zero code.
+3. For each lease with a deadline in the future: attach the home image again if it is not mounted, create the end timer if it does not exist (a reboot removes transient timers; its monotonic time counts from a clock read right before it, and a deadline that passed in the meantime gets no timer, because step 4 revokes that lease; the clock of one run never goes back, so a backward step cannot undo that), and start the workspace if it does not run. If the image does not attach, the workspace does not start.
+4. Read the clock again and revoke each lease that became overdue during the run. If no step failed, start Caddy (no effect if it runs), then send the two requests with a wrong key of the grant self-check (a GET of the model list and a POST to the route of the model) to `GATEWAY_CHECK_ADDRESS`; any answer other than 401, a failed start, or a failed request stops Caddy (fail closed). If step 2 or step 3 failed, do not start Caddy, but do not stop a Caddy that runs: an overdue lease already has the deny-all rule, and an active lease keeps its API access while its workspace is down. Exceptions: an unreadable lease file stops Caddy and the workspace (see "State and secrets"), and a missing or bad settings file stops Caddy (end of step 2), also after a failed revoke.
+
+All three commands read the clock after they take the lock. (TODO branch of 2026-10-06)
 
 ### pass grant
 
 `pass grant <name> --ttl 24h --pubkey <file>`:
 
-1. Validate the inputs before any state is written. The name must match `^[a-z][a-z0-9-]{0,30}$`. The key file must have exactly one non-empty line, that line must start with a public key type (for example `ssh-ed25519`, `ssh-rsa`, or `ecdsa-sha2-`), and `ssh-keygen -l -f` must accept it. A private key file is thus refused. Check that the model endpoint is healthy and that no lease exists. Check that the state filesystem has free space for the home image plus a reserve of 5 GB, and refuse if not (eng review D11; build phase 2, with the home image). Run `firewall/rules.sh`.
+1. Validate the inputs before any state is written. The name must match `^[a-z][a-z0-9-]{0,30}$`. The key file must have exactly one non-empty line, that line must start with a public key type (for example `ssh-ed25519`, `ssh-rsa`, or `ecdsa-sha2-`), and `ssh-keygen -l -f` must accept it. A private key file is thus refused. Check that the model endpoint is healthy and that no lease exists. Check that the state filesystem has free space for the home image plus a reserve of 5 GB, and refuse if not (eng review D11; build phase 2, with the home image). Run `firewall/rules.sh`. Also check that Caddy runs (only reconcile starts it) and that `/usr/local/bin/sparkpass revoke <name> --deadline 0` succeeds, because the end timer calls that binary with that argument form: an old build refuses `--deadline`, and the new build does nothing for deadline 0 (no lease has it) and takes no lock. Before that call, grant closes a token file that is not the deny-all rule (with no lease, it is a key with no end or a cut file), as the reconcile gate does, so the call is a pure no-op.
 2. Write the lease file with the absolute deadline.
-3. Create the end timer for that deadline: a transient systemd timer with a unique name (it includes the deadline), `AccuracySec=1s`, that calls `pass revoke <name>`. The timer has two triggers, the calendar time and the monotonic time to the deadline (`--on-active`), so a backward clock step cannot delay the end (ship review, 2026-10-06). Nothing is handed out before this step.
+3. Create the end timer for that deadline: a transient systemd timer with a unique name (it includes the deadline), `AccuracySec=1s`, that calls `pass revoke <name> --deadline <deadline>`. The timer has two triggers, the calendar time and the monotonic time to the deadline (`--on-active`), so a backward clock step cannot delay the end (ship review, 2026-10-06). Nothing is handed out before this step. With the deadline in the call, a delayed timer of an older lease never revokes a new lease of the same name. The deadline comes from one clock read, after the lock and after the checks of step 1 (up to 50 seconds): it is that time plus the TTL. (After a failed step, the history record ends at a second read, at the revoke.) So neither the lock wait nor the checks shorten the TTL, and the monotonic time equals the TTL, also after a backward clock step. A TTL under 60 seconds (the time of steps 3 to 8: six commands) is a usage error, because the key must not go live after its end time. A sync stall or a forward clock step can still pass the deadline before step 7, so grant reads the clock again before it activates the token and refuses if the deadline has passed (a check that looks forward only). A window stays after that check: if a sync stall in the token write lasts past the deadline and the end timer closes the gateway first, grant writes the key over the deny-all rule, and the end timer cuts it only after grant releases the lock (the rest of steps 7 and 8, about 50 seconds).
 4. Make a random token. It is not active yet.
 5. Create a fixed-size ext4 image file, fully allocated at this step (`fallocate`, not a sparse file), and mount it on the host at `/var/lib/sparkpass/mnt/<name>` through a loop device. Write `authorized_keys`, the host key of this lease, and the profile file into it (see "State and secrets").
 6. Start the workspace container (see "Workspace boundary") with the home mount and with `--dns` set to two public resolvers. Publish its SSH port only on the bind address and port from the settings file.
 7. Activate the token: write it to the token file and reload the gateway. The model server is not touched.
-8. Self-check (eng review D5): send one request with the new token to `/v1/models` through the public listener. Then send the same request with a wrong token; it must get 401. (Owner decisions of 2026-10-06: without the second request, a gateway that does not import the token file passes the check and is open to all; a wrong token, not a missing header, also catches a rule that checks only that a header exists.) In build phase 2, also send one through the workspace listener, and check that the published SSH port answers with the host key of this lease. A failed check runs revoke and exits with a non-zero code.
+8. Self-check (eng review D5): send one request with the new token to `/v1/models` through the public listener. Then send the same request with a wrong token; it must get 401. (Owner decisions of 2026-10-06: without the second request, a gateway that does not import the token file passes the check and is open to all; a wrong token, not a missing header, also catches a rule that checks only that a header exists.) In build phase 2, also send one through the workspace listener, and check that the published SSH port answers with the host key of this lease. The request with the new token must get HTTP 200; the requests with a wrong token (GET `/v1/models` and POST `/v1/chat/completions`) must get 401. A failed check (another answer, or a request that fails) leaves no proof that the gateway refuses a wrong token, and a revoke cannot close a gateway that ignores the token file: grant stops Caddy, runs revoke, and exits with a non-zero code. The next reconcile starts Caddy with its own check.
 9. Print the pass: public endpoint, key, SSH command, the fingerprint of the SSH host key, deadline, model name, and the rules (erase rule, failure rule, acceptable use).
 
 If a step after step 2 fails, grant runs revoke for that lease and exits with a non-zero code.
@@ -148,7 +150,7 @@ If a step after step 2 fails, grant runs revoke for that lease and exits with a 
 Three callers use revoke: the owner, the end timer, and reconcile. Revoke is idempotent. It cuts access first and erases second:
 
 1. Write the deny-all rule to the token file.
-2. Run `systemctl try-restart caddy`. This closes each open connection after the 2-second grace period. It does nothing if Caddy is not active, for example at boot. Fail-closed rule (eng review D7): if the deny-all write in step 1 failed, revoke stops Caddy and does not restart it, and it marks the lease `REVOKE-FAILED`.
+2. Run `systemctl try-restart caddy`. This closes each open connection after the 2-second grace period. It does nothing if Caddy is not active, for example at boot. Fail-closed rule (eng review D7): if the deny-all write in step 1 failed, revoke stops Caddy and does not restart it, and it marks the lease `REVOKE-FAILED`. If the restart fails, revoke also stops Caddy.
 3. Stop the end timer of that lease. (Order changed in the ship review of 2026-10-06: the access cut is first in every caller, because the timer stop can take two commands.)
 4. Remove the workspace container with a kill (`docker rm -f`). A graceful stop has no value, because the data is erased in any case. This ends each SSH session and removes the guest's key.
 5. Unmount and delete the home image.
@@ -156,9 +158,9 @@ Three callers use revoke: the owner, the end timer, and reconcile. Revoke is ide
 
 Revoke continues past a failed step. It deletes the lease file only if each step succeeded. If not, it marks the lease `REVOKE-FAILED`, exits with a non-zero code, and writes to the system journal. The retry timer runs reconcile each 5 minutes, and reconcile runs revoke again. `pass list` shows the `REVOKE-FAILED` state.
 
-Order with the lock (eng review D8): steps 1 and 2 run first, before revoke takes the lock. They only close the gateway, so they are safe at any time. Steps 3, 4, 5, and 6 run under the lock. After revoke has the lock, it reads the token file again. If the file is not the deny-all rule (a grant wrote a token in the meantime), revoke repeats steps 1 and 2.
+Order with the lock (eng review D8): steps 1 and 2 run first, before revoke takes the lock. They only close the gateway, so they are safe at any time. Steps 3, 4, 5, and 6 run under the lock. After revoke has the lock, it reads the token file again. If the close before the lock failed, if the file is not the deny-all rule (a grant wrote a token in the meantime), or if the lease is `REVOKE-FAILED` (an earlier close can have failed), revoke repeats steps 1 and 2. Steps 1 and 2 before the lock do not run when the token file is the complete rule of a different lease, because that is the key of a new grant. If the lease file is missing but the token file holds the complete rule of this name, that key has no end: revoke closes the gateway and exits. A call with `--deadline` (the end timer) does nothing, before the lock and again under it, when its lease has a different deadline, or when the lease file is missing and the token file holds no rule of this name: it is the timer of an older lease.
 
-Timing: an open stream ends not later than 15 seconds after the deadline in all cases. An open SSH session ends within 15 seconds in the normal case, and within about 60 seconds when a different command holds the lock.
+Timing: an open stream ends not later than 15 seconds after the deadline in all cases, with two exceptions: a backward clock step during reconcile steps 1 to 3 can add their time (at most about 20 seconds) to an end timer that reconcile creates again; and a sync stall in the token write of grant step 7 that lasts past the deadline can keep the key live for the rest of steps 7 and 8 (see grant step 3). An open SSH session ends within 15 seconds in the normal case, and within about 60 seconds when a different command holds the lock.
 
 ### Workspace boundary
 
@@ -1198,41 +1200,55 @@ Lease states:
 
 ```
 flock
- 1 validate inputs, model health, no lease, free space (D11), firewall rules
+ 1 validate inputs, model health, gateway active, no lease, free space (D11), firewall rules;
+   a token file that is not deny-all (a key with no lease) ──▶ close the gateway; end-timer call;
+   then read the clock: deadline = now + TTL (main refuses a TTL shorter than steps 3 to 8, 60 s)
  2 lease file (atomic write)          ── from here, each failure runs revoke
  3 end timer for the deadline
  4 token (not active)
  5 home image (fallocate, ext4)       [build phase 2]
  6 workspace container                [build phase 2]
  7 activate the token, reload Caddy
- 8 self-check (D5) ── fail ──▶ revoke, exit non-zero
+ 8 self-check (D5): 200 with the token, 401 with a wrong token (GET and POST)
+   ── fail ──▶ stop Caddy, revoke, exit non-zero
  9 print the pass
 ```
 
 `pass revoke` (callers: the owner, the end timer, reconcile):
 
 ```
- [no lock] write deny-all to the token file ── fail ──▶ stop Caddy, mark REVOKE-FAILED (D7)
- [no lock] systemctl try-restart caddy          (open streams close after 2 s)
+ [no lock] end timer of an older lease (no lease file and no rule of this name, or a new deadline) ──▶ nothing to do
+ [no lock] no lease file, but the rule of this name in the token file ──▶ close the gateway, exit
+           (no lease file and no rule ──▶ "no lease", exit)
+ [no lock] write deny-all to the token file ── fail ──▶ stop Caddy (D7)
+           (not when the file is the rule of a different lease: the key of a new grant)
+ [no lock] systemctl try-restart caddy ── fail ──▶ stop Caddy    (open streams close after 2 s)
  take flock                                      (each command of the holder has a 10 s limit)
-   token file is not deny-all? ──▶ repeat the two steps above (D8)
+   end timer of an older lease? ──▶ nothing to do
+   close before the lock failed, token file is not deny-all, or lease is REVOKE-FAILED?
+     ──▶ repeat the two steps above (D8)
    stop the end timer
    docker rm -f workspace                        (SSH sessions end)
    unmount and delete the home image
    each step ok? ── yes ──▶ record to history/, delete the lease file
-                └── no ───▶ REVOKE-FAILED, exit non-zero, journal
+                └── no ───▶ mark REVOKE-FAILED, exit non-zero, journal
 ```
 
 `pass reconcile` (at boot and each 5 minutes):
 
 ```
-flock
+flock, then read the clock
  1 firewall rules ── fail ──▶ stop workspace, stop Caddy, exit non-zero
    unreadable lease file ──▶ stop Caddy and workspace, exit non-zero (D7)
  2 lease overdue or REVOKE-FAILED ──▶ revoke
- 3 lease active ──▶ attach image, create end timer, start workspace
- 4 no failure ──▶ start Caddy
-   failure in 2 or 3 ──▶ do not start Caddy; a Caddy that runs stays
+   token file not deny-all and no lease ──▶ close the gateway
+   token file not the rule of the active lease ──▶ revoke that lease (its key is dead)
+   settings file missing or bad ──▶ stop Caddy, exit non-zero
+ 3 lease still active ──▶ attach image, create end timer, start workspace
+ 4 read the clock again, revoke each lease that is overdue now
+   no failure ──▶ start Caddy ── fail ──▶ stop Caddy, exit non-zero
+   a wrong token (GET and POST) to the public listener at GATEWAY_CHECK_ADDRESS gets no 401 ──▶ stop Caddy, exit non-zero (D5)
+   any other failure in 2, 3, or 4 ──▶ do not start Caddy; a Caddy that runs stays
 ```
 
 Network:
@@ -1270,7 +1286,7 @@ Inline diagrams: the revoke module and the reconcile module of the crate get the
 | Boot | clock not set, no network | manual check, one time | `time-sync.target` wait; gateway stays closed | guest: connection refused until the clock is set |
 | Reconcile | firewall rules do not load | unit test | stop workspace and Caddy | guest: connection refused; owner: journal |
 | Reconcile | lease file unreadable | unit test (D7) | stop Caddy and workspace | guest: connection refused; owner: journal |
-| Grant | token not active or SSH port closed | unit test (D5) | self-check fails, revoke | owner: clear error, no pass printed |
+| Grant | token not active or SSH port closed | unit test (D5) | self-check fails, stop Caddy, revoke | owner: clear error, no pass printed |
 | Grant | disk nearly full | unit test (D11) | grant refuses, no state written | owner: clear error |
 | Serving | model server down or frozen | `tests/expiry.sh --stub` (D6) | 503, or timeout after 300 s | guest: clear error; owner: not told (TODO: notification) |
 | Serving | heavy load freezes a unit | load test in milestone 1 (D9) | template limits, request body limit | guest: errors until a manual power cycle |
