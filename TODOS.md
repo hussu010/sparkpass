@@ -2,138 +2,6 @@
 
 ## Pass tool
 
-### Read the clock again after the lock
-
-**What:** In `reconcile` (and in `grant`), read the system clock after `paths.lock()` returns, and use that value to sort the leases into overdue and active, and to compute `--on-active` and the deadline.
-
-**Why:** `main` reads the clock before the lock wait. After a wait of up to about 2 minutes, a lease whose deadline passed during the wait counts as active: reconcile creates a timer from the stale time and starts Caddy, which serves an expired key until the timer fires. In grant, the same wait shortens the guest's TTL.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Codex structured review [P1] at src/reconcile.rs:46-48, Codex adversarial, and the Claude adversarial pass found it independently; the owner chose to land it before the first guest (D10). Today only `main` reads the clock ("Only main reads the system clock" in src/time.rs); the fix needs a clock parameter (for example `now: &dyn Fn() -> u64`) for `grant` and `reconcile`, with a test that advances the clock during the lock wait.
-
-**Effort:** S
-**Priority:** P1 (before the first guest)
-**Depends on:** None
-
-### Grant checks that the end-timer binary exists and runs
-
-**What:** In grant step 1, run `/usr/local/bin/sparkpass list` (through the runner) and refuse the grant if it fails.
-
-**Why:** The end timer always runs `/usr/local/bin/sparkpass revoke <name>`. If the owner runs a build from target/release before install, or the installed file is an old build, the timer fails at the deadline with 203/EXEC, and the key stays live; grant still prints the pass.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Claude adversarial pass, src/lease.rs:178 and src/config.rs:9 (`BINARY`). The owner chose to land it before the first guest (D10). A FakeRunner test covers the refusal.
-
-**Effort:** S
-**Priority:** P1 (before the first guest)
-**Depends on:** None
-
-### The self-check with the real key requires HTTP 200
-
-**What:** Make the first self-check request use `-w %{http_code}` and require `200`, as the wrong-token request does.
-
-**Why:** `curl -f` exits with 0 for a redirect or a 204, so grant can hand out a pass while `/v1/models` does not serve the model.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Codex structured [P2] and Codex adversarial, src/grant.rs:98-99. The owner chose P1 (D10). Combine with the TODO "One curl helper for both self-check requests".
-
-**Effort:** S
-**Priority:** P1 (before the first guest)
-**Depends on:** None
-
-### Correct the old revoke step numbers in four comments
-
-**What:** The deny-all write is revoke step 1, the restart step 2, the timer stop step 3. Correct src/gateway.rs:66-73 (doc and inline comments of `close`), src/revoke.rs:25 (`closed` parameter), src/lease.rs:205 (`stop_end_timer`), src/reconcile.rs:83.
-
-**Why:** The order was changed in the ship review; these comments still describe the old order, in the modules where the step order is the safety property.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): maintainability, cycle 3 (confidence 9). Comments only; no test changes.
-
-**Effort:** S
-**Priority:** P1
-**Depends on:** None
-
-### Make reconcile run the token-file check before step 3
-
-**What:** Run the two token-file checks (a rule with no lease; an active lease whose file is not its rule) directly after the overdue leases are revoked, independent of later failures.
-
-**Why:** When the timer check or `systemd-run` in step 3 fails, reconcile returns early, and an empty or cut token file stays while a running Caddy serves; the check is skipped on each run until step 3 succeeds.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): red team, cycle 3, src/reconcile.rs:69. Test: an active lease with an empty token file and a timer check that hangs; the deny-all write and try-restart still run.
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** None
-
-### Revoke must not trust an earlier cut for a REVOKE-FAILED lease
-
-**What:** In `revoke()`, close the gateway again when the lease state is `revoke-failed`, also when `closed` is true.
-
-**Why:** `closed` proves only this process's own close. A lease that is already REVOKE-FAILED can hold a token that an earlier failed close left live; a revoke with `closed = true` then deletes the lease and the mark, and reconcile never cuts the token.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): red team, cycle 3, src/revoke.rs:89 (confidence 3).
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** None
-
-### Bind a revoke to the lease that it was made for
-
-**What:** Give the end timer the deadline that it was created for (for example an internal `revoke <name> --deadline <unix seconds>`), and make that call a no-op when the lease file has a different deadline. Also make the close before the lock in `revoke <name>` safe against a lease that another revoke and a new grant replaced in the meantime.
-
-**Why:** A delayed end-timer service can revoke a new lease of the same name; and a close before the lock can overwrite a replacement guest's new token. Both fail closed (a guest loses access early), but the owner holds a pass that does not work.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Codex structured [P2] src/lease.rs:178-180 and src/revoke.rs:78-82; the red team reported the timer case in cycles 1 and 2.
-
-**Effort:** M
-**Priority:** P2
-**Depends on:** None
-
-### One history record for each lease, also after a partial commit
-
-**What:** Give a failed lease-file delete its own error text, sync the lease directory after the delete, and make a retried revoke reuse the history record of the first try instead of a new `-N` record.
-
-**Why:** If the directory sync after the history rename fails, or the delete of the lease file fails, the retry writes a second record of the same lease, possibly with a different end time.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Codex adversarial [P2] src/lease.rs:77 and the Claude adversarial pass src/revoke.rs:51-53. Access is not affected.
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** None
-
-### Two test gaps from the cycle-3 review
-
-**What:** (1) A row in `token_file_that_is_not_the_rule_of_the_active_lease_is_closed_before_the_gateway_starts` with a directive after the complete rule (`<rule>respond 200\n`). (2) Pin the `state` and `end` fields of the history record after a retried revoke in `failed_timer_stop_gives_revoke_failed_and_the_gateway_still_closes`.
-
-**Why:** A relaxed `is_rule_of` (`starts_with`) and a change of the record contract pass the suite today.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): testing specialist, cycle 3, src/reconcile.rs:253 and src/revoke.rs:179.
-
-**Effort:** S
-**Priority:** P2
-**Depends on:** None
-
-### Smaller hardening items from the adversarial review
-
-**What:** (1) Use `writeln!` on a locked stdout in `main`; on error, tell the owner that the lease is active with no printed pass and give the revoke command. (2) Make `-q` the first argument of each curl call, so that root's `~/.curlrc` cannot add `--insecure`, `--proxy`, or `-L`. (3) In `revoke <name>`, treat a token file that holds that name's rule as "the lease exists". (4) Send the wrong-token probe also as `POST /v1/chat/completions`. (5) Bound the output that `RealRunner` keeps in memory.
-
-**Why:** Each closes a small failure mode: a panic after a complete grant; a self-check that root's curl config changes; a key that stays live when the lease file is lost; a token rule on only some routes; memory exhaustion by a broken command.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Claude adversarial pass (items 3, 4, 5, 7) and Codex adversarial (unbounded output). src/main.rs:87, src/grant.rs:70/98/108, src/revoke.rs:78, src/runner.rs:108.
-
-**Effort:** M
-**Priority:** P3
-**Depends on:** None
-
-### One curl helper for both self-check requests
-
-**What:** One closure that runs `curl -sS -o /dev/null -m <limit> -w %{http_code} -H "Authorization: Bearer <value>" <url>` and returns the status, for the real key and the wrong key.
-
-**Why:** The two match blocks in `hand_out` repeat the same error handling; one helper is about 6 lines shorter.
-
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): simplification (advisory), src/grant.rs:98. Do it together with "The self-check with the real key requires HTTP 200".
-
-**Effort:** S
-**Priority:** P3
-**Depends on:** None
-
 ### Owner notification
 
 **What:** Send a push message to the owner when a lease becomes `REVOKE-FAILED` or when the model endpoint is down during an active lease.
@@ -158,21 +26,255 @@
 **Priority:** P3
 **Depends on:** Build phase 2 complete (the home image exists).
 
+### Exact end timers in reconcile after a backward clock step
+
+**What:** Count the `--on-active` time of an end timer that reconcile creates again from a monotonic source (for example `std::time::Instant` in the production clock of main.rs), not from the wall clock.
+
+**Why:** A backward clock step during reconcile steps 1 to 3 adds their time (at most about 20 seconds) to the end of such a timer. The design text names this as the one exception to "an open stream ends not later than 15 seconds after the deadline".
+
+**Context:** From the /ship adversarial review of 2026-10-06 (Codex adversarial P2, verified by a skeptic). Grant has no such gap: it reads the clock once, after its checks, and `--on-active` equals the TTL. Reconcile keeps a monotonic wrapper over the injected clock for one run (src/reconcile.rs), so a test clock stays possible.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+### The access cut waits for the sync of the token file
+
+**What:** In `gateway::close`, restart Caddy before the fsync of the deny-all file, or give the sync a time limit.
+
+**Why:** `write_rule` calls `sync_all` before `systemctl try-restart caddy`, and that sync has no time limit. On ext4 a journal commit that carries other dirty data (a model download, guest writes in phase 2) can delay the access cut past the 15-second bound, and a stalled device blocks it in D state, where systemd cannot kill the process.
+
+**Context:** From the /ship adversarial review of 2026-10-06, second round (Claude adversarial, INVESTIGATE); the order existed before branch fix/todos-before-first-guest. The boot gate of reconcile already handles each token-file state after a power cut, so the sync before the restart adds little safety. Decide the durability trade-off first.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+### One retry of the reconcile probe on a network error
+
+**What:** In `check_gateway`, when a wrong-token request fails in curl (exit 7, 28, 35), wait 1 to 2 seconds and send the two requests once more before Caddy stops. An answer other than 401 still stops Caddy at once.
+
+**Why:** One transient failure during an active lease stops the gateway for up to 5 minutes, and the end time of the pass does not move.
+
+**Context:** From the /ship adversarial review of 2026-10-06 (Claude adversarial, INVESTIGATE). Add it only when tests/expiry.sh on the units, with a reboot inside an active lease, shows a probe failure right after the start that passes on the next run. A transport error proves nothing about the token check, so the owner decides.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** The systemd units and tests/expiry.sh on the units.
+
 ## Gateway (Caddyfile step)
 
 ### Fail closed when the gateway does not enforce the token file
 
-**What:** When the wrong-token self-check gets an answer other than 401, stop Caddy (not only revoke), and say in the error that the Caddyfile must be repaired before reconcile. In reconcile, after `systemctl start caddy`, send the same wrong-token request through PUBLIC_URL and stop Caddy on any answer other than 401 (reconcile then reads the settings file and fails closed without it). Write the Caddyfile so that it refuses each request when the import holds no rule.
+**What:** Write the Caddyfile so that it refuses each request when the import holds no rule, and prove it on the units with tests/expiry.sh. Acceptance rules for this step:
+1. Import the token file once, as the first line inside one top-level `route { }` block that holds all the routing (for example `route { import /etc/sparkpass/token.caddy; reverse_proxy /v1/* 127.0.0.1:<MODEL_PORT>; respond 404 }`). A per-route or per-`handle` import leaves other paths of the model server open (`/invocations`, `/tokenize`, `/metrics`, `/v1/completions`) while both wrong-token checks get 401.
+2. The caddy unit starts with `caddy run --environ --config <Caddyfile>`, never with `--resume`, which loads the last autosaved config and not the Caddyfile.
+3. `GATEWAY_CHECK_ADDRESS` reaches the same site block as `PUBLIC_URL` on THIS host: a loopback or a local address, never the other Spark, because its 401 answers would make reconcile trust a local Caddy that is open. Consider a check in `read_settings` (a loopback address, or one that `ip -o addr` lists). Upgrade order: set the key in /etc/sparkpass/config before you install this build, at a time with no active lease. Without it, reconcile keeps Caddy stopped (an active guest loses access) and grant refuses.
+4. The ACME procedure for the first certificate and for a host that was off past the end of its certificate: stop pass-reconcile.timer, start caddy, wait for the certificate, start the timer, run `sparkpass reconcile`. Include first issuance in the tests/expiry.sh proof.
+5. Extend tests/expiry.sh: during an active lease, a wrong token to `/v1/completions`, `/invocations`, `/tokenize`, `/metrics` and a path outside `/v1` gets 401; after a grant and a revoke, the old token gets 401.
 
-**Why:** A gateway that does not import the token file is open to all. Today grant only revokes, which cannot close such a gateway, and reconcile starts Caddy with no proof; a stop alone holds only until the next reconcile, at most 5 minutes.
+**Why:** A gateway that does not import the token file is open to all. The code part is done (see Context), but only the Caddyfile and the unit decide what the gateway enforces.
 
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): security CRITICAL (confidence 6) at src/grant.rs:110 and red team at src/reconcile.rs:92, cycle 3; the 401 probe in reconcile was also proposed in cycle 1 (D7 item 6, skipped then because a public-route outage would stop the gateway every 5 minutes; decide that trade-off with the Caddyfile). The owner chose P1 for the Caddyfile step (D9). Prove the 401 on the units with tests/expiry.sh.
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): security CRITICAL (confidence 6) at src/grant.rs:110 and red team at src/reconcile.rs:92, cycle 3. The code part landed on branch fix/todos-before-first-guest (2026-10-06): grant stops Caddy on any self-check failure, and reconcile sends the same two wrong-token requests after each start through `--connect-to` to `GATEWAY_CHECK_ADDRESS` and stops Caddy on any other answer. Rules 1, 2 and 4 come from the /ship adversarial review of 2026-10-06 (Claude adversarial, Codex adversarial, and a completeness critic), each verified by a skeptic.
 
 **Effort:** M
 **Priority:** P1 (before the first guest)
 **Depends on:** The Caddyfile and the systemd units (plan steps A1 and C1).
 
+### Keep a gateway stopped after proof that it is open
+
+**What:** On a proven answer other than 401 to a wrong token (grant step 8 or the reconcile check), write a marker file under /var/lib/sparkpass. Reconcile does not start Caddy while the marker exists (or while its check fails), and names the file to remove after the Caddyfile repair. A curl failure writes no marker.
+
+**Why:** Today each reconcile after such a stop runs start, check, stop: the gateway is open to all for each check window, every 5 minutes, until the owner repairs the Caddyfile. If `PUBLIC_URL` and `GATEWAY_CHECK_ADDRESS` reach different listeners, reconcile starts a gateway that grant proved open and returns success.
+
+**Context:** From the /ship reviews of 2026-10-06: red team cycle 1, Claude adversarial (its top recommendation), verified by a skeptic in a scratch copy. About 20 code lines and 15 test lines. Write the repair step into the Caddyfile item above.
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+
+### Grant also checks through GATEWAY_CHECK_ADDRESS
+
+**What:** In grant step 1 (or step 8), also send the reconcile check (`--connect-to` to `GATEWAY_CHECK_ADDRESS`) and refuse the grant when it fails.
+
+**Why:** Grant proves the gateway only through `PUBLIC_URL`. With a wrong check address, grant prints a pass, and the next reconcile stops the gateway for the whole lease.
+
+**Context:** From the /ship review of 2026-10-06, red team cycle 1 (confidence 5). It adds two commands to grant: raise `HAND_OUT_TIME` or count them in step 1.
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+
+### Reconcile checks a running Caddy also after a failed step
+
+**What:** When an earlier reconcile step failed, still send the wrong-token check if `systemctl is-active caddy` succeeds, and stop Caddy on an answer other than 401. Keep the rule "no start and no stop" for all other failures.
+
+**Why:** A failure that repeats on each run (for example a REVOKE-FAILED lease whose timer stop fails) stops the only periodic proof of the gateway, and a gateway that answers 200 to a wrong key stays up.
+
+**Context:** From the /ship review of 2026-10-06, red team cycle 2 (confidence 5), at the early return before the start in src/reconcile.rs. It changes the design rule of reconcile step 4.
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+
 ## CI
+
+### Build-provenance attestation for the release binary
+
+**What:** Add `actions/attest-build-provenance` (pinned SHA, `subject-path: target/release/sparkpass`, job permissions `id-token: write` and `attestations: write`), and verify on the unit with `gh attestation verify sparkpass -R hussu010/sparkpass`. Optional: `sha256sum sparkpass | tee sparkpass.sha256`, so that the hash is also in the job log.
+
+**Why:** The sha256 file shares the artifact with the binary: it finds a corrupt download, not a changed artifact.
+
+**Context:** From the /ship adversarial review of 2026-10-06 (Claude adversarial, verified). Do it when the CI binary becomes the install path on the units.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+
+## Completed
+
+### Read the clock again after the lock
+
+**What:** In `reconcile` (and in `grant`), read the system clock after `paths.lock()` returns, and use that value to sort the leases into overdue and active, and to compute `--on-active` and the deadline.
+
+**Why:** `main` reads the clock before the lock wait. After a wait of up to about 2 minutes, a lease whose deadline passed during the wait counts as active: reconcile creates a timer from the stale time and starts Caddy, which serves an expired key until the timer fires. In grant, the same wait shortens the guest's TTL.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Codex structured review [P1] at src/reconcile.rs:46-48, Codex adversarial, and the Claude adversarial pass found it independently; the owner chose to land it before the first guest (D10). Today only `main` reads the clock ("Only main reads the system clock" in src/time.rs); the fix needs a clock parameter (for example `now: &dyn Fn() -> u64`) for `grant` and `reconcile`, with a test that advances the clock during the lock wait.
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06). Grant takes the deadline from one clock read after the lock and after the checks of step 1, and checks the clock again before step 7; reconcile reads the clock after the lock, through a wrapper that never goes back within one run.
+
+### Grant checks that the end-timer binary exists and runs
+
+**What:** In grant step 1, run `/usr/local/bin/sparkpass list` (through the runner) and refuse the grant if it fails.
+
+**Why:** The end timer always runs `/usr/local/bin/sparkpass revoke <name>`. If the owner runs a build from target/release before install, or the installed file is an old build, the timer fails at the deadline with 203/EXEC, and the key stays live; grant still prints the pass.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Claude adversarial pass, src/lease.rs:178 and src/config.rs:9 (`BINARY`). The owner chose to land it before the first guest (D10). A FakeRunner test covers the refusal.
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06). Grant runs the end-timer call itself (`sparkpass revoke <name> --deadline 0`), so an old build that refuses `--deadline` is also refused.
+
+### The self-check with the real key requires HTTP 200
+
+**What:** Make the first self-check request use `-w %{http_code}` and require `200`, as the wrong-token request does.
+
+**Why:** `curl -f` exits with 0 for a redirect or a 204, so grant can hand out a pass while `/v1/models` does not serve the model.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Codex structured [P2] and Codex adversarial, src/grant.rs:98-99. The owner chose P1 (D10). Combine with the TODO "One curl helper for both self-check requests".
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06).
+
+### Correct the old revoke step numbers in four comments
+
+**What:** The deny-all write is revoke step 1, the restart step 2, the timer stop step 3. Correct src/gateway.rs:66-73 (doc and inline comments of `close`), src/revoke.rs:25 (`closed` parameter), src/lease.rs:205 (`stop_end_timer`), src/reconcile.rs:83.
+
+**Why:** The order was changed in the ship review; these comments still describe the old order, in the modules where the step order is the safety property.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): maintainability, cycle 3 (confidence 9). Comments only; no test changes.
+
+**Effort:** S
+**Priority:** P1
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06).
+
+### Make reconcile run the token-file check before step 3
+
+**What:** Run the two token-file checks (a rule with no lease; an active lease whose file is not its rule) directly after the overdue leases are revoked, independent of later failures.
+
+**Why:** When the timer check or `systemd-run` in step 3 fails, reconcile returns early, and an empty or cut token file stays while a running Caddy serves; the check is skipped on each run until step 3 succeeds.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): red team, cycle 3, src/reconcile.rs:69. Test: an active lease with an empty token file and a timer check that hangs; the deny-all write and try-restart still run.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06).
+
+### Revoke must not trust an earlier cut for a REVOKE-FAILED lease
+
+**What:** In `revoke()`, close the gateway again when the lease state is `revoke-failed`, also when `closed` is true.
+
+**Why:** `closed` proves only this process's own close. A lease that is already REVOKE-FAILED can hold a token that an earlier failed close left live; a revoke with `closed = true` then deletes the lease and the mark, and reconcile never cuts the token.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): red team, cycle 3, src/revoke.rs:89 (confidence 3).
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06).
+
+### Bind a revoke to the lease that it was made for
+
+**What:** Give the end timer the deadline that it was created for (for example an internal `revoke <name> --deadline <unix seconds>`), and make that call a no-op when the lease file has a different deadline. Also make the close before the lock in `revoke <name>` safe against a lease that another revoke and a new grant replaced in the meantime.
+
+**Why:** A delayed end-timer service can revoke a new lease of the same name; and a close before the lock can overwrite a replacement guest's new token. Both fail closed (a guest loses access early), but the owner holds a pass that does not work.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Codex structured [P2] src/lease.rs:178-180 and src/revoke.rs:78-82; the red team reported the timer case in cycles 1 and 2.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06). The close before the lock can still cut a new key of the SAME name in a narrow window; the ponytail comment in src/revoke.rs names it, and the reconcile dead-key gate revokes that lease.
+
+### One history record for each lease, also after a partial commit
+
+**What:** Give a failed lease-file delete its own error text, sync the lease directory after the delete, and make a retried revoke reuse the history record of the first try instead of a new `-N` record.
+
+**Why:** If the directory sync after the history rename fails, or the delete of the lease file fails, the retry writes a second record of the same lease, possibly with a different end time.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Codex adversarial [P2] src/lease.rs:77 and the Claude adversarial pass src/revoke.rs:51-53. Access is not affected.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06).
+
+### Two test gaps from the cycle-3 review
+
+**What:** (1) A row in `token_file_that_is_not_the_rule_of_the_active_lease_is_closed_before_the_gateway_starts` with a directive after the complete rule (`<rule>respond 200\n`). (2) Pin the `state` and `end` fields of the history record after a retried revoke in `failed_timer_stop_gives_revoke_failed_and_the_gateway_still_closes`.
+
+**Why:** A relaxed `is_rule_of` (`starts_with`) and a change of the record contract pass the suite today.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): testing specialist, cycle 3, src/reconcile.rs:253 and src/revoke.rs:179.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06).
+
+### Smaller hardening items from the adversarial review
+
+**What:** (1) Use `writeln!` on a locked stdout in `main`; on error, tell the owner that the lease is active with no printed pass and give the revoke command. (2) Make `-q` the first argument of each curl call, so that root's `~/.curlrc` cannot add `--insecure`, `--proxy`, or `-L`. (3) In `revoke <name>`, treat a token file that holds that name's rule as "the lease exists". (4) Send the wrong-token probe also as `POST /v1/chat/completions`. (5) Bound the output that `RealRunner` keeps in memory.
+
+**Why:** Each closes a small failure mode: a panic after a complete grant; a self-check that root's curl config changes; a key that stays live when the lease file is lost; a token rule on only some routes; memory exhaustion by a broken command.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): Claude adversarial pass (items 3, 4, 5, 7) and Codex adversarial (unbounded output). src/main.rs:87, src/grant.rs:70/98/108, src/revoke.rs:78, src/runner.rs:108.
+
+**Effort:** M
+**Priority:** P3
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06). Each curl call also has `--noproxy *`.
+
+### One curl helper for both self-check requests
+
+**What:** One closure that runs `curl -sS -o /dev/null -m <limit> -w %{http_code} -H "Authorization: Bearer <value>" <url>` and returns the status, for the real key and the wrong key.
+
+**Why:** The two match blocks in `hand_out` repeat the same error handling; one helper is about 6 lines shorter.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): simplification (advisory), src/grant.rs:98. Do it together with "The self-check with the real key requires HTTP 200".
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest (2026-10-06).
 
 ### Least privilege and provenance for the release binary
 
@@ -185,5 +287,4 @@
 **Effort:** S
 **Priority:** P3
 **Depends on:** None
-
-## Completed
+**Completed:** branch fix/todos-before-first-guest (2026-10-06). The sha256 shares the artifact with the binary; see the attestation item under CI.
