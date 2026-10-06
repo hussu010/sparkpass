@@ -1,0 +1,8 @@
+/target/
+
+# Second barrier: state and secrets live outside the repository
+# (/etc/sparkpass, /var/lib/sparkpass). These patterns catch a stray copy.
+token.caddy
+/leases/
+/history/
+*.img
