@@ -7,5 +7,5 @@ token.caddy
 /history/
 *.img
 
-# QA evidence of /qa and /ship runs
-/.gstack/qa-reports/
+# gstack reports (QA, deploy) stay local
+/.gstack/

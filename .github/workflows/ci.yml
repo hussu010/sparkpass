@@ -1,6 +1,9 @@
 name: ci
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     # Same architecture as the DGX Spark, so the release binary runs on the pair.
@@ -14,8 +17,14 @@ jobs:
       # The deployable binary comes only from a push to main, never from a pull request.
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo build --locked --release
+      # In target/release, so that the file names only `sparkpass`: `sha256sum -c sparkpass.sha256` next to the download.
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: target/release
+        run: sha256sum sparkpass > sparkpass.sha256
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sparkpass-aarch64-linux
-          path: target/release/sparkpass
+          path: |
+            target/release/sparkpass
+            target/release/sparkpass.sha256
