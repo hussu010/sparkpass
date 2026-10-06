@@ -1,6 +1,7 @@
 //! The gateway (Caddy): the token file, and the commands that close and stop the gateway.
 
 use crate::config::Paths;
+use crate::lease;
 use crate::runner::{Runner, run_ok};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -37,14 +38,19 @@ pub fn is_deny_all(paths: &Paths) -> bool {
 /// The token file is the complete active rule of this lease, with any token.
 /// False for the empty or cut file that a power cut in `write_rule` leaves.
 pub fn is_rule_of(paths: &Paths, name: &str) -> bool {
-    // `rule` stays the only owner of the format: the token is the text between the two fixed parts.
-    let frame = rule(Some((name, "\0")));
-    let (Ok(text), Some((head, tail))) = (fs::read_to_string(&paths.token), frame.split_once('\0')) else {
-        return false;
-    };
-    text.strip_prefix(head)
-        .and_then(|rest| rest.strip_suffix(tail))
-        .is_some_and(|token| !token.is_empty() && token.bytes().all(|b| b.is_ascii_hexdigit()))
+    rule_name(paths).is_some_and(|owner| owner == name)
+}
+
+/// The lease name of the token file, if the file is the complete active rule of a lease, with any token.
+pub fn rule_name(paths: &Paths) -> Option<String> {
+    let text = fs::read_to_string(&paths.token).ok()?;
+    // `rule` stays the only owner of the format: the name and the token are the texts between its fixed parts.
+    let frame = rule(Some(("\0", "\0")));
+    let mut parts = frame.split('\0');
+    let (head, middle, tail) = (parts.next()?, parts.next()?, parts.next()?);
+    let (name, token) = text.strip_prefix(head)?.strip_suffix(tail)?.split_once(middle)?;
+    // A name that grant cannot make (a directive in it) is no lease.
+    (!token.is_empty() && token.bytes().all(|b| b.is_ascii_hexdigit()) && lease::valid_name(name)).then(|| name.to_string())
 }
 
 /// Test helper: the token in a token file that holds an active rule, of any lease.
@@ -63,14 +69,14 @@ pub fn new_token() -> io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Closes the gateway: revoke steps 2 and 3. Safe at any time, with or without the lock.
+/// Closes the gateway: revoke steps 1 and 2. Safe at any time, with or without the lock.
 /// Fail closed (eng review D7): if the gateway cannot close in the normal way, it stops.
 pub fn close(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
-    // 2. Deny-all rule. If the write failed, a restart can load the old token: stop, do not restart.
+    // 1. Deny-all rule. If the write failed, a restart can load the old token: stop, do not restart.
     if let Err(e) = write_rule(paths, &rule(None)) {
         return Err(format!("deny-all write to {}: {e}; {}", paths.token.display(), stop(runner)));
     }
-    // 3. The restart closes each open connection after the grace period. No effect if Caddy is not active.
+    // 2. The restart closes each open connection after the grace period. No effect if Caddy is not active.
     if let Err(e) = run_ok(runner, &["systemctl", "try-restart", "caddy"]) {
         return Err(format!("gateway restart: {e}; {}", stop(runner)));
     }
@@ -133,6 +139,27 @@ mod tests {
         let err = write_rule(&paths, &rule(None)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(!paths.token.exists());
+    }
+
+    #[test]
+    fn rule_name_is_the_lease_of_a_complete_rule_only() {
+        let paths = Paths::temp();
+        let rule_of_bob = rule(Some(("bob", &"ab".repeat(32))));
+        for (text, name) in [
+            (rule_of_bob.as_str(), Some("bob")),
+            (&rule(Some(("guest-1", "f"))), Some("guest-1")),
+            (&rule(None), None),
+            ("", None),
+            (&rule_of_bob[..rule_of_bob.len() - 5], None),
+            (&format!("{rule_of_bob}respond 200\n"), None),
+            (&rule(Some(("bob", ""))), None),
+            (&rule(Some(("bob", "x\"\nrespond 200\n#"))), None),
+            (&rule(Some(("bob\nrespond 200", "ab"))), None),
+        ] {
+            fs::write(&paths.token, text).unwrap();
+            assert_eq!(rule_name(&paths).as_deref(), name, "{text:?}");
+            assert_eq!(is_rule_of(&paths, "bob"), name == Some("bob"), "{text:?}");
+        }
     }
 
     #[test]

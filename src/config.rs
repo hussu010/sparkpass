@@ -2,6 +2,7 @@
 
 use std::fs::{self, DirBuilder, File};
 use std::io;
+use std::net::IpAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
@@ -60,19 +61,23 @@ pub struct Settings {
     pub public_url: String,
     /// Port of the model server on 127.0.0.1.
     pub model_port: u16,
+    /// IP address of the public listener on this host, for example 127.0.0.1. Reconcile sends its
+    /// wrong-token check there, with the name of `public_url`.
+    pub gateway_check_address: IpAddr,
 }
 
-/// Lines `KEY=VALUE`. "#" starts a comment. Unknown keys are ignored. Only grant reads this file.
+/// Lines `KEY=VALUE`. "#" starts a comment. Unknown keys are ignored. Grant and reconcile read this file.
 pub fn read_settings(paths: &Paths) -> Result<Settings, String> {
     let file = paths.config.display();
     let text = fs::read_to_string(&paths.config)
         .map_err(|e| format!("cannot read the settings file {file}: {e}"))?;
-    let (mut url, mut port) = (None, None);
+    let (mut url, mut port, mut address) = (None, None, None);
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("");
         match line.split_once('=').map(|(key, value)| (key.trim(), value.trim())) {
             Some(("PUBLIC_URL", value)) => url = Some(value.trim_end_matches('/')),
             Some(("MODEL_PORT", value)) => port = value.parse::<u16>().ok().filter(|p| *p > 0),
+            Some(("GATEWAY_CHECK_ADDRESS", value)) => address = value.parse::<IpAddr>().ok(),
             _ => {}
         }
     }
@@ -83,9 +88,12 @@ pub fn read_settings(paths: &Paths) -> Result<Settings, String> {
         .to_string();
     let model_port =
         port.ok_or_else(|| format!("settings file {file}: MODEL_PORT must be a port number"))?;
+    let gateway_check_address = address
+        .ok_or_else(|| format!("settings file {file}: GATEWAY_CHECK_ADDRESS must be an IP address, for example 127.0.0.1"))?;
     Ok(Settings {
         public_url,
         model_port,
+        gateway_check_address,
     })
 }
 
@@ -102,7 +110,7 @@ impl Paths {
         let paths = Paths::new(&root);
         fs::create_dir_all(paths.token.parent().unwrap()).unwrap();
         fs::write(&paths.token, crate::gateway::rule(None)).unwrap();
-        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\n").unwrap();
+        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n").unwrap();
         drop(paths.lock().unwrap());
         paths
     }
@@ -161,28 +169,43 @@ mod tests {
     #[test]
     fn settings_file_is_read() {
         let s = settings(
-            "# sparkpass settings\n\nPUBLIC_URL = https://spark.example.net/  # public name\nMODEL_PORT=8000\nSSH_BIND=10.0.0.1:2222\nnot a line\n",
+            "# sparkpass settings\n\nPUBLIC_URL = https://spark.example.net/  # public name\nMODEL_PORT=8000\nSSH_BIND=10.0.0.1:2222\nnot a line\nGATEWAY_CHECK_ADDRESS = ::1\n",
         )
         .unwrap();
         assert_eq!((s.public_url.as_str(), s.model_port), ("https://spark.example.net", 8000));
+        assert_eq!(s.gateway_check_address, IpAddr::from(std::net::Ipv6Addr::LOCALHOST));
+        let s = read_settings(&Paths::temp()).unwrap();
+        assert_eq!(s.gateway_check_address, IpAddr::from(std::net::Ipv4Addr::LOCALHOST));
     }
 
     #[test]
     fn settings_file_with_a_missing_or_bad_value_is_refused() {
-        for text in [
-            "",
-            "PUBLIC_URL=https://spark.example.net\n",
-            "MODEL_PORT=8000\n",
-            "PUBLIC_URL=spark.example.net\nMODEL_PORT=8000\n",
+        // Each row is refused for the key that it names. A valid address comes first, and a later line replaces it.
+        const OK: &str = "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\n";
+        for (text, key) in [
+            ("", "PUBLIC_URL"),
+            ("PUBLIC_URL=https://spark.example.net\n", "MODEL_PORT"),
+            ("MODEL_PORT=8000\n", "PUBLIC_URL"),
+            ("PUBLIC_URL=spark.example.net\nMODEL_PORT=8000\n", "PUBLIC_URL"),
             // Plain http would send the API key in clear text.
-            "PUBLIC_URL=http://spark.example.net\nMODEL_PORT=8000\n",
-            "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=0\n",
-            "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=70000\n",
-            "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=http\n",
-            "#PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\n",
+            ("PUBLIC_URL=http://spark.example.net\nMODEL_PORT=8000\n", "PUBLIC_URL"),
+            ("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=0\n", "MODEL_PORT"),
+            ("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=70000\n", "MODEL_PORT"),
+            ("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=http\n", "MODEL_PORT"),
+            ("#PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\n", "PUBLIC_URL"),
+            // A name is not an address: the check must reach this host, not what a resolver says.
+            (&format!("{OK}GATEWAY_CHECK_ADDRESS=localhost\n"), "GATEWAY_CHECK_ADDRESS"),
+            (&format!("{OK}GATEWAY_CHECK_ADDRESS=127.0.0.1:443\n"), "GATEWAY_CHECK_ADDRESS"),
+            (&format!("{OK}GATEWAY_CHECK_ADDRESS=[::1]\n"), "GATEWAY_CHECK_ADDRESS"),
+            (&format!("{OK}GATEWAY_CHECK_ADDRESS=127.0.0.256\n"), "GATEWAY_CHECK_ADDRESS"),
+            (&format!("{OK}GATEWAY_CHECK_ADDRESS=\n"), "GATEWAY_CHECK_ADDRESS"),
         ] {
-            assert!(settings(text).is_err(), "{text:?}");
+            let error = settings(&format!("GATEWAY_CHECK_ADDRESS=127.0.0.1\n{text}")).err().unwrap_or_default();
+            assert!(error.contains(key), "{text:?}: {error}");
         }
+        // No address line.
+        let error = settings(OK).err().unwrap_or_default();
+        assert!(error.contains("GATEWAY_CHECK_ADDRESS"), "{error}");
     }
 
     #[test]

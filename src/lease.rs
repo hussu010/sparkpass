@@ -79,12 +79,21 @@ pub fn overwrite(paths: &Paths, lease: &Lease) -> io::Result<()> {
 }
 
 pub fn write_history(paths: &Paths, lease: &Lease, end: u64) -> io::Result<()> {
-    // Two leases with one name can start in the same second (a script that grants, revokes, and
-    // grants again). A record is never overwritten: the second one gets a suffix.
+    // Two leases with one name can start in the same second: a different deadline gets a suffix. A
+    // retried revoke of the same lease (its first try wrote the record, and a later step failed)
+    // replaces its own record, with the new end time.
+    // ponytail: two leases with the same name, start second, and deadline share one record, for example
+    // a script that grants, revokes, and grants again with one TTL in one second.
+    let same = |file: &str| {
+        fs::read_to_string(paths.history.join(file))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Lease>(&text).ok())
+            .is_some_and(|old| (&old.name, old.start, old.deadline) == (&lease.name, lease.start, lease.deadline))
+    };
     let base = format!("{}-{}", lease.name, lease.start);
     let mut file = format!("{base}.json");
     let mut n = 1;
-    while paths.history.join(&file).exists() {
+    while paths.history.join(&file).exists() && !same(&file) {
         file = format!("{base}-{n}.json");
         n += 1;
     }
@@ -156,7 +165,7 @@ impl Lease {
     }
 }
 
-/// A transient systemd timer that runs `sparkpass revoke <name>` at the deadline. Two triggers: the
+/// A transient systemd timer that runs `sparkpass revoke <name> --deadline <deadline>` at the deadline. Two triggers: the
 /// calendar time (it survives a reboot through reconcile) and the monotonic clock (a backward clock
 /// step cannot delay it). The earlier one fires.
 pub fn create_end_timer(runner: &dyn Runner, lease: &Lease, now: u64) -> Result<(), String> {
@@ -178,13 +187,17 @@ pub fn create_end_timer(runner: &dyn Runner, lease: &Lease, now: u64) -> Result<
             BINARY,
             "revoke",
             &lease.name,
+            // A late run after a new grant of the same name must not revoke the new lease.
+            "--deadline",
+            &lease.deadline.to_string(),
         ],
     )?;
-    // systemd-run gives exit code 0 for a time in the past, and that timer never starts its service.
+    // systemd-run can give exit code 0 and leave no active timer (for example a unit that failed at once):
+    // the lease then has no end.
     match end_timer_exists(runner, lease)? {
         true => Ok(()),
         false => Err(format!(
-            "the end timer {}.timer is not active after systemd-run; is the deadline in the past?",
+            "the end timer {}.timer is not active after systemd-run",
             lease.end_unit()
         )),
     }
@@ -202,7 +215,7 @@ pub fn end_timer_exists(runner: &dyn Runner, lease: &Lease) -> Result<bool, Stri
     }
 }
 
-/// Revoke step 1.
+/// Revoke step 3.
 pub fn stop_end_timer(runner: &dyn Runner, lease: &Lease) -> Result<(), String> {
     let timer = format!("{}.timer", lease.end_unit());
     // The exit code has no value here: the unit can be gone already. The check below decides.
@@ -330,15 +343,27 @@ mod tests {
     }
 
     #[test]
-    fn history_record_is_never_overwritten() {
+    fn history_has_one_record_for_each_lease() {
         let paths = Paths::temp();
         let lease = seed(&paths, "bob", 2_000, State::Active);
         write_history(&paths, &lease, 1_500).unwrap();
         let first = fs::read_to_string(paths.history.join("bob-1000.json")).unwrap();
-        // The same name and the same start second: the second record gets a suffix.
-        write_history(&paths, &lease, 1_600).unwrap();
-        write_history(&paths, &lease, 1_700).unwrap();
+        // Different leases with the same name and the same start second: each one gets a suffix.
+        let second = Lease { deadline: 2_100, ..lease.clone() };
+        write_history(&paths, &second, 1_600).unwrap();
+        write_history(&paths, &Lease { deadline: 2_200, ..lease.clone() }, 1_700).unwrap();
         assert_eq!(files(&paths.history), ["bob-1000-1.json", "bob-1000-2.json", "bob-1000.json"]);
+        assert_eq!(fs::read_to_string(paths.history.join("bob-1000.json")).unwrap(), first);
+
+        // A retried revoke of the second lease replaces its own record: the new end time, no new file.
+        let marked = Lease { state: State::RevokeFailed, ..second };
+        write_history(&paths, &marked, 1_800).unwrap();
+        assert_eq!(files(&paths.history), ["bob-1000-1.json", "bob-1000-2.json", "bob-1000.json"]);
+        let record = fs::read_to_string(paths.history.join("bob-1000-1.json")).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&record).unwrap(),
+            json!({"name": "bob", "start": 1000, "deadline": 2100, "state": "revoke-failed", "end": 1800})
+        );
         assert_eq!(fs::read_to_string(paths.history.join("bob-1000.json")).unwrap(), first);
     }
 
@@ -441,6 +466,8 @@ mod tests {
                 "/usr/local/bin/sparkpass",
                 "revoke",
                 "bob",
+                "--deadline",
+                "1709210096",
             ]
         );
         assert_eq!(argv[1..], [["systemctl", "is-active", "--quiet", "sparkpass-end-bob-1709210096.timer"]]);
@@ -451,7 +478,7 @@ mod tests {
 
     #[test]
     fn end_timer_that_is_not_active_after_its_creation_is_an_error() {
-        // systemd-run gives exit code 0 for a time in the past, and no timer is active after it.
+        // systemd-run gives exit code 0, and no timer is active after it.
         let lease = Lease { name: "bob".into(), start: 1, deadline: 2_000, state: State::Active };
         let runner = FakeRunner::default();
         runner.exit("systemctl is-active", 4);
