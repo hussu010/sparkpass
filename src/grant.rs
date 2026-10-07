@@ -240,7 +240,7 @@ Rules:
 - The end time does not move. A model failure or a restart of the host adds no time.
 - At the end time the key stops, and open requests close.
 - Prompts and completions are not logged. The delete at the end is not a secure erase: the model server can hold recent prompts in its memory until it restarts.
-- The owner keeps the lease record (name, start, end) and the gateway access log (time, client IP address, method, path, status, size).
+- The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).
 - Acceptable use: no unlawful use, no attack on other systems, and no resale of the access.",
         settings.public_url,
         format_utc(deadline)
@@ -377,7 +377,8 @@ mod tests {
             "not logged",
             "not a secure erase",
             "until it restarts",
-            "The owner keeps the lease record (name, start, end) and the gateway access log (time, client IP address, method, path, status, size).",
+            // The log filter of gateway/Caddyfile deletes the client address (tests/gateway.sh, case "access log").
+            "The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).",
             "no unlawful use, no attack on other systems, and no resale",
         ] {
             assert!(pass.contains(part), "{part:?} is not in:\n{pass}");

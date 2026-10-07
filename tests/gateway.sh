@@ -4,8 +4,8 @@
 #   tests/gateway.sh                      caddy:2
 #   CADDY_IMAGE=caddy:2.6.2 tests/gateway.sh  (the Ubuntu 24.04 package)
 # It prints one line for each case and stops at the first mismatch with exit code 1.
-# It does not prove the units: the systemd unit, the ACME certificate and the real
-# inbound path are for tests/expiry.sh.
+# It does not prove the units: the systemd unit (RuntimeDirectory, the reload as the caddy user),
+# the certificate from tailscaled and the real inbound path (Tailscale Funnel) are for tests/expiry.sh.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -35,7 +35,8 @@ lease_rule() { # <name> <token>
 	printf '# sparkpass: lease %s\n@sparkpass_pass header Authorization "Bearer %s"\nvars @sparkpass_pass sparkpass_pass yes\n' "$1" "$2"
 }
 
-# Writes the token file in place and loads it, as grant does with `systemctl reload caddy`.
+# Writes the token file in place and loads it, as grant does with `systemctl reload caddy`: the reload
+# goes to the admin socket of the Caddyfile, because no TCP admin API exists (case "admin socket").
 # No bind mount: Docker Desktop can keep the old size of a changed file, and Caddy then reads a cut file.
 load() { # <token file text>
 	printf '%s' "$1" | docker exec -i "$box" sh -c 'cat >/etc/sparkpass/token.caddy'
@@ -59,9 +60,14 @@ expect() { # <want> <method> <path> [curl arguments]
 	[[ $got == "$want" ]] || fail "$case: $2 $3 ${*:4} got $got, want $want"
 }
 
-# Each path of the model server that a guest can try, with the method that it takes.
-paths=("GET /v1/models" "POST /v1/chat/completions" "POST /v1/completions" "POST /invocations"
-	"POST /tokenize" "GET /metrics" "GET /" "GET /other")
+# The routes of the pass (the exact match of gateway/Caddyfile), then other routes that a guest can try:
+# other methods and paths under /v1 (some change state that the next guest sees: a LoRA load, a stored
+# response), another case, and paths outside /v1.
+allowed=("GET /v1/models" "POST /v1/chat/completions" "POST /v1/completions")
+denied=("GET /v1/chat/completions" "POST /v1/models" "POST /v1/embeddings" "POST /v1/responses"
+	"POST /v1/load_lora_adapter" "GET /v1/models/x" "GET /V1/models"
+	"POST /invocations" "POST /tokenize" "GET /metrics" "GET /" "GET /other")
+paths=("${allowed[@]}" "${denied[@]}")
 
 on_each_path() { # <want> [curl arguments]
 	local p
@@ -90,10 +96,12 @@ for _ in {1..50}; do
 done
 [[ -n $stub_port ]] || fail "the stub did not start: $(cat "$work/stub.out")"
 
+# SPARKPASS_BIND: the published port reaches the container's address, not its loopback. /run/caddy for
+# the admin socket: on the unit, RuntimeDirectory=caddy of systemd/caddy-sparkpass.conf makes it.
 docker create --name "$box" --add-host host.docker.internal:host-gateway -p 127.0.0.1::8443 \
 	-e SPARKPASS_SITE=localhost:8443 -e SPARKPASS_MODEL_HOST=host.docker.internal \
-	-e SPARKPASS_MODEL_PORT="$stub_port" \
-	"$image" caddy run --environ --config /etc/caddy/Caddyfile >/dev/null
+	-e SPARKPASS_MODEL_PORT="$stub_port" -e SPARKPASS_BIND=0.0.0.0 \
+	"$image" sh -c 'mkdir -p /run/caddy && exec caddy run --environ --config /etc/caddy/Caddyfile' >/dev/null
 docker cp -q "$repo/gateway/Caddyfile" "$box:/etc/caddy/Caddyfile"
 docker cp -q "$work/etc" "$box:/etc/sparkpass"
 docker start "$box" >/dev/null
@@ -110,7 +118,20 @@ config=$(docker exec "$box" caddy adapt --config /etc/caddy/Caddyfile 2>/dev/nul
 for want in '"grace_period":2000000000' '"response_header_timeout":300000000000' '"max_size":4000000'; do
 	[[ $config == *"$want"* ]] || fail "$case: the adapted config has no $want"
 done
-echo "ok   $case: grace period 2 s, response header timeout 300 s, body limit 4 MB"
+# The unit sets no SPARKPASS_BIND: Caddy then listens on loopback only, where tailscaled forwards Funnel's TCP.
+config=$(docker exec "$box" env -u SPARKPASS_BIND caddy adapt --config /etc/caddy/Caddyfile 2>/dev/null)
+[[ $config == *'"listen":["127.0.0.1:8443"]'* ]] || fail "$case: with no SPARKPASS_BIND, the site does not listen on 127.0.0.1 only"
+echo "ok   $case: grace period 2 s, response header timeout 300 s, body limit 4 MB, 127.0.0.1 with no SPARKPASS_BIND"
+
+case="admin socket"
+# The admin API has no authentication: only the unix socket of the Caddyfile, and no TCP listener for it.
+# Each reload of this test (load) goes to that socket, as `systemctl reload caddy` does on the unit.
+docker exec "$box" test -S /run/caddy/admin.sock || fail "$case: /run/caddy/admin.sock is not a socket"
+# Each TCP listener of the container (state 0A in /proc/net/tcp and tcp6), as its hex port: only the site,
+# 8443 (20FB). No admin listener (the default is 2019, 07E3), and no HTTP listener on 80 (0050).
+listeners=$(docker exec "$box" cat /proc/net/tcp /proc/net/tcp6 | awk '$4 == "0A" {sub(/.*:/, "", $2); print $2}' | sort -u | tr '\n' ' ')
+[[ $listeners == "20FB " ]] || fail "$case: the TCP listeners (hex ports) are: $listeners; only 20FB (8443) is allowed"
+echo "ok   $case: the admin API is on /run/caddy/admin.sock, and the only TCP listener is 8443"
 
 case="deny-all"
 on_each_path 401
@@ -123,12 +144,10 @@ case="active rule"
 # The exact text of gateway::rule, with its final newline (a command substitution would drop it).
 rule=$(lease_rule bob "$token")$'\n'
 load "$rule"
-expect 200 GET /v1/models -H "$key"
-expect 200 POST /v1/chat/completions -H "$key"
-expect 200 POST /v1/completions -H "$key"
-for p in "POST /invocations" "POST /tokenize" "GET /metrics" "GET /" "GET /other"; do
+for p in "${allowed[@]}"; do expect 200 "${p% *}" "${p#* }" -H "$key"; done
+for p in "${denied[@]}"; do
 	expect 404 "${p% *}" "${p#* }" -H "$key"
-	# Only the gateway's own 404 has no body: a 404 of the model server means the path reached it.
+	# Only the gateway's own 404 has no body: a 404 of the model server means the route reached it.
 	[[ ! -s $work/body ]] || fail "$case: $p reached the model server: $(cat "$work/body")"
 done
 # Raw paths with a dot or empty segment (curl --path-as-is): the proxy would send them as they are, so
@@ -142,7 +161,7 @@ done
 # A request with a query string, for the access log case below (the stub answers it with its own 404).
 status GET "/v1/models?q=sparkpass-query-text" -H "$key" >/dev/null
 refused_cases
-echo "ok   $case: the key gets 200 on /v1/*, 404 elsewhere, 400 for a dot or empty segment; each other header gets 401 on each path"
+echo "ok   $case: the key gets 200 on the ${#allowed[@]} routes of the pass, the gateway's 404 on ${#denied[@]} other routes, 400 for a dot or empty segment; each other header gets 401 on each route"
 
 case="body limit"
 head -c 5000000 /dev/zero >"$work/big"
@@ -192,9 +211,11 @@ access=$(grep -F '"logger":"http.log.access' "$work/caddy.log" || true)
 [[ -n $access ]] || fail "$case: no access log line"
 grep -qF '"uri":"/v1/models"' <<<"$access" || fail "$case: no path in the access log"
 grep -qF '"status":401' <<<"$access" || fail "$case: no status in the access log"
-# Only time, client IP address, method, path, status and size, plus the log metadata.
+grep -qF '"method":"POST"' <<<"$access" || fail "$case: no method in the access log"
+# Only time, method, path, status and size, plus the log metadata. No client address: behind Funnel each
+# connection comes from tailscaled on 127.0.0.1.
 python3 -c 'import json, sys
-keep = {"level", "ts", "logger", "msg", "remote_ip", "client_ip", "method", "uri", "status", "size"}
+keep = {"level", "ts", "logger", "msg", "method", "uri", "status", "size"}
 for line in sys.stdin:
     d = json.loads(line)
     d.update(d.pop("request"))
@@ -202,5 +223,5 @@ for line in sys.stdin:
         sys.exit("FAIL access log: a line has more fields: " + line)' <<<"$access" || exit 1
 if line=$(grep -m1 -iE "bearer|$token" "$work/caddy.log"); then fail "$case: the log has a key: $line"; fi
 if line=$(grep -m1 -F "sparkpass-query-text" <<<"$access"); then fail "$case: the log has a query string: $line"; fi
-echo "ok   $case: $(wc -l <<<"$access" | tr -d ' ') lines, no headers, no query, no Bearer, no key"
+echo "ok   $case: $(wc -l <<<"$access" | tr -d ' ') lines, no headers, no client address, no query, no Bearer, no key"
 echo "PASS"
