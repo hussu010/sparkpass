@@ -13,8 +13,9 @@
 //!  5 home image                         [build phase 2]
 //!  6 workspace container                [build phase 2]
 //!  7 activate the token, reload Caddy
-//!  8 self-check (D5): 200 with the token, 401 with a wrong token (GET and POST)
-//!    ── fail ──▶ stop Caddy, revoke, exit non-zero (a proven answer other than 401: write gateway-open)
+//!  8 self-check (D5) through PUBLIC_URL: 200 with the token, 401 with a wrong token (GET and POST)
+//!    ── fail ──▶ stop Caddy, revoke, exit non-zero; an answer other than 401 is no proof by itself (the
+//!    inbound route can answer): the check of step 1 decides, and only its proven answer writes gateway-open
 //!  9 print the pass
 //! ```
 
@@ -148,7 +149,8 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     // 8. Self-check through the public listener (eng review D5). Each failure leaves the gateway with no
     // proof that it refuses a wrong token, and a revoke cannot close a gateway that ignores the token file:
     // the gateway stops (fail closed), and the next reconcile starts it with its own check, except after a
-    // proven answer other than 401 to a wrong token: that writes the gateway-open marker (below).
+    // proven answer other than 401 to a wrong token at GATEWAY_CHECK_ADDRESS: that writes the gateway-open
+    // marker (below).
     let models = format!("{}/v1/models", settings.public_url);
     match status(runner, &["-H", &format!("Authorization: Bearer {token}")], &models) {
         Ok(code) if code == "200" => {}
@@ -163,22 +165,31 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     // request above for everyone, and only these requests show it.
     match wrong_token_answer(runner, &[], &settings.public_url) {
         None => {}
-        // The gateway is open to all, and the revoke cannot close it: a new token file changes nothing.
+        // An answer other than 401 through the public route is no proof by itself: a relay of the inbound
+        // route (Tailscale Funnel) can give its own answer. The check of step 1 decides: a proven answer
+        // there writes the marker (the gateway is open to all, and the revoke cannot close it), and a failed
+        // request stops the gateway. A gateway that refuses the wrong token there stops too (fail closed),
+        // with no marker: the public route does not reach it.
         Some((url, Ok(code))) => {
-            let evidence = format!("the gateway answered {code} through {url} to a request with a wrong token, and it must answer 401: the gateway does not enforce the token file");
-            return Err(gateway::mark_open(paths, runner, &evidence));
+            let public = format!("the self-check with a wrong token through {url} got {code}, and it must get 401");
+            check_gateway(paths, runner, settings).map_err(|e| format!("{public}; {e}"))?;
+            return Err(format!(
+                "{public}, but the gateway refuses the wrong token at {}: the inbound route does not reach this gateway, or it changes its answers; {}",
+                settings.gateway_check_address,
+                gateway::stop(runner)
+            ));
         }
         Some((url, Err(e))) => return Err(format!("the self-check with a wrong token through {url} failed: {e}; {}", gateway::stop(runner))),
     }
     Ok(token)
 }
 
-/// Step 1 and the proof of reconcile after each start (TODO branch of 2026-10-06; it extends the self-check
-/// of eng review D5): the public listener of this host refuses a wrong token. `--connect-to` with an empty
-/// host and port sends each connection to GATEWAY_CHECK_ADDRESS on the port of PUBLIC_URL, never through
-/// the public route or DNS, and TLS still checks the name of PUBLIC_URL. No part of the URL is parsed here.
-/// Each failure stops the gateway (fail closed), and a proven answer other than 401 then writes the marker
-/// that keeps it stopped.
+/// Step 1, the decision of step 8, and the proof of reconcile after each start (TODO branch of 2026-10-06;
+/// it extends the self-check of eng review D5): the public listener of this host refuses a wrong token.
+/// `--connect-to` with an empty host and port sends each connection to GATEWAY_CHECK_ADDRESS (loopback, see
+/// config.rs) on the port of PUBLIC_URL, never through the public route or DNS, and TLS still checks the
+/// name of PUBLIC_URL. No part of the URL is parsed here. Each failure stops the gateway (fail closed), and
+/// a proven answer other than 401 then writes the marker that keeps it stopped.
 pub fn check_gateway(paths: &Paths, runner: &dyn Runner, settings: &Settings) -> Result<(), String> {
     let address = match settings.gateway_check_address {
         IpAddr::V6(address) => format!("[{address}]"),
@@ -474,32 +485,103 @@ mod tests {
         }
     }
 
-    // A gateway that does not enforce the token file is open to all, and a revoke cannot close it.
+    /// A healthy host whose check through GATEWAY_CHECK_ADDRESS (`probe`) gets `answer` from the reload of step 7
+    /// on. Step 1 still passes: with the deny-all rule, each request gets 401.
+    fn host_with_a_check_answer_after_the_reload(probe: &'static str, answer: Result<Output, RunError>) -> (Paths, Arc<FakeRunner>) {
+        let (paths, runner) = (Paths::temp(), Arc::new(FakeRunner::healthy()));
+        runner.hook({
+            // Weak: the hook lives in the runner.
+            let runner = Arc::downgrade(&runner);
+            move |argv| {
+                if argv.join(" ") == RELOAD
+                    && let Some(runner) = runner.upgrade()
+                {
+                    runner.on(probe, answer.clone());
+                }
+            }
+        });
+        (paths, runner)
+    }
+
+    // A gateway that does not enforce the token file is open to all, and a revoke cannot close it. The check
+    // through GATEWAY_CHECK_ADDRESS confirms the answer of the public route (P1 item of 2026-10-07).
     #[test]
     fn wrong_token_that_is_not_refused_stops_the_gateway_before_the_revoke() {
-        for (request, url, runs) in [(WRONG_GET, MODELS, 2), (WRONG_POST, CHAT, 3)] {
+        for (request, probe, url, runs) in [(WRONG_GET, CHECK_GET, MODELS, 2), (WRONG_POST, CHECK_POST, CHAT, 3)] {
             for code in ["200", "404", "204", "302", "500", ""] {
-                let (paths, runner) = host();
+                let (paths, runner) = host_with_a_check_answer_after_the_reload(probe, output(0, code));
                 runner.on(request, output(0, code));
-                let result = grant(&paths, &runner, "bob", TTL, &|| NOW);
+                let result = grant(&paths, &*runner, "bob", TTL, &|| NOW);
                 let error = result.as_ref().unwrap_err();
                 for part in [
-                    &format!("the gateway answered {code} through {url} to a request with a wrong token, and it must answer 401"),
-                    "the gateway does not enforce the token file; the gateway is stopped;",
+                    &format!("the self-check with a wrong token through {url} got {code}, and it must get 401; "),
+                    &format!("the gateway answered {code} through {url} at 127.0.0.1 to a request with a wrong token, and it must answer 401"),
+                    "the gateway does not enforce the token file; repair the import of the token file in the Caddyfile; the gateway is stopped;",
                     "the gateway is stopped; each reconcile run stops the gateway until you repair the Caddyfile and remove",
                 ] {
                     assert!(error.contains(part), "{part:?} is not in: {error}");
                 }
-                // The marker keeps the gateway stopped and holds the evidence.
+                // The marker keeps the gateway stopped and holds the evidence of the check address.
                 let marker = fs::read_to_string(&paths.gateway_open).unwrap();
-                assert!(marker.contains(&format!("answered {code} through {url}")), "{marker}");
+                assert!(marker.contains(&format!("answered {code} through {url} at 127.0.0.1")), "{marker}");
                 assert_eq!(runner.count(SELF_CHECK), runs);
                 // One stop, and then the revoke: try-restart has no effect on a stopped gateway.
                 assert_eq!(runner.count(STOP_CADDY), 1);
                 let calls = runner.calls();
-                assert!(calls.ends_with(&[STOP_CADDY, RESTART, STOP_TIMER, CHECK_TIMER].map(String::from)), "{calls:?}");
+                assert!(calls.ends_with(&[probe, STOP_CADDY, RESTART, STOP_TIMER, CHECK_TIMER].map(String::from)), "{calls:?}");
                 assert_revoked(&paths, &runner, result);
             }
+        }
+    }
+
+    // Added for the P1 item "Prove the gateway step on the units" (2026-10-07).
+    // Value: protects=an answer of the inbound route alone (a relay of Tailscale Funnel answers with its own
+    // error) writes no marker, and the grant still fails closed; fails_when=step 8 writes the marker for a
+    // public answer that the check address does not confirm, or the gateway stays up; why_new=step 8 trusted
+    // the public answer; seam=none
+    #[test]
+    fn wrong_token_answer_of_the_public_route_alone_stops_the_gateway_with_no_marker() {
+        for (request, url) in [(WRONG_GET, MODELS), (WRONG_POST, CHAT)] {
+            for code in ["502", "530", "200", ""] {
+                let (paths, runner) = host();
+                runner.on(request, output(0, code));
+                let result = grant(&paths, &runner, "bob", TTL, &|| NOW);
+                let error = result.as_ref().unwrap_err();
+                let text = format!(
+                    "the self-check with a wrong token through {url} got {code}, and it must get 401, but the gateway refuses the wrong token at 127.0.0.1: the inbound route does not reach this gateway, or it changes its answers; the gateway is stopped"
+                );
+                assert!(error.contains(&text), "{error}");
+                assert!(!paths.gateway_open.exists(), "{error}");
+                // The check of step 1 again (both requests get 401), the stop, then the revoke.
+                assert_eq!(runner.count(STOP_CADDY), 1);
+                assert_eq!(runner.count(CHECK_GET), 2);
+                let calls = runner.calls();
+                assert!(calls.ends_with(&[CHECK_GET, CHECK_POST, STOP_CADDY, RESTART, STOP_TIMER, CHECK_TIMER].map(String::from)), "{calls:?}");
+                assert_revoked(&paths, &runner, result);
+            }
+        }
+    }
+
+    // Added for the P1 item "Prove the gateway step on the units" (2026-10-07).
+    // Value: protects=a failed check through the check address after an answer of the public route is no
+    // proof either: the gateway stops, with no marker; fails_when=the Err of check_gateway in step 8 writes the
+    // marker or keeps the gateway up; why_new=the confirmation of step 8 is new; seam=none
+    #[test]
+    fn wrong_token_answer_of_the_public_route_and_a_failed_check_stop_the_gateway_with_no_marker() {
+        for (check, text) in [(output(7, "000"), "curl exit code 7"), (Err(RunError::Timeout(Duration::from_secs(10))), "curl: no result after 10s")] {
+            let (paths, runner) = host_with_a_check_answer_after_the_reload(CHECK_GET, check);
+            runner.on(WRONG_GET, output(0, "200"));
+            let result = grant(&paths, &*runner, "bob", TTL, &|| NOW);
+            let error = result.as_ref().unwrap_err();
+            let want = format!(
+                "the self-check with a wrong token through {MODELS} got 200, and it must get 401; the check with a wrong token through {MODELS} at 127.0.0.1 failed: {text}; the gateway is stopped"
+            );
+            assert!(error.contains(&want), "{error}");
+            assert!(!paths.gateway_open.exists(), "{error}");
+            assert_eq!(runner.count(STOP_CADDY), 1);
+            let calls = runner.calls();
+            assert!(calls.ends_with(&[CHECK_GET, STOP_CADDY, RESTART, STOP_TIMER, CHECK_TIMER].map(String::from)), "{calls:?}");
+            assert_revoked(&paths, &runner, result);
         }
     }
 

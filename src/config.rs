@@ -75,7 +75,7 @@ pub struct Settings {
     /// Port of the model server on 127.0.0.1.
     pub model_port: u16,
     /// A loopback address of this host, for example 127.0.0.1, where Caddy listens (gateway/Caddyfile, `bind`).
-    /// Grant (step 1) and reconcile send their wrong-token check there, with the name of `public_url`.
+    /// Grant (steps 1 and 8) and reconcile send their wrong-token check there, with the name of `public_url`.
     pub gateway_check_address: IpAddr,
 }
 
