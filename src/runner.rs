@@ -139,6 +139,7 @@ pub mod fake {
         /// ponytail: one state for all units, because one guest has access at a time.
         timer: Mutex<Option<bool>>,
         /// `healthy()` only: does Caddy run? `start` and `stop` change it; `try-restart` does not start it.
+        /// `is-active` and `show -p ActiveState` read it.
         caddy: Mutex<Option<bool>>,
     }
 
@@ -221,6 +222,9 @@ pub mod fake {
                     ["systemctl", "start", "caddy"] => *active = true,
                     ["systemctl", "stop", "caddy"] => *active = false,
                     ["systemctl", "is-active", "--quiet", "caddy"] if !*active => return output(3, ""),
+                    ["systemctl", "show", "-p", "ActiveState", "--value", "caddy"] => {
+                        return output(0, if *active { "active\n" } else { "inactive\n" });
+                    }
                     _ => {}
                 }
             }
@@ -371,5 +375,14 @@ mod tests {
             ["systemctl is-active --quiet x.timer", "systemctl is-active --quiet caddy", "systemctl is-active --quiet x.timer", "other"]
         );
         assert_eq!(runner.count("systemctl is-active"), 3);
+
+        // The state of Caddy follows start and stop (added for the ActiveState read of reconcile, 2026-10-07).
+        let runner = FakeRunner::healthy();
+        let state = ["systemctl", "show", "-p", "ActiveState", "--value", "caddy"];
+        assert_eq!(runner.run(&state), output(0, "active\n"));
+        runner.run(&["systemctl", "stop", "caddy"]).unwrap();
+        assert_eq!(runner.run(&state), output(0, "inactive\n"));
+        runner.run(&["systemctl", "start", "caddy"]).unwrap();
+        assert_eq!(runner.run(&state), output(0, "active\n"));
     }
 }

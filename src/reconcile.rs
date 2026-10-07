@@ -13,8 +13,9 @@
 //!    gateway-open marker ──▶ stop Caddy, exit non-zero
 //!    a failed revoke or close in 2 or 4, or no end timer in 3 for a lease that ends before the next run
 //!      ──▶ stop Caddy, exit non-zero (the cut is not proven)
-//!    any other failure (an end timer in 3) ──▶ do not start Caddy; a Caddy that runs gets the check below
-//!      ── fail ──▶ stop Caddy; a Caddy in an unknown state ──▶ stop Caddy
+//!    any other failure (an end timer in 3) ──▶ do not start Caddy; a Caddy that runs (ActiveState active
+//!      or reloading) gets the check below ── fail ──▶ stop Caddy; inactive or failed ──▶ no check, no stop;
+//!      each other state (activating, deactivating, unknown) ──▶ stop Caddy
 //!    no failure ──▶ start Caddy ── fail ──▶ stop Caddy, exit non-zero
 //!    a wrong token (GET and POST) to the public listener at GATEWAY_CHECK_ADDRESS gets no 401 ──▶ stop Caddy,
 //!      exit non-zero (D5); a proven answer other than 401 ──▶ also write gateway-open
@@ -179,7 +180,9 @@ fn steps(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64, runs: &Cel
     // After a failure: no start. After a failure that is not an access cut (an end timer of step 3), a
     // gateway that runs still gets its proof, because a failure that repeats on each run must not end the
     // only periodic proof; a failed proof stops it (check_gateway). Otherwise a gateway that runs stays:
-    // each revoke and close of this run succeeded. Exit code 3 is "not active"; each other answer (a
+    // each revoke and close of this run succeeded. The state is ActiveState, not `is-active`, whose exit
+    // code 3 also means activating and deactivating (for example during the try-restart of a concurrent
+    // revoke): inactive or failed is "does not run"; each other answer (activating, deactivating, a
     // time-out, an error of systemctl) leaves the state unknown: stop.
     if !failed.is_empty() {
         // A failed revoke or close leaves the access cut unproven: Caddy can still hold the old key in
@@ -190,9 +193,10 @@ fn steps(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64, runs: &Cel
         if must_stop {
             return fail_closed(runner, failed.join("; "));
         }
-        match runner.run(&["systemctl", "is-active", "--quiet", "caddy"]) {
-            Ok(out) if out.code == Some(3) => {}
-            Ok(out) if out.code == Some(0) => {
+        let state = runner.run(&["systemctl", "show", "-p", "ActiveState", "--value", "caddy"]);
+        match state.as_ref().map(|out| (out.code, out.stdout.trim())) {
+            Ok((Some(0), "inactive" | "failed")) => {}
+            Ok((Some(0), "active" | "reloading")) => {
                 if let Err(e) = check_gateway(paths, runner, &settings) {
                     failed.push(e);
                     return Err(failed.join("; "));
@@ -200,10 +204,11 @@ fn steps(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64, runs: &Cel
                 runs.set(true);
                 return Err(format!("{}; the gateway runs with its proof, and it was not started again", failed.join("; ")));
             }
-            other => {
-                failed.push(format!("the state of the gateway is unknown: {}", match other {
-                    Ok(out) => format!("`systemctl is-active caddy` {}", exit_text(out.code)),
-                    Err(e) => format!("`systemctl is-active caddy`: {e}"),
+            _ => {
+                failed.push(format!("the state of the gateway is unknown: `systemctl show -p ActiveState --value caddy` {}", match &state {
+                    Ok(out) if out.code == Some(0) => format!("gave {:?}", out.stdout.trim()),
+                    Ok(out) => exit_text(out.code),
+                    Err(e) => e.to_string(),
                 }));
                 return fail_closed(runner, failed.join("; "));
             }
@@ -313,7 +318,8 @@ mod tests {
     const START: &str = "systemctl start caddy";
     const STOP: &str = "systemctl stop caddy";
     const RESTART: &str = "systemctl try-restart caddy";
-    const CADDY_ACTIVE: &str = "systemctl is-active --quiet caddy";
+    /// The state of Caddy after a failed step (FakeRunner::healthy answers it from its Caddy state).
+    const CADDY_STATE: &str = "systemctl show -p ActiveState --value caddy";
     /// The health check of the model during a lease, after the gateway check.
     const HEALTH: &str = "curl -q --noproxy * -fsS -m 8 http://127.0.0.1:8000/v1/models";
     const REVOKE_FAILED: &str = "the revoke of bob is not complete (state revoke-failed)";
@@ -913,7 +919,7 @@ mod tests {
         runner.on(&check_timer(2_000), hang());
         assert!(reconcile(&paths, &runner, &|| NOW).is_err());
         // No start, and the gateway that runs passes its check, so it stays.
-        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), CADDY_ACTIVE, PROBE, PROBE_POST]);
+        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), CADDY_STATE, PROBE, PROBE_POST]);
 
         // Step 3: the timer create hangs.
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
@@ -1027,21 +1033,29 @@ mod tests {
             runner.exit(&create_timer(2_000), 1);
             (paths, runner)
         };
-        let (paths, runner) = failed_timer();
-        runner.on(PROBE, output(0, "200"));
-        let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
-        assert!(error.contains("answered 200") && error.contains("; the gateway is stopped; each reconcile run stops the gateway"), "{error}");
-        assert!(runner.calls().ends_with(&[CADDY_ACTIVE, PROBE, STOP].map(String::from)), "{:?}", runner.calls());
-        assert!(paths.gateway_open.exists());
-        assert_eq!(runner.count(START), 0);
+        // ActiveState "reloading" is a gateway that runs, as "active" (the healthy runner) is.
+        for state in [None, Some("reloading\n")] {
+            let (paths, runner) = failed_timer();
+            if let Some(state) = state {
+                runner.on(CADDY_STATE, output(0, state));
+            }
+            runner.on(PROBE, output(0, "200"));
+            let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+            assert!(error.contains("answered 200") && error.contains("; the gateway is stopped; each reconcile run stops the gateway"), "{error}");
+            assert!(runner.calls().ends_with(&[CADDY_STATE, PROBE, STOP].map(String::from)), "{:?}", runner.calls());
+            assert!(paths.gateway_open.exists());
+            assert_eq!(runner.count(START), 0);
+        }
 
-        // A gateway that does not run gets no check and no stop.
-        let (paths, runner) = failed_timer();
-        runner.exit(CADDY_ACTIVE, 3);
-        assert!(reconcile(&paths, &runner, &|| NOW).unwrap_err().ends_with("the gateway was not started"));
-        assert_eq!(runner.calls().last().map(String::as_str), Some(CADDY_ACTIVE));
-        assert_eq!(runner.count(STOP), 0);
-        assert!(!paths.gateway_open.exists());
+        // A gateway that does not run (ActiveState inactive or failed) gets no check and no stop.
+        for state in ["inactive\n", "failed\n"] {
+            let (paths, runner) = failed_timer();
+            runner.on(CADDY_STATE, output(0, state));
+            assert!(reconcile(&paths, &runner, &|| NOW).unwrap_err().ends_with("the gateway was not started"));
+            assert_eq!(runner.calls().last().map(String::as_str), Some(CADDY_STATE));
+            assert_eq!(runner.count(STOP), 0);
+            assert!(!paths.gateway_open.exists());
+        }
 
         // Extended by the /ship test coverage audit (2026-10-06, TODO batch 2): no answer after a failed step.
         // Value: protects=after a failed step, a check of a gateway that runs and gets no answer is no proof, so the gateway stops (with no marker);
@@ -1051,7 +1065,7 @@ mod tests {
         runner.on(PROBE, hang());
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.contains("failed: curl: no result after 10s") && error.ends_with("the gateway is stopped"), "{error}");
-        assert!(runner.calls().ends_with(&[CADDY_ACTIVE, PROBE, STOP].map(String::from)), "{:?}", runner.calls());
+        assert!(runner.calls().ends_with(&[CADDY_STATE, PROBE, STOP].map(String::from)), "{:?}", runner.calls());
         assert!(!paths.gateway_open.exists());
     }
 
@@ -1145,22 +1159,32 @@ mod tests {
         assert_eq!(fs::read_to_string(&paths.model_down).unwrap(), "amy\n");
     }
 
-    // Added by the /ship review (2026-10-06, TODO batch 2).
+    // Added by the /ship review (2026-10-06, TODO batch 2). Extended for ActiveState (2026-10-07): exit code 3
+    // of `is-active` also means activating and deactivating, so reconcile skipped the check of a Caddy that a
+    // concurrent revoke restarts, and could send a false "does not run" message.
     // Value: protects=after a failed step, a gateway in an unknown state stops (fail closed);
-    // fails_when=each is-active error counts as "does not run", so the gateway gets no check and no stop;
-    // why_new=the failed-step tests have exit codes 0 and 3 only; seam=none
+    // fails_when=a transition state or a failed command counts as "does not run" (no check, no stop), or as
+    // "runs" (a check of a Caddy that can start or stop under it); why_new=the failed-step tests had the
+    // states active and inactive only; seam=none
     #[test]
     fn unknown_gateway_state_after_a_failed_step_stops_the_gateway() {
-        for answer in [hang(), output(1, "")] {
+        for (answer, text) in [
+            (output(0, "activating\n"), "gave \"activating\""),
+            (output(0, "deactivating\n"), "gave \"deactivating\""),
+            (output(0, ""), "gave \"\""),
+            (output(1, "active\n"), "exit code 1"),
+            (hang(), "no result after 10s"),
+        ] {
             // A failed end-timer create: a failed step that is not an access cut.
             let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
             seed(&paths, "bob", 2_000, State::Active);
             write_rule_of_bob(&paths);
             runner.exit(&create_timer(2_000), 1);
-            runner.on(CADDY_ACTIVE, answer);
+            runner.on(CADDY_STATE, answer);
             let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
-            assert!(error.contains("the state of the gateway is unknown") && error.ends_with("; the gateway is stopped"), "{error}");
-            assert_eq!(runner.calls().last().map(String::as_str), Some(STOP));
+            let want = format!("the state of the gateway is unknown: `systemctl show -p ActiveState --value caddy` {text}; the gateway is stopped");
+            assert!(error.ends_with(&want), "{error}");
+            assert!(runner.calls().ends_with(&[CADDY_STATE, STOP].map(String::from)), "{:?}", runner.calls());
             assert_eq!(runner.count(PROBE), 0);
         }
     }
@@ -1338,7 +1362,7 @@ mod tests {
     // gateway-down tests reached Err only through fail_closed; seam=none
     #[test]
     fn failed_step_with_a_stopped_gateway_during_a_lease_sends_the_gateway_down_message() {
-        for (command, answer) in [(CADDY_ACTIVE, output(3, "")), (PROBE, hang())] {
+        for (command, answer) in [(CADDY_STATE, output(0, "inactive\n")), (PROBE, hang())] {
             let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
             fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
             seed(&paths, "bob", 5_000, State::Active);
