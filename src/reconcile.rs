@@ -10,9 +10,16 @@
 //!    settings file missing or bad ──▶ stop Caddy, exit non-zero
 //!  3 lease still active ──▶ attach image, create end timer, start workspace
 //!  4 read the clock again, revoke each lease that is overdue now
+//!    gateway-open marker ──▶ stop Caddy, exit non-zero
+//!    a failed revoke or close in 2 or 4, or no end timer in 3 for a lease that ends before the next run
+//!      ──▶ stop Caddy, exit non-zero (the cut is not proven)
+//!    any other failure (an end timer in 3) ──▶ do not start Caddy; a Caddy that runs gets the check below
+//!      ── fail ──▶ stop Caddy; a Caddy in an unknown state ──▶ stop Caddy
 //!    no failure ──▶ start Caddy ── fail ──▶ stop Caddy, exit non-zero
-//!    a wrong token (GET and POST) to the public listener at GATEWAY_CHECK_ADDRESS gets no 401 ──▶ stop Caddy, exit non-zero (D5)
-//!    any other failure in 2, 3, or 4 ──▶ do not start Caddy; a Caddy that runs stays
+//!    a wrong token (GET and POST) to the public listener at GATEWAY_CHECK_ADDRESS gets no 401 ──▶ stop Caddy,
+//!      exit non-zero (D5); a proven answer other than 401 ──▶ also write gateway-open
+//!    success with an active lease ──▶ model check (one notification at the start and at the end of an outage)
+//!    gateway stopped or not started with an active lease ──▶ one notification; the next successful start ──▶ one more
 //! ```
 //!
 //! Build phase 1 has no workspace and no home image. The step order is the safety property:
@@ -21,15 +28,32 @@
 
 use crate::config::{self, Paths, Settings};
 use crate::gateway;
-use crate::grant::wrong_token_answer;
+use crate::grant::{check_gateway, model_name};
 use crate::lease::{self, Lease, State};
+use crate::notify;
 use crate::revoke::revoke;
-use crate::runner::{Runner, run_ok};
+use crate::runner::{Runner, exit_text, run_ok};
 use std::cell::Cell;
+use std::fs;
 use std::io::{self, Write};
-use std::net::IpAddr;
+
+/// The latest start of the next run, in seconds: pass-reconcile.timer starts a run each 5 minutes, and a
+/// run can take up to TimeoutStartSec of pass-reconcile.service (180 s) before its revoke.
+const NEXT_RUN: u64 = 300 + 180;
 
 pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) -> Result<(), String> {
+    // True when a run failed but the gateway still runs with its proof (a failed step, see step 4).
+    let runs = Cell::new(false);
+    let result = steps(paths, runner, clock, &runs);
+    match &result {
+        Ok(()) => gateway_up(paths, runner),
+        Err(e) if !runs.get() => gateway_down(paths, runner, e),
+        Err(_) => {}
+    }
+    result
+}
+
+fn steps(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64, runs: &Cell<bool>) -> Result<(), String> {
     let _lock = match paths.lock() {
         Ok(lock) => lock,
         Err(e) => return fail_closed(runner, format!("cannot take the lock {}: {e}", paths.lock.display())),
@@ -65,11 +89,15 @@ pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) ->
         .iter()
         .partition(|lease| lease.deadline <= now || lease.state == State::RevokeFailed);
     let mut failed = Vec::new();
+    // A failed revoke or close (the access cut is not proven), or an active lease with no end timer near
+    // its end: the gateway must stop (see step 4).
+    let mut must_stop = false;
     // 2. Revoke each lease that is overdue or in state revoke-failed.
     for lease in ended {
         // The end time of the record is the time of the revoke: an earlier revoke can have taken 30 seconds.
         if let Err(e) = revoke(paths, runner, &lease.name, clock(), false) {
             failed.push(e);
+            must_stop = true;
         }
     }
     // The token file gate. It runs before the settings read and step 3, so that a failure there cannot
@@ -83,6 +111,7 @@ pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) ->
             let _ = writeln!(io::stderr(), "sparkpass: reconcile: the token file holds a rule with no lease; closing the gateway");
             if let Err(e) = gateway::close(paths, runner) {
                 failed.push(e);
+                must_stop = true;
             }
         }
     } else if !active.iter().any(|lease| gateway::is_rule_of(paths, &lease.name)) {
@@ -98,6 +127,7 @@ pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) ->
             );
             if let Err(e) = revoke(paths, runner, &lease.name, clock(), false) {
                 failed.push(e);
+                must_stop = true;
             }
         }
     }
@@ -115,9 +145,9 @@ pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) ->
         let timer = match lease::end_timer_exists(runner, lease) {
             Ok(true) => Ok(()),
             // The clock again: the commands above can take 20 seconds, and the timer counts from now. The
-            // clock of this run does not go back, so a backward step can make the timer longer only by the
-            // time since the first read (about 20 seconds; see "Timing" in the design document). A deadline
-            // that passed in the meantime needs no timer: step 4 revokes that lease.
+            // production clock (main.rs steady_clock) never falls behind the time since its first read, so a
+            // backward step does not make the timer longer. A deadline that passed in the meantime needs no
+            // timer: step 4 revokes that lease.
             Ok(false) => match clock() {
                 later if lease.deadline <= later => Ok(()),
                 later => lease::create_end_timer(runner, lease, later),
@@ -126,6 +156,11 @@ pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) ->
         };
         if let Err(e) = timer {
             failed.push(e);
+            // With no end timer, only the next run revokes the lease: a deadline before that run would
+            // leave the key live past its end (owner decision D15 of the review of 2026-10-06).
+            if lease.deadline <= clock().saturating_add(NEXT_RUN) {
+                must_stop = true;
+            }
         }
     }
     // 4. The clock again, right before the start: a deadline can pass during the steps above.
@@ -133,38 +168,128 @@ pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) ->
     for lease in active.iter().filter(|lease| lease.deadline <= now) {
         if let Err(e) = revoke(paths, runner, &lease.name, now, false) {
             failed.push(e);
+            must_stop = true;
         }
     }
-    // Start the gateway (no effect if it runs). After a failure: no start, and no stop of a gateway
-    // that runs, because an overdue lease has the deny-all rule already.
+    // A gateway proven open stays stopped until the owner repairs the Caddyfile and removes the marker.
+    if let Some(marker) = gateway::open_marker(paths) {
+        failed.push(marker);
+        return fail_closed(runner, failed.join("; "));
+    }
+    // After a failure: no start. After a failure that is not an access cut (an end timer of step 3), a
+    // gateway that runs still gets its proof, because a failure that repeats on each run must not end the
+    // only periodic proof; a failed proof stops it (check_gateway). Otherwise a gateway that runs stays:
+    // each revoke and close of this run succeeded. Exit code 3 is "not active"; each other answer (a
+    // time-out, an error of systemctl) leaves the state unknown: stop.
     if !failed.is_empty() {
+        // A failed revoke or close leaves the access cut unproven: Caddy can still hold the old key in
+        // memory (a failed deny-all write or restart, and a failed stop), and a check with a wrong key
+        // cannot see that key. Stop the gateway; each run tries the stop again. No active guest loses
+        // access: a revoked lease has ended, and grant allows one lease at a time. Also stop for an
+        // active lease with no end timer that ends before the next run (step 3).
+        if must_stop {
+            return fail_closed(runner, failed.join("; "));
+        }
+        match runner.run(&["systemctl", "is-active", "--quiet", "caddy"]) {
+            Ok(out) if out.code == Some(3) => {}
+            Ok(out) if out.code == Some(0) => {
+                if let Err(e) = check_gateway(paths, runner, &settings) {
+                    failed.push(e);
+                    return Err(failed.join("; "));
+                }
+                runs.set(true);
+                return Err(format!("{}; the gateway runs with its proof, and it was not started again", failed.join("; ")));
+            }
+            other => {
+                failed.push(format!("the state of the gateway is unknown: {}", match other {
+                    Ok(out) => format!("`systemctl is-active caddy` {}", exit_text(out.code)),
+                    Err(e) => format!("`systemctl is-active caddy`: {e}"),
+                }));
+                return fail_closed(runner, failed.join("; "));
+            }
+        }
         return Err(format!("{}; the gateway was not started", failed.join("; ")));
     }
-    // A start that failed or timed out can still complete in systemd, and that gateway has no proof: stop it.
+    // Start the gateway (no effect if it runs). A start that failed or timed out can still complete in
+    // systemd, and that gateway has no proof: stop it.
     // ponytail: one check, right after the start. A Caddy that still waits for its first ACME certificate
     // (a first install, or a host that was off past the end of its certificate) fails the TLS check, and
     // each run stops it again. Upgrade: repeat the check for the time of an ACME order. Until then, the
     // owner starts Caddy by hand, waits for the certificate, and runs reconcile.
-    run_ok(runner, &["systemctl", "start", "caddy"])
-        .and_then(|_| check_gateway(runner, &settings))
-        .or_else(|e| fail_closed(runner, e))
+    if let Err(e) = run_ok(runner, &["systemctl", "start", "caddy"]) {
+        return fail_closed(runner, e);
+    }
+    check_gateway(paths, runner, &settings)?;
+    match active.iter().find(|lease| lease.deadline > now) {
+        Some(lease) => check_model(paths, runner, &settings, &lease.name),
+        // No lease: an outage marker of an ended lease has no use.
+        None => {
+            let _ = fs::remove_file(&paths.model_down);
+        }
+    }
+    Ok(())
 }
 
-/// The proof after each start (TODO branch of 2026-10-06; it extends the self-check of eng review D5):
-/// the public listener of this host refuses a wrong token. `--connect-to` with an empty host and port
-/// sends each connection to GATEWAY_CHECK_ADDRESS on the port of PUBLIC_URL, never through the public
-/// route or DNS, and TLS still checks the name of PUBLIC_URL. No part of the URL is parsed here.
-fn check_gateway(runner: &dyn Runner, settings: &Settings) -> Result<(), String> {
-    let address = match settings.gateway_check_address {
-        IpAddr::V6(address) => format!("[{address}]"),
-        address => address.to_string(),
+/// During a lease, the model must answer (owner decision of 2026-10-06). One outage sends one notification
+/// (the marker), and its end sends one more. Nothing else changes: the guest gets 503 meanwhile.
+fn check_model(paths: &Paths, runner: &dyn Runner, settings: &Settings, name: &str) {
+    // The marker of this lease only: a marker that an earlier lease left must not hide this outage.
+    let down = fs::read_to_string(&paths.model_down).is_ok_and(|text| text.trim() == name);
+    match model_name(runner, settings.model_port) {
+        // The marker goes after a sent notification only, as below: a failed send is tried again.
+        Ok(_) if down => {
+            if notify::send(paths, runner, &format!("sparkpass: the model endpoint answers again during the lease of {name}")) {
+                let _ = fs::remove_file(&paths.model_down);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "sparkpass: reconcile: {e}, during the lease of {name}");
+            // The marker after a sent notification only: a failed send is tried again on the next run.
+            if !down && notify::send(paths, runner, &format!("sparkpass: {e}, during the lease of {name}; the guest gets 503 until the model runs again")) {
+                let _ = fs::write(&paths.model_down, format!("{name}\n"));
+            }
+        }
+    }
+}
+
+/// The name of a lease that is active after the run, or the file of an unreadable lease, for the
+/// notifications of the gateway. A REVOKE-FAILED lease sent its own notification.
+fn active_lease(paths: &Paths) -> Option<String> {
+    lease::read_all(paths).ok()?.into_iter().find_map(|(file, lease)| match lease {
+        Ok(lease) => (lease.state == State::Active).then_some(lease.name),
+        Err(_) => Some(file.strip_suffix(".json").unwrap_or(&file).to_string()),
+    })
+}
+
+/// During a lease, a gateway that reconcile stopped or did not start gives the guest no access, also for
+/// hours (owner decision of 2026-10-06, review D3): one notification for each outage (the marker holds the
+/// lease name, as `model-down` does). Also with gateway-open: mark_open sends one message, and a failed send
+/// of it is not tried again.
+fn gateway_down(paths: &Paths, runner: &dyn Runner, error: &str) {
+    let Some(name) = active_lease(paths) else {
+        return;
     };
-    match wrong_token_answer(runner, &["--connect-to", &format!("::{address}:")], &settings.public_url) {
-        None => Ok(()),
-        Some((url, Ok(code))) => Err(format!(
-            "the gateway answered {code} through {url} at {address} to a request with a wrong token, and it must answer 401: the gateway does not enforce the token file; repair the import of the token file in the Caddyfile"
-        )),
-        Some((url, Err(e))) => Err(format!("the check with a wrong token through {url} at {address} failed: {e}")),
+    if fs::read_to_string(&paths.gateway_down).is_ok_and(|text| text.trim() == name) {
+        return;
+    }
+    // The marker after a sent notification only: a failed send is tried again on the next run.
+    if notify::send(paths, runner, &format!("sparkpass: the gateway does not run during the lease of {name}, so the guest has no access; reconcile tries again each 5 minutes: {error}")) {
+        let _ = fs::write(&paths.gateway_down, format!("{name}\n"));
+    }
+}
+
+/// The end of the outage of `gateway_down`: one more notification while that lease is still active. The
+/// marker goes after a sent notification only (a failed send is tried again), or at once with no such lease.
+fn gateway_up(paths: &Paths, runner: &dyn Runner) {
+    let Ok(text) = fs::read_to_string(&paths.gateway_down) else {
+        return;
+    };
+    let name = text.trim();
+    if !active_lease(paths).is_some_and(|lease| lease == name)
+        || notify::send(paths, runner, &format!("sparkpass: the gateway runs again during the lease of {name}"))
+    {
+        let _ = fs::remove_file(&paths.gateway_down);
     }
 }
 
@@ -188,6 +313,9 @@ mod tests {
     const START: &str = "systemctl start caddy";
     const STOP: &str = "systemctl stop caddy";
     const RESTART: &str = "systemctl try-restart caddy";
+    const CADDY_ACTIVE: &str = "systemctl is-active --quiet caddy";
+    /// The health check of the model during a lease, after the gateway check.
+    const HEALTH: &str = "curl -q --noproxy * -fsS -m 8 http://127.0.0.1:8000/v1/models";
     const REVOKE_FAILED: &str = "the revoke of bob is not complete (state revoke-failed)";
     /// The check with a wrong token after the start, through the check address of `Paths::temp`.
     const PROBE: &str = "curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ::127.0.0.1: -H Authorization: Bearer 0000000000000000000000000000000000000000000000000000000000000000 https://spark.example.net/v1/models";
@@ -288,7 +416,7 @@ mod tests {
             runner.exit(&check_timer(2_000), 0);
             runner.on(probe, answer);
             let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
-            assert!(error.contains(text) && error.ends_with("; the gateway is stopped"), "{error}");
+            assert!(error.contains(text) && error.contains("; the gateway is stopped"), "{error}");
             let probes: &[&str] = if probe == PROBE { &[PROBE] } else { &[PROBE, PROBE_POST] };
             assert_eq!(runner.calls(), [&[FIREWALL, &check_timer(2_000), START][..], probes, &[STOP]].concat());
             assert!(!error.contains(&"ab".repeat(32)), "{error}");
@@ -449,7 +577,7 @@ mod tests {
         let clock = || if reads.fetch_add(1, Ordering::SeqCst) == 0 { NOW } else { 2_000 };
         runner.exit(RESTART, 1);
         let error = reconcile(&paths, &runner, &clock).unwrap_err();
-        assert!(error.ends_with("; the gateway was not started"), "{error}");
+        assert!(error.ends_with("; the gateway is stopped"), "{error}");
         assert_eq!(runner.count(START), 0);
         assert_eq!(state(&paths), State::RevokeFailed);
 
@@ -463,7 +591,8 @@ mod tests {
         let reads = AtomicU64::new(0);
         let clock = || if reads.fetch_add(1, Ordering::SeqCst) == 0 { NOW } else { 2_000 };
         let error = reconcile(&paths, &runner, &clock).unwrap_err();
-        assert!(error.ends_with("; the gateway was not started"), "{error}");
+        // A failed revoke: the gateway stops (owner decision D13).
+        assert!(error.ends_with("; the gateway is stopped"), "{error}");
         assert_eq!(runner.count(START), 0);
         assert_eq!(files(&paths.leases), ["amy.json"]);
         assert_eq!(files(&paths.history), ["bob-1000.json"]);
@@ -560,7 +689,7 @@ mod tests {
         fs::remove_file(&paths.token).unwrap();
         fs::create_dir(&paths.token).unwrap();
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
-        assert_eq!(runner.calls(), [FIREWALL, STOP]);
+        assert_eq!(runner.calls(), [FIREWALL, STOP, STOP]);
         // Extended by the /ship test coverage audit (2026-10-06): the error names the file to repair.
         // Value: protects=the error of a failed deny-all write in gateway::close names the token file path;
         // fails_when=the format in close drops paths.token.display(), and the owner reads "Is a directory" with no file;
@@ -581,7 +710,9 @@ mod tests {
         runner.exit(RESTART, 1);
         assert!(reconcile(&paths, &runner, &|| NOW).is_err());
         let calls = runner.calls();
-        assert!(calls.ends_with(&[RESTART.into(), STOP.into(), stop_timer(2_000), check_timer(2_000)]), "{calls:?}");
+        // The stop after the failed restart, and one more at the end: a failed revoke leaves the cut
+        // unproven, so no check follows (review of 2026-10-06, owner decision D13).
+        assert!(calls.ends_with(&[RESTART.into(), STOP.into(), stop_timer(2_000), check_timer(2_000), STOP.into()]), "{calls:?}");
         assert_eq!(runner.count(START), 0);
         assert_eq!(state(&paths), State::RevokeFailed);
         assert!(gateway::is_deny_all(&paths));
@@ -629,7 +760,7 @@ mod tests {
         runner.exit(&check_timer(2_000), 0);
         fs::write(&paths.token, &rule_of_bob).unwrap();
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
-        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), START, PROBE, PROBE_POST]);
+        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH]);
         assert_eq!(fs::read_to_string(&paths.token).unwrap(), rule_of_bob);
     }
 
@@ -641,8 +772,9 @@ mod tests {
         fs::write(&paths.token, "").unwrap();
         runner.on(&check_timer(2_000), hang());
         assert!(reconcile(&paths, &runner, &|| NOW).is_err());
-        // The revoke of the dead key closes the gateway first; its timer stop fails on the hang.
-        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(2_000), &check_timer(2_000)]);
+        // The revoke of the dead key closes the gateway first; its timer stop fails on the hang, so the
+        // gateway stops at the end (a failed revoke).
+        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(2_000), &check_timer(2_000), STOP]);
         assert!(gateway::is_deny_all(&paths));
         assert_eq!(runner.count(START), 0);
         assert_eq!(runner.count("systemd-run"), 0);
@@ -692,9 +824,9 @@ mod tests {
             let clock = || if reads.fetch_add(1, Ordering::SeqCst) == 0 { NOW } else { later };
             assert_eq!(reconcile(&paths, &runner, &clock), Ok(()));
             let timer = format!(
-                "systemd-run --collect --unit=sparkpass-end-bob-2000 --on-calendar=1970-01-01 00:33:20 UTC --on-active={on_active} --timer-property=AccuracySec=1s --timer-property=RemainAfterElapse=no --property=Type=oneshot --property=TimeoutStartSec=120 /usr/local/bin/sparkpass revoke bob --deadline 2000"
+                "systemd-run --collect --unit=sparkpass-end-bob-2000 --on-calendar=1970-01-01 00:33:20 UTC --on-active={on_active} --timer-property=AccuracySec=1s --timer-property=RemainAfterElapse=no --property=Type=oneshot --property=TimeoutStartSec=240 /usr/local/bin/sparkpass revoke bob --deadline 2000"
             );
-            assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), &timer, &check_timer(2_000), START, PROBE, PROBE_POST]);
+            assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), &timer, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH]);
             // The lease and its access stay.
             assert_eq!(state(&paths), State::Active);
             assert!(!gateway::is_deny_all(&paths));
@@ -708,7 +840,7 @@ mod tests {
         gateway::write_rule(&paths, &gateway::rule(Some(("bob", &"ab".repeat(32))))).unwrap();
         runner.exit(&check_timer(2_000), 0);
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
-        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), START, PROBE, PROBE_POST]);
+        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH]);
     }
 
     #[test]
@@ -729,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_revoke_step_means_no_gateway_start_and_no_gateway_stop() {
+    fn failed_revoke_step_means_no_gateway_start_and_a_gateway_stop() {
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
         seed(&paths, "bob", 1_000, State::Active);
         // The end timer is active after the stop.
@@ -737,14 +869,15 @@ mod tests {
         // The error is the only report of the failed revoke: revoke itself writes nothing to the journal.
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.contains(REVOKE_FAILED) && error.contains("is active after the stop"), "{error}");
-        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(1_000), &check_timer(1_000)]);
+        // A failed revoke leaves the cut unproven: the gateway stops, with no check (owner decision D13).
+        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(1_000), &check_timer(1_000), STOP]);
         assert_eq!(state(&paths), State::RevokeFailed);
 
         // The next run with no failure completes the revoke and starts the gateway.
         runner.exit(&check_timer(1_000), 3);
         assert_eq!(reconcile(&paths, &runner, &|| NOW + 300), Ok(()));
         assert_eq!(runner.count(START), 1);
-        assert_eq!(runner.count(STOP), 0);
+        assert_eq!(runner.count(STOP), 1);
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
     }
 
@@ -773,7 +906,8 @@ mod tests {
         write_rule_of_bob(&paths);
         runner.on(&check_timer(2_000), hang());
         assert!(reconcile(&paths, &runner, &|| NOW).is_err());
-        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000)]);
+        // No start, and the gateway that runs passes its check, so it stays.
+        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), CADDY_ACTIVE, PROBE, PROBE_POST]);
 
         // Step 3: the timer create hangs.
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
@@ -789,9 +923,10 @@ mod tests {
         seed(&paths, "bob", 1_000, State::Active);
         runner.on(RESTART, hang());
         assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+        // The gateway is stopped, and stopped again at the end (a failed revoke), so no check follows.
         assert_eq!(
             runner.calls(),
-            [FIREWALL, RESTART, STOP, &stop_timer(1_000), &check_timer(1_000)]
+            [FIREWALL, RESTART, STOP, &stop_timer(1_000), &check_timer(1_000), STOP]
         );
         assert_eq!(state(&paths), State::RevokeFailed);
 
@@ -842,5 +977,390 @@ mod tests {
         assert_eq!(runner.count("systemd-run"), 0);
         assert_eq!(files(&paths.leases), ["bob.json"]);
         assert_eq!(state(&paths), State::RevokeFailed);
+    }
+
+    #[test]
+    fn gateway_marked_open_stays_stopped_also_with_a_lease() {
+        for lease in [false, true] {
+            let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+            if lease {
+                seed(&paths, "bob", 2_000, State::Active);
+                write_rule_of_bob(&paths);
+                runner.exit(&check_timer(2_000), 0);
+            }
+            fs::write(&paths.gateway_open, "the gateway answered 200 through https://spark.example.net/v1/models\n").unwrap();
+            let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+            assert!(error.contains("the gateway was proven open earlier") && error.ends_with("the gateway is stopped"), "{error}");
+            assert_eq!(runner.count(START), 0);
+            assert_eq!(runner.calls().last().map(String::as_str), Some(STOP));
+        }
+    }
+
+    #[test]
+    fn wrong_token_answer_other_than_401_writes_the_marker_and_a_curl_failure_does_not() {
+        for (answer, marked) in [(output(0, "200"), true), (output(28, "000"), false)] {
+            let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+            runner.on(PROBE, answer);
+            assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+            assert_eq!(paths.gateway_open.exists(), marked);
+            // The next run: with the marker, no start; without it, the start and the check again.
+            let runner = FakeRunner::healthy();
+            let _ = reconcile(&paths, &runner, &|| NOW + 300);
+            assert_eq!(runner.count(START), usize::from(!marked));
+        }
+    }
+
+    #[test]
+    fn gateway_that_runs_is_checked_also_after_a_failed_step() {
+        // A failed step that is not an access cut (the end timer create fails on each run), and a gateway
+        // that answers 200.
+        let failed_timer = || {
+            let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+            seed(&paths, "bob", 2_000, State::Active);
+            write_rule_of_bob(&paths);
+            runner.exit(&create_timer(2_000), 1);
+            (paths, runner)
+        };
+        let (paths, runner) = failed_timer();
+        runner.on(PROBE, output(0, "200"));
+        let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+        assert!(error.contains("answered 200") && error.contains("; the gateway is stopped; each reconcile run stops the gateway"), "{error}");
+        assert!(runner.calls().ends_with(&[CADDY_ACTIVE, PROBE, STOP].map(String::from)), "{:?}", runner.calls());
+        assert!(paths.gateway_open.exists());
+        assert_eq!(runner.count(START), 0);
+
+        // A gateway that does not run gets no check and no stop.
+        let (paths, runner) = failed_timer();
+        runner.exit(CADDY_ACTIVE, 3);
+        assert!(reconcile(&paths, &runner, &|| NOW).unwrap_err().ends_with("the gateway was not started"));
+        assert_eq!(runner.calls().last().map(String::as_str), Some(CADDY_ACTIVE));
+        assert_eq!(runner.count(STOP), 0);
+        assert!(!paths.gateway_open.exists());
+
+        // Extended by the /ship test coverage audit (2026-10-06, TODO batch 2): no answer after a failed step.
+        // Value: protects=after a failed step, a check of a gateway that runs and gets no answer is no proof, so the gateway stops (with no marker);
+        // fails_when=the failed-step branch stops the gateway only on a proven answer, and a gateway with no proof stays up on each run;
+        // why_new=this branch had only the case of a 200 answer; seam=none
+        let (paths, runner) = failed_timer();
+        runner.on(PROBE, hang());
+        let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+        assert!(error.contains("failed: curl: no result after 10s") && error.ends_with("the gateway is stopped"), "{error}");
+        assert!(runner.calls().ends_with(&[CADDY_ACTIVE, PROBE, STOP].map(String::from)), "{:?}", runner.calls());
+        assert!(!paths.gateway_open.exists());
+    }
+
+    // Added by the /ship review, Step 11 (2026-10-06, Codex P1, owner decision D13).
+    // Value: protects=a failed revoke whose close and stop failed does not leave a running Caddy that a
+    // check with a wrong key would accept; the stop runs again; fails_when=the failed-step branch checks a
+    // running gateway also after a failed revoke; why_new=each failed-revoke test had a stop that works; seam=none
+    #[test]
+    fn failed_revoke_with_a_failed_stop_gets_no_check_and_a_new_stop() {
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        seed(&paths, "bob", 1_000, State::Active);
+        write_rule_of_bob(&paths);
+        runner.exit(RESTART, 1);
+        runner.exit(STOP, 1);
+        let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+        assert!(error.ends_with("THE GATEWAY STOP FAILED ALSO: `systemctl stop caddy`: exit code 1: "), "{error}");
+        assert_eq!(runner.count(PROBE), 0, "{:?}", runner.calls());
+        assert_eq!(runner.count(STOP), 2, "{:?}", runner.calls());
+        assert_eq!(runner.calls().last().map(String::as_str), Some(STOP));
+        assert_eq!(state(&paths), State::RevokeFailed);
+    }
+
+    #[test]
+    fn model_outage_during_a_lease_sends_one_notification_and_one_when_it_ends() {
+        const NOTIFY: &str = "curl -q -fsS -o /dev/null -m 8 --data-binary ";
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\nNOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        seed(&paths, "bob", 5_000, State::Active);
+        write_rule_of_bob(&paths);
+        runner.exit(&check_timer(5_000), 0);
+        runner.on(HEALTH, output(7, ""));
+        // Two runs during the outage: one notification, and the run itself succeeds.
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 300), Ok(()));
+        let sent: Vec<String> = runner.calls().into_iter().filter(|call| call.starts_with(NOTIFY)).collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("the model endpoint is not healthy") && sent[0].contains("during the lease of bob"), "{sent:?}");
+        assert!(paths.model_down.exists());
+        // The model answers again: one more notification, and the marker goes.
+        runner.on(HEALTH, output(0, r#"{"data":[{"id":"test-model"}]}"#));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 600), Ok(()));
+        let sent: Vec<String> = runner.calls().into_iter().filter(|call| call.starts_with(NOTIFY)).collect();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].contains("answers again during the lease of bob"), "{sent:?}");
+        assert!(!paths.model_down.exists());
+
+        // With no lease, an old outage marker goes, and no health check runs.
+        fs::write(&paths.model_down, "bob\n").unwrap();
+        let (paths2, runner) = (paths, FakeRunner::healthy());
+        fs::remove_file(paths2.lease("bob")).unwrap();
+        gateway::write_rule(&paths2, &gateway::rule(None)).unwrap();
+        assert_eq!(reconcile(&paths2, &runner, &|| NOW), Ok(()));
+        assert_eq!(runner.count(HEALTH), 0);
+        assert!(!paths2.model_down.exists());
+    }
+
+    // Added by the /ship review (2026-10-06, TODO batch 2): the stop comes before the notification.
+    // Value: protects=a gateway proven open stops at once; the notification (up to one command limit) and
+    // its text come after the stop; fails_when=check_gateway notifies before the stop;
+    // why_new=no test set NOTIFY_URL on the path of a proven-open gateway; seam=none
+    #[test]
+    fn proven_open_gateway_stops_before_the_notification() {
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\nNOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        runner.on(PROBE, output(0, "200"));
+        let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+        let calls = runner.calls();
+        assert_eq!(calls[calls.len() - 2], STOP, "{calls:?}");
+        assert!(calls[calls.len() - 1].starts_with(&format!("curl -q -fsS -o /dev/null -m 8 --data-binary sparkpass: {error} ")), "{calls:?}");
+        assert_eq!(runner.count(STOP), 1);
+    }
+
+    // Added by the /ship review (2026-10-06, TODO batch 2).
+    // Value: protects=an outage during a lease always gives one notification; fails_when=check_model trusts
+    // a marker that an earlier lease left; why_new=the outage test has one lease only; seam=none
+    #[test]
+    fn outage_marker_of_an_earlier_lease_does_not_hide_the_outage_of_the_next_lease() {
+        const NOTIFY: &str = "curl -q -fsS -o /dev/null -m 8 --data-binary ";
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\nNOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        // The lease of bob ended during an outage, and amy got a pass before the next reconcile.
+        fs::write(&paths.model_down, "bob\n").unwrap();
+        seed(&paths, "amy", 5_000, State::Active);
+        gateway::write_rule(&paths, &gateway::rule(Some(("amy", &"ab".repeat(32))))).unwrap();
+        runner.exit("systemctl is-active --quiet sparkpass-end-amy-5000.timer", 0);
+        runner.on(HEALTH, output(7, ""));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        let sent: Vec<String> = runner.calls().into_iter().filter(|call| call.starts_with(NOTIFY)).collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("during the lease of amy"), "{sent:?}");
+        assert_eq!(fs::read_to_string(&paths.model_down).unwrap(), "amy\n");
+    }
+
+    // Added by the /ship review (2026-10-06, TODO batch 2).
+    // Value: protects=after a failed step, a gateway in an unknown state stops (fail closed);
+    // fails_when=each is-active error counts as "does not run", so the gateway gets no check and no stop;
+    // why_new=the failed-step tests have exit codes 0 and 3 only; seam=none
+    #[test]
+    fn unknown_gateway_state_after_a_failed_step_stops_the_gateway() {
+        for answer in [hang(), output(1, "")] {
+            // A failed end-timer create: a failed step that is not an access cut.
+            let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+            seed(&paths, "bob", 2_000, State::Active);
+            write_rule_of_bob(&paths);
+            runner.exit(&create_timer(2_000), 1);
+            runner.on(CADDY_ACTIVE, answer);
+            let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+            assert!(error.contains("the state of the gateway is unknown") && error.ends_with("; the gateway is stopped"), "{error}");
+            assert_eq!(runner.calls().last().map(String::as_str), Some(STOP));
+            assert_eq!(runner.count(PROBE), 0);
+        }
+    }
+
+    // Added by the /ship review (2026-10-06, TODO batch 2, owner decision D3 of the review).
+    // Value: protects=the owner learns of a guest with no gateway: one notification for each outage, one at its
+    // end, none with no lease; fails_when=reconcile stops the gateway during a lease and sends nothing;
+    // why_new=only the model outage and a gateway proven open had notifications; seam=none
+    #[test]
+    fn gateway_stop_during_a_lease_sends_one_notification_and_one_when_it_runs_again() {
+        const NOTIFY: &str = "curl -q -fsS -o /dev/null -m 8 --data-binary ";
+        let sent = |runner: &FakeRunner| -> Vec<String> { runner.calls().into_iter().filter(|call| call.starts_with(NOTIFY)).collect() };
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\nNOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        seed(&paths, "bob", 5_000, State::Active);
+        write_rule_of_bob(&paths);
+        runner.exit(&check_timer(5_000), 0);
+        // Two runs with a failed firewall load: the gateway stops on each run, and one notification goes.
+        runner.exit(FIREWALL, 1);
+        assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+        assert!(reconcile(&paths, &runner, &|| NOW + 300).is_err());
+        let messages = sent(&runner);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains("the gateway does not run during the lease of bob") && messages[0].contains("the firewall rules did not load"), "{messages:?}");
+        // The firewall loads again: the gateway starts with its check, one more notification, and the marker goes.
+        runner.exit(FIREWALL, 0);
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 600), Ok(()));
+        let messages = sent(&runner);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[1].contains("the gateway runs again during the lease of bob"), "{messages:?}");
+        assert!(!paths.gateway_down.exists());
+
+        // A failed step while the gateway runs with its proof: the guest has access, so no notification.
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\nNOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        seed(&paths, "bob", 5_000, State::Active);
+        write_rule_of_bob(&paths);
+        runner.exit(&check_timer(5_000), 3);
+        runner.exit(&create_timer(5_000), 1);
+        assert!(reconcile(&paths, &runner, &|| NOW).unwrap_err().ends_with("the gateway runs with its proof, and it was not started again"));
+        assert_eq!(sent(&runner), [] as [String; 0]);
+
+        // No lease: a stop sends nothing.
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\nNOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        runner.exit(FIREWALL, 1);
+        assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+        assert_eq!(sent(&runner), [] as [String; 0]);
+    }
+
+    const CONFIG_WITH_NOTIFY: &str = "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\nNOTIFY_URL=https://ntfy.example.net/secret-topic\n";
+    const NOTIFY_CALL: &str = "curl -q -fsS -o /dev/null -m 8 --data-binary ";
+
+    // Added by the /ship review, pass 2 (2026-10-06, TODO batch 2).
+    // Value: protects=the guards of gateway_down: one gateway-down message also after the message of
+    // mark_open (owner decision D7 of review pass 3), none for a REVOKE-FAILED lease (its revoke sends its
+    // own), and one message (and one at the end) for an unreadable lease file;
+    // fails_when=one guard goes; why_new=the first gateway-down test has an active lease only; seam=none
+    #[test]
+    fn gateway_down_sends_one_message_and_counts_an_unreadable_lease() {
+        // A gateway proven open during a lease: the message of mark_open, and the gateway-down message (owner
+        // decision D7 of review pass 3: a failed send of the first one is not tried again). The next run,
+        // stopped by the marker, sends nothing more.
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+        seed(&paths, "bob", 5_000, State::Active);
+        write_rule_of_bob(&paths);
+        runner.exit(&check_timer(5_000), 0);
+        runner.on(PROBE, output(0, "200"));
+        assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+        assert!(reconcile(&paths, &runner, &|| NOW + 300).is_err());
+        assert_eq!(runner.count(NOTIFY_CALL), 2, "{:?}", runner.calls());
+        assert!(runner.calls().iter().any(|call| call.contains("the gateway does not run during the lease of bob")), "{:?}", runner.calls());
+        // A REVOKE-FAILED lease sent its own message: the stop sends none.
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+        seed(&paths, "bob", 5_000, State::RevokeFailed);
+        runner.exit(FIREWALL, 1);
+        assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+        assert_eq!(runner.count(NOTIFY_CALL), 0, "{:?}", runner.calls());
+        // An unreadable lease file counts as a lease of its name: one message, and one after the repair.
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+        fs::write(paths.lease("bob"), "not json").unwrap();
+        assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+        assert_eq!(runner.count(NOTIFY_CALL), 1, "{:?}", runner.calls());
+        assert_eq!(fs::read_to_string(&paths.gateway_down).unwrap(), "bob\n");
+        seed(&paths, "bob", 5_000, State::Active);
+        write_rule_of_bob(&paths);
+        runner.exit(&check_timer(5_000), 0);
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 300), Ok(()));
+        let calls = runner.calls();
+        assert!(calls.last().unwrap().contains("the gateway runs again during the lease of bob"), "{calls:?}");
+    }
+
+    // Added by the /ship review, pass 2 (2026-10-06, TODO batch 2).
+    // Value: protects=a gateway-down marker of an earlier lease hides no outage, and a run with no lease
+    // removes it with no message; fails_when=gateway_down or gateway_up ignores the lease name;
+    // why_new=the model-down marker had this test, the gateway-down marker did not; seam=none
+    #[test]
+    fn gateway_down_marker_of_an_earlier_lease_does_not_hide_the_next_outage() {
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+        fs::write(&paths.gateway_down, "bob\n").unwrap();
+        seed(&paths, "amy", 5_000, State::Active);
+        runner.exit(FIREWALL, 1);
+        assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+        assert_eq!(runner.count(NOTIFY_CALL), 1, "{:?}", runner.calls());
+        assert_eq!(fs::read_to_string(&paths.gateway_down).unwrap(), "amy\n");
+        // A successful run after the lease ended removes the marker and sends nothing.
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+        fs::write(&paths.gateway_down, "bob\n").unwrap();
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        assert_eq!(runner.count(NOTIFY_CALL), 0, "{:?}", runner.calls());
+        assert!(!paths.gateway_down.exists());
+    }
+
+    // Added by the /ship review, pass 2 (2026-10-06, TODO batch 2).
+    // Value: protects=a failed send of an outage message is tried again on the next run; fails_when=the
+    // marker is written before or whatever the send gives; why_new=each test had a send that works; seam=none
+    #[test]
+    fn failed_outage_message_is_sent_again_on_the_next_run() {
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+        seed(&paths, "bob", 5_000, State::Active);
+        write_rule_of_bob(&paths);
+        runner.exit(&check_timer(5_000), 0);
+        runner.exit(FIREWALL, 1);
+        runner.on(NOTIFY_CALL, output(6, ""));
+        assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+        assert!(reconcile(&paths, &runner, &|| NOW + 300).is_err());
+        assert_eq!(runner.count(NOTIFY_CALL), 2, "{:?}", runner.calls());
+        assert!(!paths.gateway_down.exists());
+        // The same for the model outage.
+        runner.exit(FIREWALL, 0);
+        runner.on(HEALTH, output(7, ""));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 600), Ok(()));
+        assert!(!paths.model_down.exists());
+        // The sends work again: one message, then the marker.
+        runner.on(NOTIFY_CALL, output(0, "200"));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 900), Ok(()));
+        assert!(paths.model_down.exists());
+        // The end of the outage: a failed send keeps the marker for the next run (added in review pass 3).
+        runner.on(HEALTH, output(0, r#"{"data":[{"id":"test-model"}]}"#));
+        fs::write(&paths.gateway_down, "bob\n").unwrap();
+        runner.exit(NOTIFY_CALL, 6);
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 1_200), Ok(()));
+        assert!(paths.model_down.exists() && paths.gateway_down.exists());
+        runner.on(NOTIFY_CALL, output(0, "200"));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 1_500), Ok(()));
+        assert!(!paths.model_down.exists() && !paths.gateway_down.exists());
+    }
+
+    // Added by the /ship review, pass 3 (2026-10-06, TODO batch 2).
+    // Value: protects=a gateway marked open stops also when a step failed and Caddy still runs (no check
+    // can pass it); fails_when=the marker gate moves below the failed-step branch; why_new=the marker test
+    // had no failed step; seam=none
+    #[test]
+    fn gateway_marked_open_stops_also_after_a_failed_step_while_it_runs() {
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        seed(&paths, "bob", 2_000, State::Active);
+        write_rule_of_bob(&paths);
+        runner.exit(&create_timer(2_000), 1);
+        fs::write(&paths.gateway_open, "the gateway answered 200 through https://spark.example.net/v1/models\n").unwrap();
+        let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+        assert!(error.contains("the gateway was proven open earlier") && error.ends_with("the gateway is stopped"), "{error}");
+        assert_eq!(runner.count(PROBE), 0, "{:?}", runner.calls());
+        assert_eq!(runner.calls().last().map(String::as_str), Some(STOP));
+    }
+
+    // Added by the /ship review, pass 3 (2026-10-06, TODO batch 2).
+    // Value: protects=the gateway-down message on the failed-step paths where the guest has no access (Caddy
+    // does not run; a failed check stops it); fails_when=`runs` is set before the check; why_new=the
+    // gateway-down tests reached Err only through fail_closed; seam=none
+    #[test]
+    fn failed_step_with_a_stopped_gateway_during_a_lease_sends_the_gateway_down_message() {
+        for (command, answer) in [(CADDY_ACTIVE, output(3, "")), (PROBE, hang())] {
+            let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+            fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+            seed(&paths, "bob", 5_000, State::Active);
+            write_rule_of_bob(&paths);
+            runner.exit(&create_timer(5_000), 1);
+            runner.on(command, answer);
+            assert!(reconcile(&paths, &runner, &|| NOW).is_err());
+            let calls = runner.calls();
+            assert!(calls.last().unwrap().starts_with(&format!("{NOTIFY_CALL}sparkpass: the gateway does not run during the lease of bob")), "{calls:?}");
+            assert_eq!(fs::read_to_string(&paths.gateway_down).unwrap(), "bob\n");
+        }
+    }
+
+    // Added by the /ship review, Step 11 round 2 (2026-10-06, Codex P1, owner decision D15).
+    // Value: protects=an active lease with no end timer that ends before the next run gets no live key past
+    // its end: the gateway stops; a lease that ends later keeps its gateway (with the check); fails_when=a
+    // failed timer create never stops the gateway, or always does; why_new=the timer tests had a far deadline; seam=none
+    #[test]
+    fn active_lease_with_no_end_timer_near_its_end_stops_the_gateway() {
+        for (deadline, stops) in [(NOW + 60, true), (NOW + NEXT_RUN, true), (NOW + NEXT_RUN + 1, false)] {
+            let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+            seed(&paths, "bob", deadline, State::Active);
+            write_rule_of_bob(&paths);
+            runner.exit(&create_timer(deadline), 1);
+            let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+            assert_eq!(runner.count(PROBE), usize::from(!stops), "{deadline}: {:?}", runner.calls());
+            assert_eq!(runner.calls().last().map(String::as_str) == Some(STOP), stops, "{deadline}: {error}");
+            assert_eq!(state(&paths), State::Active);
+        }
     }
 }

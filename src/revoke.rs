@@ -15,7 +15,7 @@
 //!    docker rm -f workspace                        (SSH sessions end)        [build phase 2]
 //!    unmount and delete the home image                                       [build phase 2]
 //!    each step ok? ── yes ──▶ record to history/, delete the lease file
-//!                 └── no ───▶ mark REVOKE-FAILED, exit non-zero, journal
+//!                 └── no ───▶ mark REVOKE-FAILED, exit non-zero, journal, one NOTIFY_URL message
 //! ```
 //!
 //! `command` is the full diagram. `revoke` is the part under the lock; grant and reconcile call it
@@ -24,6 +24,7 @@
 use crate::config::Paths;
 use crate::gateway;
 use crate::lease::{self, Lease, State};
+use crate::notify;
 use crate::runner::Runner;
 use std::fs;
 use std::io::{self, Write};
@@ -65,6 +66,7 @@ pub fn revoke(paths: &Paths, runner: &dyn Runner, name: &str, now: u64, closed: 
         }
     }
     if failed.is_empty() {
+        let _ = fs::remove_file(&paths.revoke_failed);
         return Ok(());
     }
     // The mark must stay: reconcile starts the gateway again for a lease that is active and not overdue.
@@ -75,12 +77,22 @@ pub fn revoke(paths: &Paths, runner: &dyn Runner, name: &str, now: u64, closed: 
     }
     // Each caller gives this text to the journal.
     let failed = failed.join("; ");
-    Err(match mark {
-        Ok(()) => format!("the revoke of {name} is not complete (state revoke-failed); reconcile tries it again; failed steps: {failed}"),
+    let text = match mark {
+        Ok(()) => format!("the revoke of {name} is not complete (state revoke-failed); reconcile tries it again each 5 minutes; failed steps: {failed}"),
         Err(_) => format!(
             "the revoke of {name} is not complete, and THE MARK FAILED ALSO: the lease file can still say active, and reconcile can start the gateway; repair the state directory and run `sparkpass revoke {name}` again; failed steps: {failed}"
         ),
-    })
+    };
+    // One notification for each failed revoke, not one on each retry of reconcile. The marker holds the
+    // lease name and is written only after a sent message, so a failed send is tried again on the next retry.
+    // A retry sends only while no marker exists: an empty marker that a full disk left must not give a
+    // message on each run.
+    let sent = fs::read_to_string(&paths.revoke_failed).is_ok_and(|marker| marker.trim() == name);
+    let unsent_retry = matches!(paths.revoke_failed.try_exists(), Ok(false));
+    if !sent && (lease.state == State::Active || unsent_retry) && notify::send(paths, runner, &format!("sparkpass: {text}")) {
+        let _ = fs::write(&paths.revoke_failed, format!("{name}\n"));
+    }
+    Err(text)
 }
 
 /// `sparkpass revoke <name>`, and the call of the end timer: `deadline` is the deadline of the lease that
@@ -152,7 +164,7 @@ mod tests {
     use super::*;
     use crate::lease::{files, seed};
     use crate::runner::RunError;
-    use crate::runner::fake::FakeRunner;
+    use crate::runner::fake::{FakeRunner, output};
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -346,6 +358,7 @@ mod tests {
     fn mark_that_failed_is_not_reported_as_state_revoke_failed() {
         for timer_stays in [true, false] {
             let (paths, runner) = active();
+            fs::write(&paths.config, "NOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
             if timer_stays {
                 runner.exit(CHECK_TIMER, 0);
             }
@@ -362,6 +375,10 @@ mod tests {
             let error = revoke(&paths, &runner, "bob", 1_500, false).unwrap_err();
             assert!(error.contains("THE MARK FAILED ALSO"), "{error}");
             assert!(!error.contains("(state revoke-failed)"), "{error}");
+            // The notification gives the same true state (added by the /ship review, 2026-10-06).
+            let sent: Vec<String> = runner.calls().into_iter().filter(|call| call.starts_with("curl -q -fsS")).collect();
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(sent[0].contains(&error), "{sent:?}");
             // Access is cut already.
             assert!(gateway::is_deny_all(&paths));
         }
@@ -656,5 +673,55 @@ mod tests {
         assert_eq!(runner.calls(), [] as [&str; 0]);
         assert_eq!(fs::read_to_string(&paths.token).unwrap(), active_rule());
         assert_eq!(state(&paths), State::Active);
+    }
+
+    #[test]
+    fn first_revoke_failure_sends_one_notification_and_a_retry_sends_none() {
+        const NOTIFY: &str = "curl -q -fsS -o /dev/null -m 8 --data-binary sparkpass: the revoke of bob is not complete (state revoke-failed)";
+        let (paths, runner) = active();
+        fs::write(&paths.config, "NOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        // The end timer stays active after the stop: the revoke fails.
+        runner.exit(CHECK_TIMER, 0);
+        assert!(revoke(&paths, &runner, "bob", 1_500, false).is_err());
+        assert_eq!(runner.count(NOTIFY), 1, "{:?}", runner.calls());
+        assert_eq!(state(&paths), State::RevokeFailed);
+        assert!(revoke(&paths, &runner, "bob", 1_800, false).is_err());
+        assert_eq!(runner.count(NOTIFY), 1, "{:?}", runner.calls());
+        // A complete revoke removes the marker.
+        runner.exit(CHECK_TIMER, 3);
+        assert_eq!(revoke(&paths, &runner, "bob", 2_100, false), Ok(()));
+        assert!(!paths.revoke_failed.exists());
+    }
+
+    // Added by the /ship review, pass 3 (owner decision D6 of the review).
+    // Value: protects=the REVOKE-FAILED message reaches the owner also when its first send fails;
+    // fails_when=the message goes only at the first failure, whatever the send gives; why_new=the test above
+    // has a send that works; seam=none
+    #[test]
+    fn failed_send_of_the_revoke_failed_message_is_tried_again_on_the_next_retry() {
+        const NOTIFY: &str = "curl -q -fsS -o /dev/null -m 8 --data-binary sparkpass: the revoke of bob is not complete";
+        let (paths, runner) = active();
+        fs::write(&paths.config, "NOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        runner.exit(CHECK_TIMER, 0);
+        runner.exit(NOTIFY, 6);
+        assert!(revoke(&paths, &runner, "bob", 1_500, false).is_err());
+        assert!(!paths.revoke_failed.exists());
+        runner.on(NOTIFY, output(0, "200"));
+        assert!(revoke(&paths, &runner, "bob", 1_800, false).is_err());
+        assert_eq!(runner.count(NOTIFY), 2, "{:?}", runner.calls());
+        assert_eq!(fs::read_to_string(&paths.revoke_failed).unwrap(), "bob\n");
+        assert!(revoke(&paths, &runner, "bob", 2_100, false).is_err());
+        assert_eq!(runner.count(NOTIFY), 2, "{:?}", runner.calls());
+
+        // A marker that cannot be written (a full disk leaves an empty file; here a directory): one message,
+        // not one on each retry (added by the focused review of review pass 3).
+        let (paths, runner) = active();
+        fs::write(&paths.config, "NOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        fs::create_dir(&paths.revoke_failed).unwrap();
+        runner.exit(CHECK_TIMER, 0);
+        for now in [1_500, 1_800, 2_100] {
+            assert!(revoke(&paths, &runner, "bob", now, false).is_err());
+        }
+        assert_eq!(runner.count(NOTIFY), 1, "{:?}", runner.calls());
     }
 }

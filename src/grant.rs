@@ -2,9 +2,11 @@
 //!
 //! ```text
 //! flock
-//!  1 validate inputs, model health, gateway active, no lease, firewall rules;
-//!    a token file that is not deny-all (a key with no lease) ──▶ close the gateway; end-timer call;
-//!    then read the clock: deadline = now + TTL (main refuses a TTL shorter than steps 3 to 8, 60 s)
+//!  1 validate inputs, no gateway-open marker, no lease, model health, gateway active;
+//!    a wrong token (GET and POST) to the public listener at GATEWAY_CHECK_ADDRESS gets no 401
+//!    ── fail ──▶ stop Caddy, exit non-zero (a proven answer: write gateway-open);
+//!    firewall rules; a token file that is not deny-all (a key with no lease) ──▶ close the gateway;
+//!    end-timer call; then read the clock: deadline = now + TTL (main refuses a TTL shorter than steps 3 to 8, 60 s)
 //!  2 lease file (atomic write)          ── from here, each failure runs revoke
 //!  3 end timer for the deadline
 //!  4 token (not active)
@@ -12,7 +14,7 @@
 //!  6 workspace container                [build phase 2]
 //!  7 activate the token, reload Caddy
 //!  8 self-check (D5): 200 with the token, 401 with a wrong token (GET and POST)
-//!    ── fail ──▶ stop Caddy, revoke, exit non-zero
+//!    ── fail ──▶ stop Caddy, revoke, exit non-zero (a proven answer other than 401: write gateway-open)
 //!  9 print the pass
 //! ```
 
@@ -22,11 +24,13 @@ use crate::lease::{self, Lease, State};
 use crate::revoke::revoke;
 use crate::runner::{Runner, exit_text, run_ok};
 use crate::time::format_utc;
+use std::fs;
 use std::io::{self, Write};
+use std::net::IpAddr;
 
 /// Time limit of each curl call, in seconds. It must stay below the command limit in main.rs,
 /// so that curl reports its own error before the runner kills it.
-const CURL_LIMIT: &str = "8";
+pub const CURL_LIMIT: &str = "8";
 
 /// The longest time of steps 3 to 8: six commands (systemd-run, the timer check, the reload, and the three
 /// self-check requests), each with the command limit of main.rs. main refuses a shorter TTL, so that a key
@@ -43,15 +47,28 @@ pub fn grant(paths: &Paths, runner: &dyn Runner, name: &str, ttl: u64, clock: &d
         .map_err(|e| format!("cannot take the lock {}: {e}", paths.lock.display()))?;
     // 1. Validate before any state is written.
     let settings = config::read_settings(paths)?;
-    let model = model_name(runner, settings.model_port)?;
-    // Only reconcile starts the gateway (the boot gate). Without this check, step 7 fails late.
-    run_ok(runner, &["systemctl", "is-active", "--quiet", "caddy"])
-        .map_err(|_| "the gateway is not running; run `sparkpass reconcile` and read its output".to_string())?;
+    if let Some(marker) = gateway::open_marker(paths) {
+        return Err(marker);
+    }
+    // Before each command: a grant that must refuse holds the lock for no command, and its checks cannot
+    // stop the gateway of the active guest.
     let leases = lease::read_all(paths)
         .map_err(|e| format!("cannot read the lease directory {}: {e}", paths.leases.display()))?;
     if let Some((file, _)) = leases.first() {
         return Err(format!("a lease exists ({file}), and only one guest has access at a time; see `sparkpass list`"));
     }
+    // With no lease, each notification marker is of an earlier lease. A marker of a lease with this name
+    // would hide a message of the new lease (the markers hold the name only).
+    let _ = fs::remove_file(&paths.model_down);
+    let _ = fs::remove_file(&paths.gateway_down);
+    let _ = fs::remove_file(&paths.revoke_failed);
+    let model = model_name(runner, settings.model_port)?;
+    // Only reconcile starts the gateway (the boot gate). Without this check, step 7 fails late.
+    run_ok(runner, &["systemctl", "is-active", "--quiet", "caddy"])
+        .map_err(|_| "the gateway is not running; run `sparkpass reconcile` and read its output".to_string())?;
+    // The check of reconcile, through GATEWAY_CHECK_ADDRESS. With a wrong check address, the pass would
+    // work until the next reconcile stops the gateway. A failed check stops the gateway, as in reconcile.
+    check_gateway(paths, runner, &settings)?;
     run_ok(runner, &[config::FIREWALL]).map_err(|e| format!("the firewall rules did not load: {e}"))?;
     // With no lease, the token file must be the deny-all rule. Other content is a key with no end (a lost
     // lease file) or a cut file: close it here, as the reconcile gate does, with a limit for each command.
@@ -67,7 +84,7 @@ pub fn grant(paths: &Paths, runner: &dyn Runner, name: &str, ttl: u64, clock: &d
     run_ok(runner, &[config::BINARY, "revoke", name, "--deadline", "0"]).map_err(|e| {
         format!("the end timer needs {}, and it does not accept the call of the end timer: {e}; install this build first", config::BINARY)
     })?;
-    // The clock after the lock and after the commands above (up to 50 seconds): neither shortens the TTL,
+    // The clock after the lock and after the commands above (up to 7 commands, 70 seconds): neither shortens the TTL,
     // and the end timer counts the TTL from here, also after a backward clock step.
     let now = clock();
     let deadline = now.checked_add(ttl).ok_or("the TTL is too large")?;
@@ -89,8 +106,8 @@ pub fn grant(paths: &Paths, runner: &dyn Runner, name: &str, ttl: u64, clock: &d
     }
 }
 
-/// Step 1: the model must answer. Returns the model name.
-fn model_name(runner: &dyn Runner, port: u16) -> Result<String, String> {
+/// Step 1 and the health check of reconcile: the model must answer. Returns the model name.
+pub fn model_name(runner: &dyn Runner, port: u16) -> Result<String, String> {
     // ponytail: the port comes from MODEL_PORT and the name from the live endpoint, because the
     // schema of templates/pair.yaml is unknown until the hardware step. Upgrade: read both from the recipe.
     let url = format!("http://127.0.0.1:{port}/v1/models");
@@ -109,14 +126,16 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     lease::write(paths, lease).map_err(|e| format!("cannot write the lease file: {e}"))?;
     // 3. End timer. Nothing is handed out before this step: the token file is still the deny-all rule.
     // The step fails if the timer is not active after it.
-    lease::create_end_timer(runner, lease, lease.start)?;
+    // The monotonic time counts from a clock read right before systemd-run, not from the lease start: a
+    // sync stall in step 2 must not make the timer longer (review of 2026-10-06).
+    lease::create_end_timer(runner, lease, clock().max(lease.start))?;
     // 4. Token. It is not active yet.
     let token = gateway::new_token().map_err(|e| format!("cannot make a token: {e}"))?;
     // 5 and 6 are build phase 2: home image and workspace container.
     // 7. Activate the token. The model server is not touched. A sync stall in step 2 or a forward clock
-    // step can pass the deadline before this point; when it passed before systemd-run, only the monotonic
-    // trigger (the full TTL) is left. The key must not go live after its end time. The check looks forward
-    // only, so a backward step cannot make it fire.
+    // step can pass the deadline before this point; when it passed before systemd-run, the monotonic time
+    // of the timer is 0, and its revoke waits for the lock. The key must not go live after its end time.
+    // The check looks forward only, so a backward step cannot make it fire.
     // ponytail: the token write and the reload after this check have a window (a sync stall in the token
     // write). When the end timer closes the gateway before that write, grant writes the key over the
     // deny-all rule, and the end timer cuts it only after grant releases the lock (the rest of steps 7 and 8).
@@ -128,7 +147,8 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     run_ok(runner, &["systemctl", "reload", "caddy"])?;
     // 8. Self-check through the public listener (eng review D5). Each failure leaves the gateway with no
     // proof that it refuses a wrong token, and a revoke cannot close a gateway that ignores the token file:
-    // the gateway stops (fail closed), and the next reconcile starts it with its own check.
+    // the gateway stops (fail closed), and the next reconcile starts it with its own check, except after a
+    // proven answer other than 401 to a wrong token: that writes the gateway-open marker (below).
     let models = format!("{}/v1/models", settings.public_url);
     match status(runner, &["-H", &format!("Authorization: Bearer {token}")], &models) {
         Ok(code) if code == "200" => {}
@@ -144,20 +164,43 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     match wrong_token_answer(runner, &[], &settings.public_url) {
         None => {}
         // The gateway is open to all, and the revoke cannot close it: a new token file changes nothing.
-        Some((url, Ok(code))) => return Err(format!(
-            "the gateway answered {code} through {url} to a request with a wrong token, and it must answer 401: the gateway does not enforce the token file; {}; repair the import of the token file in the Caddyfile before the next reconcile starts the gateway",
-            gateway::stop(runner)
-        )),
+        Some((url, Ok(code))) => {
+            let evidence = format!("the gateway answered {code} through {url} to a request with a wrong token, and it must answer 401: the gateway does not enforce the token file");
+            return Err(gateway::mark_open(paths, runner, &evidence));
+        }
         Some((url, Err(e))) => return Err(format!("the self-check with a wrong token through {url} failed: {e}; {}", gateway::stop(runner))),
     }
     Ok(token)
+}
+
+/// Step 1 and the proof of reconcile after each start (TODO branch of 2026-10-06; it extends the self-check
+/// of eng review D5): the public listener of this host refuses a wrong token. `--connect-to` with an empty
+/// host and port sends each connection to GATEWAY_CHECK_ADDRESS on the port of PUBLIC_URL, never through
+/// the public route or DNS, and TLS still checks the name of PUBLIC_URL. No part of the URL is parsed here.
+/// Each failure stops the gateway (fail closed), and a proven answer other than 401 then writes the marker
+/// that keeps it stopped.
+pub fn check_gateway(paths: &Paths, runner: &dyn Runner, settings: &Settings) -> Result<(), String> {
+    let address = match settings.gateway_check_address {
+        IpAddr::V6(address) => format!("[{address}]"),
+        address => address.to_string(),
+    };
+    match wrong_token_answer(runner, &["--connect-to", &format!("::{address}:")], &settings.public_url) {
+        None => Ok(()),
+        Some((url, Ok(code))) => {
+            let evidence = format!(
+                "the gateway answered {code} through {url} at {address} to a request with a wrong token, and it must answer 401: the gateway does not enforce the token file; repair the import of the token file in the Caddyfile"
+            );
+            Err(gateway::mark_open(paths, runner, &evidence))
+        }
+        Some((url, Err(e))) => Err(format!("the check with a wrong token through {url} at {address} failed: {e}; {}", gateway::stop(runner))),
+    }
 }
 
 /// Step 8 and the reconcile check: a GET of the model list and a POST to the route of the model, each
 /// with a wrong token and with `extra` first. The URL and the answer of the first request that did not
 /// get 401, or `None` when both got 401. Grant and reconcile send the same requests: after each start,
 /// reconcile stops again a gateway that grant stopped (when both reach the same listener).
-pub fn wrong_token_answer(runner: &dyn Runner, extra: &[&str], public_url: &str) -> Option<(String, Result<String, String>)> {
+fn wrong_token_answer(runner: &dyn Runner, extra: &[&str], public_url: &str) -> Option<(String, Result<String, String>)> {
     let wrong = format!("Authorization: Bearer {WRONG_TOKEN}");
     let post = ["-H", &wrong, "-H", "Content-Type: application/json", "-d", "{}"];
     for (args, route) in [(&post[..2], "models"), (&post[..], "chat/completions")] {
@@ -223,7 +266,10 @@ mod tests {
     const FIREWALL: &str = config::FIREWALL;
     const BINARY_CHECK: &str = "/usr/local/bin/sparkpass revoke bob --deadline 0";
     const CADDY_ACTIVE: &str = "systemctl is-active --quiet caddy";
-    const TIMER: &str = "systemd-run --collect --unit=sparkpass-end-bob-1709210396 --on-calendar=2024-02-29 12:39:56 UTC --on-active=300 --timer-property=AccuracySec=1s --timer-property=RemainAfterElapse=no --property=Type=oneshot --property=TimeoutStartSec=120 /usr/local/bin/sparkpass revoke bob --deadline 1709210396";
+    /// The check of step 1 through GATEWAY_CHECK_ADDRESS (the reconcile check).
+    const CHECK_GET: &str = "curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ::127.0.0.1: -H Authorization: Bearer 0000000000000000000000000000000000000000000000000000000000000000 https://spark.example.net/v1/models";
+    const CHECK_POST: &str = "curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ::127.0.0.1: -H Authorization: Bearer 0000000000000000000000000000000000000000000000000000000000000000 -H Content-Type: application/json -d {} https://spark.example.net/v1/chat/completions";
+    const TIMER: &str = "systemd-run --collect --unit=sparkpass-end-bob-1709210396 --on-calendar=2024-02-29 12:39:56 UTC --on-active=300 --timer-property=AccuracySec=1s --timer-property=RemainAfterElapse=no --property=Type=oneshot --property=TimeoutStartSec=240 /usr/local/bin/sparkpass revoke bob --deadline 1709210396";
     const RELOAD: &str = "systemctl reload caddy";
     /// The start of each of the three self-check requests. The first request has the pass key after it.
     const SELF_CHECK: &str = "curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} -H Authorization: Bearer ";
@@ -272,6 +318,47 @@ mod tests {
         assert!(calls.ends_with(&[RESTART.into(), STOP_TIMER.into(), CHECK_TIMER.into()]), "{calls:?}");
     }
 
+    // Added by the /ship review (2026-10-06, TODO batch 2).
+    // Value: protects=an outage of a new lease with the name of an earlier lease gets its notification;
+    // fails_when=grant keeps the outage markers of an earlier lease; why_new=reconcile compares the name
+    // only, so a re-grant of the same name inherited the marker; seam=none
+    #[test]
+    fn grant_removes_the_outage_markers_of_an_earlier_lease() {
+        let (paths, runner) = host();
+        for marker in [&paths.model_down, &paths.gateway_down, &paths.revoke_failed] {
+            fs::write(marker, "bob\n").unwrap();
+        }
+        assert!(grant(&paths, &runner, "bob", TTL, &|| NOW).is_ok());
+        assert!(!paths.model_down.exists() && !paths.gateway_down.exists() && !paths.revoke_failed.exists());
+    }
+
+    // Added by the /ship review, pass 3: a refused grant keeps the outage markers of the active lease.
+    #[test]
+    fn grant_refused_for_an_existing_lease_keeps_the_outage_markers_of_that_lease() {
+        for state in [State::Active, State::RevokeFailed] {
+            let (paths, runner) = host();
+            seed(&paths, "bob", END, state);
+            for marker in [&paths.model_down, &paths.gateway_down, &paths.revoke_failed] {
+                fs::write(marker, "bob\n").unwrap();
+            }
+            assert_refused(&paths, &runner, &paths.snapshot());
+        }
+    }
+
+    // Added by the /ship review, Step 11 round 2 (2026-10-06).
+    // Value: protects=the monotonic time of the end timer counts from a clock read right before systemd-run,
+    // so a sync stall of the lease write cannot make the timer end after the deadline; fails_when=grant passes
+    // the lease start; why_new=each grant test had a clock that does not move; seam=none
+    #[test]
+    fn end_timer_counts_from_the_clock_before_systemd_run() {
+        let (paths, runner) = host();
+        let reads = AtomicU64::new(0);
+        // The first read sets the deadline; the lease write then takes 10 seconds.
+        let clock = || NOW + if reads.fetch_add(1, Ordering::SeqCst) == 0 { 0 } else { 10 };
+        assert!(grant(&paths, &runner, "bob", TTL, &clock).is_ok());
+        assert_eq!(runner.count(&TIMER.replace("--on-active=300", "--on-active=290")), 1, "{:?}", runner.calls());
+    }
+
     #[test]
     fn grant_returns_the_pass_after_the_self_check() {
         let (paths, runner) = host();
@@ -299,7 +386,7 @@ mod tests {
         let self_check = format!("{SELF_CHECK}{token} {MODELS}");
         assert_eq!(
             runner.calls(),
-            [HEALTH, CADDY_ACTIVE, FIREWALL, BINARY_CHECK, TIMER, CHECK_TIMER, RELOAD, &self_check, WRONG_GET, WRONG_POST]
+            [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, BINARY_CHECK, TIMER, CHECK_TIMER, RELOAD, &self_check, WRONG_GET, WRONG_POST]
         );
         let argv = runner.argv();
         let (key, wrong) = (format!("Authorization: Bearer {token}"), format!("Authorization: Bearer {WRONG_TOKEN}"));
@@ -313,7 +400,7 @@ mod tests {
             ]
         );
         assert_eq!(argv[0], ["curl", "-q", "--noproxy", "*", "-fsS", "-m", "8", "http://127.0.0.1:8000/v1/models"]);
-        assert_eq!(argv[3], [config::BINARY, "revoke", "bob", "--deadline", "0"]);
+        assert_eq!(argv[5], [config::BINARY, "revoke", "bob", "--deadline", "0"]);
         let lease = Lease { name: "bob".into(), start: NOW, deadline: END, state: State::Active };
         assert_eq!(lease::read(&paths, "bob"), Ok(Some(lease)));
         assert_eq!(files(&paths.history), [] as [&str; 0]);
@@ -348,6 +435,11 @@ mod tests {
             assert_eq!(runner.count(SELF_CHECK), 1);
             // No proof that the gateway refuses a wrong token: it stops before the revoke.
             assert_eq!(runner.count(STOP_CADDY), 1);
+            // Extended by the /ship test coverage audit (2026-10-06, TODO batch 2): no marker.
+            // Value: protects=a failed check of the pass key is no proof of an open gateway, so it writes no marker;
+            // fails_when=the marker write of step 8 moves to each failed self-check, and one 500 or timeout keeps the gateway stopped until the owner removes the marker;
+            // why_new=only the proven wrong-token answers of step 8 had a marker assert; seam=none
+            assert!(!paths.gateway_open.exists(), "{error}");
             assert_revoked(&paths, &runner, result);
         }
     }
@@ -371,6 +463,11 @@ mod tests {
                 assert_eq!(runner.count(STOP_CADDY), 1);
                 let calls = runner.calls();
                 assert!(calls.ends_with(&[STOP_CADDY, RESTART, STOP_TIMER, CHECK_TIMER].map(String::from)), "{calls:?}");
+                // Extended by the /ship test coverage audit (2026-10-06, TODO batch 2): no marker.
+                // Value: protects=a curl failure of a wrong-token request in step 8 writes no marker ("a curl failure never writes it");
+                // fails_when=the Err branch of step 8 also calls mark_open, and one network fault keeps the gateway stopped until the owner removes the marker;
+                // why_new=the marker asserts cover the step 8 answers and the curl failures of reconcile and grant step 1, not of step 8; seam=none
+                assert!(!paths.gateway_open.exists(), "{error}");
                 assert_revoked(&paths, &runner, result);
             }
         }
@@ -388,10 +485,13 @@ mod tests {
                 for part in [
                     &format!("the gateway answered {code} through {url} to a request with a wrong token, and it must answer 401"),
                     "the gateway does not enforce the token file; the gateway is stopped;",
-                    "repair the import of the token file in the Caddyfile before the next reconcile",
+                    "the gateway is stopped; each reconcile run stops the gateway until you repair the Caddyfile and remove",
                 ] {
                     assert!(error.contains(part), "{part:?} is not in: {error}");
                 }
+                // The marker keeps the gateway stopped and holds the evidence.
+                let marker = fs::read_to_string(&paths.gateway_open).unwrap();
+                assert!(marker.contains(&format!("answered {code} through {url}")), "{marker}");
                 assert_eq!(runner.count(SELF_CHECK), runs);
                 // One stop, and then the revoke: try-restart has no effect on a stopped gateway.
                 assert_eq!(runner.count(STOP_CADDY), 1);
@@ -563,7 +663,8 @@ mod tests {
                 let (paths, runner) = host();
                 seed(&paths, name, END, state);
                 assert_refused(&paths, &runner, &paths.snapshot());
-                assert_eq!(runner.count(FIREWALL), 0);
+                // No command: the checks of step 1 cannot stop the gateway of the active guest.
+                assert_eq!(runner.calls(), [] as [&str; 0]);
             }
         }
     }
@@ -594,7 +695,7 @@ mod tests {
             let (paths, runner) = host();
             runner.on(FIREWALL, firewall);
             assert_refused(&paths, &runner, &paths.snapshot());
-            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, FIREWALL]);
+            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL]);
         }
     }
 
@@ -605,7 +706,7 @@ mod tests {
             let (paths, runner) = host();
             runner.on(BINARY_CHECK, check);
             assert_refused(&paths, &runner, &paths.snapshot());
-            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, FIREWALL, BINARY_CHECK]);
+            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, BINARY_CHECK]);
             let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
             assert!(error.contains(config::BINARY) && error.contains("install this build first"), "{error}");
         }
@@ -631,7 +732,7 @@ mod tests {
         // The temporary file of the atomic write cannot be created. `read_all` ignores this name.
         fs::create_dir(paths.leases.join("bob.json.tmp")).unwrap();
         assert_refused(&paths, &runner, &paths.snapshot());
-        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, FIREWALL, BINARY_CHECK]);
+        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, BINARY_CHECK]);
     }
 
     #[test]
@@ -775,7 +876,7 @@ mod tests {
             fs::write(&paths.token, &text).unwrap();
             grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap();
             let calls = runner.calls();
-            assert_eq!(calls[..5], [HEALTH, CADDY_ACTIVE, FIREWALL, RESTART, BINARY_CHECK], "{text:?}");
+            assert_eq!(calls[..7], [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, RESTART, BINARY_CHECK], "{text:?}");
             assert!(gateway::is_rule_of(&paths, "bob"));
             assert_ne!(fs::read_to_string(&paths.token).unwrap(), text);
         }
@@ -785,7 +886,7 @@ mod tests {
         runner.exit(RESTART, 1);
         let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
         assert!(error.contains("the token file held a rule with no lease, and the close failed") && error.ends_with("the gateway is stopped"), "{error}");
-        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, FIREWALL, RESTART, STOP_CADDY]);
+        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, RESTART, STOP_CADDY]);
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
     }
 
@@ -795,7 +896,7 @@ mod tests {
         let before = paths.snapshot();
         assert_eq!(grant(&paths, &runner, "bob", 60, &|| u64::MAX - 59), Err("the TTL is too large".into()));
         // The clock is read after the checks of step 1, and they write nothing.
-        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, FIREWALL, BINARY_CHECK]);
+        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, BINARY_CHECK]);
         assert_eq!(paths.snapshot(), before);
     }
 
@@ -807,5 +908,32 @@ mod tests {
         assert_eq!(revoke(&paths, &runner, "bob", NOW + 60, false), Ok(()));
         grant(&paths, &runner, "bob", TTL, &|| NOW + 120).unwrap();
         assert_ne!(gateway::token_in(&paths.token).unwrap(), first);
+    }
+
+    #[test]
+    fn grant_refuses_while_the_gateway_is_marked_open() {
+        let (paths, runner) = host();
+        fs::write(&paths.gateway_open, "the gateway answered 200 through https://spark.example.net/v1/models\n").unwrap();
+        let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
+        assert!(error.contains("the gateway was proven open earlier") && error.contains("answered 200"), "{error}");
+        assert_eq!(runner.calls(), [] as [&str; 0]);
+        assert_eq!(files(&paths.leases), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn failed_check_through_the_check_address_stops_the_gateway_and_refuses() {
+        // A proven answer other than 401 writes the marker; a curl failure writes none.
+        for (answer, marked) in [(output(0, "200"), true), (output(0, "404"), true), (output(7, "000"), false)] {
+            let (paths, runner) = host();
+            runner.on(CHECK_GET, answer);
+            let before = paths.snapshot();
+            let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
+            assert!(error.contains("at 127.0.0.1") && error.contains("the gateway is stopped"), "{error}");
+            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, STOP_CADDY]);
+            assert_eq!(paths.gateway_open.exists(), marked, "{error}");
+            if !marked {
+                assert_eq!(paths.snapshot(), before);
+            }
+        }
     }
 }

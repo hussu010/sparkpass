@@ -20,6 +20,15 @@ pub struct Paths {
     /// The Caddyfile imports this file. `gateway::rule` owns its format.
     pub token: PathBuf,
     pub config: PathBuf,
+    /// Marker of a gateway proven open (an answer other than 401 to a wrong token). While it exists,
+    /// reconcile keeps the gateway stopped and grant refuses. The owner removes it after the repair.
+    pub gateway_open: PathBuf,
+    /// Marker of a model endpoint that was down during a lease, so that one outage sends one notification.
+    pub model_down: PathBuf,
+    /// Marker of a gateway that reconcile stopped or did not start during a lease (one notification).
+    pub gateway_down: PathBuf,
+    /// Marker of a sent REVOKE-FAILED notification (one notification for each failed revoke).
+    pub revoke_failed: PathBuf,
 }
 
 impl Paths {
@@ -33,6 +42,10 @@ impl Paths {
             lock: state.join("lock"),
             token: etc.join("token.caddy"),
             config: etc.join("config"),
+            gateway_open: state.join("gateway-open"),
+            model_down: state.join("model-down"),
+            gateway_down: state.join("gateway-down"),
+            revoke_failed: state.join("revoke-failed"),
         }
     }
 
@@ -61,9 +74,16 @@ pub struct Settings {
     pub public_url: String,
     /// Port of the model server on 127.0.0.1.
     pub model_port: u16,
-    /// IP address of the public listener on this host, for example 127.0.0.1. Reconcile sends its
-    /// wrong-token check there, with the name of `public_url`.
+    /// IP address of the public listener on this host, for example 127.0.0.1. Grant (step 1) and
+    /// reconcile send their wrong-token check there, with the name of `public_url`.
     pub gateway_check_address: IpAddr,
+}
+
+/// The `KEY=VALUE` lines of the settings file. "#" starts a comment.
+fn entries(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    text.lines()
+        .filter_map(|line| line.split('#').next().unwrap_or("").split_once('='))
+        .map(|(key, value)| (key.trim(), value.trim()))
 }
 
 /// Lines `KEY=VALUE`. "#" starts a comment. Unknown keys are ignored. Grant and reconcile read this file.
@@ -72,12 +92,11 @@ pub fn read_settings(paths: &Paths) -> Result<Settings, String> {
     let text = fs::read_to_string(&paths.config)
         .map_err(|e| format!("cannot read the settings file {file}: {e}"))?;
     let (mut url, mut port, mut address) = (None, None, None);
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("");
-        match line.split_once('=').map(|(key, value)| (key.trim(), value.trim())) {
-            Some(("PUBLIC_URL", value)) => url = Some(value.trim_end_matches('/')),
-            Some(("MODEL_PORT", value)) => port = value.parse::<u16>().ok().filter(|p| *p > 0),
-            Some(("GATEWAY_CHECK_ADDRESS", value)) => address = value.parse::<IpAddr>().ok(),
+    for entry in entries(&text) {
+        match entry {
+            ("PUBLIC_URL", value) => url = Some(value.trim_end_matches('/')),
+            ("MODEL_PORT", value) => port = value.parse::<u16>().ok().filter(|p| *p > 0),
+            ("GATEWAY_CHECK_ADDRESS", value) => address = value.parse::<IpAddr>().ok(),
             _ => {}
         }
     }
@@ -95,6 +114,14 @@ pub fn read_settings(paths: &Paths) -> Result<Settings, String> {
         model_port,
         gateway_check_address,
     })
+}
+
+/// NOTIFY_URL of the settings file (owner decision of 2026-10-06), if it is an https URL. It is optional and
+/// a secret, so a missing or bad value means no notification, never a failed command.
+pub fn notify_url(paths: &Paths) -> Option<String> {
+    let text = fs::read_to_string(&paths.config).ok()?;
+    let url = entries(&text).filter(|(key, _)| *key == "NOTIFY_URL").last()?.1;
+    url.starts_with("https://").then(|| url.to_string())
 }
 
 #[cfg(test)]
@@ -156,6 +183,15 @@ mod tests {
         assert_eq!(paths.token, Path::new("/etc/sparkpass/token.caddy"));
         assert_eq!(paths.config, Path::new("/etc/sparkpass/config"));
         assert_eq!(FIREWALL, "/usr/local/lib/sparkpass/rules.sh");
+        // Added by the /ship review (2026-10-06): the markers. tests/expiry.sh writes gateway-open itself,
+        // and install.sh names it: grant and reconcile must read that file.
+        assert_eq!(paths.gateway_open, Path::new("/var/lib/sparkpass/gateway-open"));
+        assert_eq!(paths.model_down, Path::new("/var/lib/sparkpass/model-down"));
+        assert_eq!(paths.gateway_down, Path::new("/var/lib/sparkpass/gateway-down"));
+        assert_eq!(paths.revoke_failed, Path::new("/var/lib/sparkpass/revoke-failed"));
+        let expiry = include_str!("../tests/expiry.sh");
+        assert!(expiry.contains("\nSTATE=/var/lib/sparkpass\n") && expiry.contains("\nMARKER=$STATE/gateway-open\n"));
+        assert!(include_str!("../install.sh").contains("/var/lib/sparkpass/gateway-open"));
     }
 
     #[test]

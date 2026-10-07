@@ -7,6 +7,7 @@ mod config;
 mod gateway;
 mod grant;
 mod lease;
+mod notify;
 mod reconcile;
 mod revoke;
 mod runner;
@@ -17,7 +18,7 @@ use runner::{RealRunner, Runner};
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Time limit of each system command. `grant::CURL_LIMIT` must stay below it.
 const COMMAND_LIMIT: Duration = Duration::from_secs(10);
@@ -80,6 +81,21 @@ fn run(args: &[&str], paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u6
     }
 }
 
+/// The clock of one run: the wall clock, but never earlier than its first read plus the time since then
+/// (a monotonic source). A backward step of the system clock thus cannot move an end later, also for an
+/// end timer that reconcile creates again (TODO of 2026-10-06: exact end timers).
+fn steady_clock(wall: impl Fn() -> u64, elapsed: impl Fn() -> u64) -> impl Fn() -> u64 {
+    let first = wall();
+    // Also never earlier than its last value: a forward and then backward step of the wall clock must
+    // not undo a read (review of 2026-10-06).
+    let latest = std::cell::Cell::new(first);
+    move || {
+        let now = wall().max(first.saturating_add(elapsed())).max(latest.get());
+        latest.set(now);
+        now
+    }
+}
+
 /// Writes the text of a command that completed, or returns the text for stderr. A failed write (a closed
 /// pipe, a full disk) must not panic: after a grant, the lease is active, and the owner must know it.
 /// The error holds no part of `text`, because a pass holds the token.
@@ -108,7 +124,9 @@ fn main() -> ExitCode {
     }
     // A step back to before 1970 after the check above reads as the end of time: each deadline has
     // passed (fail closed).
-    let clock = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(u64::MAX, |d| d.as_secs());
+    let wall = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(u64::MAX, |d| d.as_secs());
+    let start = Instant::now();
+    let clock = steady_clock(wall, || start.elapsed().as_secs());
     let runner = RealRunner {
         limit: COMMAND_LIMIT,
     };
@@ -132,6 +150,33 @@ mod tests {
     use super::*;
     use crate::lease::State;
     use crate::runner::fake::FakeRunner;
+
+    #[test]
+    fn steady_clock_follows_the_wall_clock_and_never_goes_behind_the_time_since_the_first_read() {
+        use std::cell::Cell;
+        let (wall, elapsed) = (Cell::new(10_000), Cell::new(0));
+        let clock = steady_clock(|| wall.get(), || elapsed.get());
+        assert_eq!(clock(), 10_000);
+        // Normal time: both move together.
+        wall.set(10_030);
+        elapsed.set(30);
+        assert_eq!(clock(), 10_030);
+        // A backward step of one hour: the clock still counts the 40 seconds since the first read.
+        wall.set(10_040 - 3_600);
+        elapsed.set(40);
+        assert_eq!(clock(), 10_040);
+        // A forward step: the wall clock wins.
+        wall.set(50_000);
+        elapsed.set(41);
+        assert_eq!(clock(), 50_000);
+        // Then a backward step: the clock keeps its last value (added by the /ship review, Step 11 round 2).
+        wall.set(10_042);
+        elapsed.set(42);
+        assert_eq!(clock(), 50_000);
+        // A wall clock before 1970 reads as the end of time (fail closed).
+        wall.set(u64::MAX);
+        assert_eq!(clock(), u64::MAX);
+    }
 
     #[test]
     fn parse_reads_each_subcommand() {

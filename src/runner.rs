@@ -138,6 +138,8 @@ pub mod fake {
         /// `healthy()` only: is an end timer active? `None`: each command gives exit code 0.
         /// ponytail: one state for all units, because one guest has access at a time.
         timer: Mutex<Option<bool>>,
+        /// `healthy()` only: does Caddy run? `start` and `stop` change it; `try-restart` does not start it.
+        caddy: Mutex<Option<bool>>,
     }
 
     pub fn output(code: i32, stdout: &str) -> Result<Output, RunError> {
@@ -149,16 +151,18 @@ pub mod fake {
     }
 
     impl FakeRunner {
-        /// A host in the normal state: the model answers, and no end timer is active.
+        /// A host in the normal state: the model answers, Caddy runs, and no end timer is active.
         /// `systemd-run` makes the end timer active, and `systemctl stop <unit>.timer` ends it.
         pub fn healthy() -> FakeRunner {
-            let runner = FakeRunner { timer: Mutex::new(Some(false)), ..FakeRunner::default() };
+            let runner = FakeRunner { timer: Mutex::new(Some(false)), caddy: Mutex::new(Some(true)), ..FakeRunner::default() };
             runner.on("curl -q --noproxy * -fsS -m 8 http://127.0.0.1:8000/v1/models", output(0, r#"{"object":"list","data":[{"id":"test-model"}]}"#));
             // The gateway accepts the pass key and refuses the wrong key of grant (the newer rule wins).
             runner.on("curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} -H Authorization: Bearer ", output(0, "200"));
             runner.on(&format!("curl -q --noproxy * -sS -o /dev/null -m 8 -w %{{http_code}} -H Authorization: Bearer {}", "0".repeat(64)), output(0, "401"));
             // The public listener at GATEWAY_CHECK_ADDRESS refuses the wrong token of the reconcile check.
             runner.on("curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ", output(0, "401"));
+            // The notification endpoint (NOTIFY_URL) accepts each message.
+            runner.on("curl -q -fsS -o /dev/null", output(0, "200"));
             runner
         }
 
@@ -209,6 +213,14 @@ pub mod fake {
                     ["systemctl", "stop", unit] if unit.ends_with(".timer") => *active = false,
                     // systemctl gives 3 for a unit that is not active.
                     ["systemctl", "is-active", "--quiet", unit] if unit.ends_with(".timer") && !*active => return output(3, ""),
+                    _ => {}
+                }
+            }
+            if let Some(active) = self.caddy.lock().unwrap().as_mut() {
+                match argv {
+                    ["systemctl", "start", "caddy"] => *active = true,
+                    ["systemctl", "stop", "caddy"] => *active = false,
+                    ["systemctl", "is-active", "--quiet", "caddy"] if !*active => return output(3, ""),
                     _ => {}
                 }
             }

@@ -183,7 +183,9 @@ pub fn create_end_timer(runner: &dyn Runner, lease: &Lease, now: u64) -> Result<
             // would read it as a live timer.
             "--timer-property=RemainAfterElapse=no",
             "--property=Type=oneshot",
-            "--property=TimeoutStartSec=120",
+            // The close before the lock (2 commands), the wait for a reconcile that holds the lock (14
+            // commands), and the steps under the lock (5 commands): 210 s of command limits, and a margin.
+            "--property=TimeoutStartSec=240",
             BINARY,
             "revoke",
             &lease.name,
@@ -462,7 +464,7 @@ mod tests {
                 "--timer-property=AccuracySec=1s",
                 "--timer-property=RemainAfterElapse=no",
                 "--property=Type=oneshot",
-                "--property=TimeoutStartSec=120",
+                "--property=TimeoutStartSec=240",
                 "/usr/local/bin/sparkpass",
                 "revoke",
                 "bob",
