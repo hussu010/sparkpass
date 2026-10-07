@@ -242,20 +242,39 @@ value_of() {
 check_address=$(sed 's/#.*//' /etc/sparkpass/config | value_of GATEWAY_CHECK_ADDRESS)
 model_port=$(sed 's/#.*//' /etc/sparkpass/config | value_of MODEL_PORT)
 caddy_port=$(value_of SPARKPASS_MODEL_PORT </etc/sparkpass/caddy.env)
-if [[ -z $check_address ]]; then
-	warn "/etc/sparkpass/config has no GATEWAY_CHECK_ADDRESS value. Until it has one, sparkpass reconcile
-keeps Caddy stopped and sparkpass grant refuses. Add the line GATEWAY_CHECK_ADDRESS=127.0.0.1
-(see $repo/etc/config.example)."
+# 127.0.0.1 only, where Caddy listens (read_settings in src/config.rs decides).
+if [[ $check_address != 127.0.0.1 ]]; then
+	warn "GATEWAY_CHECK_ADDRESS in /etc/sparkpass/config is \"$check_address\", and it must be 127.0.0.1,
+where Caddy listens (bind in gateway/Caddyfile; never the other Spark). Until it is, sparkpass
+reconcile keeps Caddy stopped and sparkpass grant refuses (see $repo/etc/config.example)."
 fi
 if [[ -n $model_port && $caddy_port != "$model_port" ]] || [[ -n $caddy_port && ! $caddy_port =~ ^[0-9]+$ ]]; then
 	warn "SPARKPASS_MODEL_PORT in /etc/sparkpass/caddy.env is \"$caddy_port\", and MODEL_PORT in
 /etc/sparkpass/config is \"$model_port\". Give both the same port number. With an empty
-SPARKPASS_MODEL_PORT, Caddy proxies to 127.0.0.1:80, its own redirect listener, not to the model server."
+SPARKPASS_MODEL_PORT, Caddy proxies to 127.0.0.1:80, not to the model server."
+fi
+# SPARKPASS_BIND is for tests/gateway.sh only. An empty value makes Caddy 2.6.2 listen on all addresses.
+if grep -qE '^[[:space:]]*SPARKPASS_BIND[[:space:]]*=' /etc/sparkpass/caddy.env; then
+	warn "/etc/sparkpass/caddy.env sets SPARKPASS_BIND. Remove that line: on the unit, Caddy listens on
+127.0.0.1 only (tailscaled forwards the TCP of Tailscale Funnel there), and an empty value makes
+Caddy 2.6.2 listen on all addresses. Only tests/gateway.sh sets it."
 fi
 if [[ $missing_rules == true ]]; then
 	warn "$rules does not exist, and the repository has no firewall/rules.sh (milestone 1 writes it).
 Until it exists, sparkpass grant refuses and sparkpass reconcile keeps Caddy stopped.
 Add firewall/rules.sh, then run this script again."
+fi
+# The inbound route is Tailscale Funnel. Warnings only: the owner sets it up after this script (step 1 below).
+if ! command -v tailscale >/dev/null; then
+	warn "tailscale is not installed. The inbound route is Tailscale Funnel: see step 1 below."
+fi
+cert_uid=
+if [[ -r /etc/default/tailscaled ]]; then
+	cert_uid=$(value_of TS_PERMIT_CERT_UID </etc/default/tailscaled | tr -d "\"'")
+fi
+if [[ $cert_uid != caddy ]]; then
+	warn "/etc/default/tailscaled has no TS_PERMIT_CERT_UID=caddy. Without it, tailscaled gives Caddy
+no certificate for the ts.net name, and each TLS handshake fails. See step 1 below."
 fi
 
 cat <<EOF
@@ -263,24 +282,37 @@ sparkpass is installed: /usr/local/bin/sparkpass, $caddyfile, the caddy.service 
 pass-reconcile.service and pass-reconcile.timer (enabled), $wait_unit (enabled).
 Caddy is stopped and disabled at boot: only 'sparkpass reconcile' starts it.
 
-Next steps, as root:
-  1. Fill /etc/sparkpass/config: PUBLIC_URL (https only), MODEL_PORT, GATEWAY_CHECK_ADDRESS (a loopback
-     or local address of THIS host, for example 127.0.0.1, never an address of the other Spark), and
-     the optional NOTIFY_URL.
-  2. Fill /etc/sparkpass/caddy.env: SPARKPASS_SITE (the host of PUBLIC_URL) and SPARKPASS_MODEL_PORT
-     (the same value as MODEL_PORT).
-  3. If /var/lib/sparkpass/gateway-open exists, a check proved that the gateway is open. While it
+Next steps, as root. The inbound route is Tailscale Funnel with raw TCP passthrough: TLS ends at Caddy
+(docs/designs/guest-pass-mvp.md, "The gateway"). <name> is the ts.net name of this unit, for example
+spark.tail1234.ts.net.
+  1. Tailscale on this unit:
+       install Tailscale (https://tailscale.com/download/linux), then: tailscale up
+       In the admin console: MagicDNS and HTTPS certificates on, the funnel node attribute in the
+       tailnet policy ('tailscale funnel' prints the link when it is missing), and key expiry off for
+       this machine (a node key expires after 180 days by default; then Funnel and the certificate stop).
+       tailscale set --accept-dns=false --auto-update=false
+         (this unit then resolves <name> through public DNS, to a relay of Funnel, so that the self-check
+         of grant and tests/expiry.sh --via-public take the public route; MagicDNS gives the tailnet
+         address of this unit, where Caddy does not listen. An automatic update restarts tailscaled,
+         and each open guest stream ends)
+       tailscale funnel --bg --tcp=443 tcp://127.0.0.1:443
+       tailscale cert --cert-file - <name> >/dev/null
+         (tailscaled gets the certificate before the first start of Caddy, so that the first check of
+         reconcile does not wait for it; do it again after the unit was off for a long time)
+       Add the line TS_PERMIT_CERT_UID=caddy to /etc/default/tailscaled (Caddy gets the certificate of
+       <name> from tailscaled), then, as the last command: systemctl restart tailscaled
+         (the restart ends a Tailscale SSH session and can stop an SSH session over the tailnet)
+  2. Fill /etc/sparkpass/config: PUBLIC_URL=https://<name>, MODEL_PORT, GATEWAY_CHECK_ADDRESS=127.0.0.1
+     (the only valid value), and the optional NOTIFY_URL.
+  3. Fill /etc/sparkpass/caddy.env: SPARKPASS_SITE=<name> and SPARKPASS_MODEL_PORT (the same value as
+     MODEL_PORT).
+  4. If /var/lib/sparkpass/gateway-open exists, a check proved that the gateway is open. While it
      exists, reconcile keeps Caddy stopped and grant refuses. Repair gateway/Caddyfile in the
      repository, run this script again, then remove /var/lib/sparkpass/gateway-open.
-  4. Start the gateway. For the first certificate, and after the host was off past the end of its
-     certificate (ACME procedure):
-       systemctl stop pass-reconcile.timer
-       sparkpass list              (continue only when it shows "no lease", or revoke each lease first,
-                                    and only when /var/lib/sparkpass/gateway-open does not exist)
-       systemctl start caddy
-       journalctl -fu caddy        (wait for "certificate obtained successfully", then Ctrl-C)
-       systemctl start pass-reconcile.timer
-       sparkpass reconcile
-     With a valid certificate, the last two commands are enough.
-  5. Check: 'sparkpass list' shows "no lease", and 'systemctl is-active caddy' shows "active".
+  5. Start the reconcile timer and the gateway: systemctl start pass-reconcile.timer, then
+     sparkpass reconcile (the enable above starts the timer only at the next boot). Then
+     'sparkpass list' shows "no lease", and 'systemctl is-active caddy' shows "active".
+  6. From a network outside the tailnet (for example a phone with no Tailscale):
+       curl -sS -o /dev/null -w '%{http_code}\n' https://<name>/v1/models
+     gives 401. Then run tests/expiry.sh (TODOS.md, "Prove the gateway step on the units").
 EOF

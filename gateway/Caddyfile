@@ -2,10 +2,16 @@
 #
 # caddy.service starts it with `caddy run --environ --config /etc/caddy/Caddyfile`,
 # never with --resume (that loads the last autosaved config, not this file).
+# Inbound route (owner decision of 2026-10-07): Tailscale Funnel with raw TCP passthrough. The relays of
+# Funnel route by SNI and forward the TLS bytes unchanged, and tailscaled on this host forwards them to
+# 127.0.0.1:443: TLS ends here. Caddy gets the certificate of a *.ts.net site from the local tailscaled,
+# with no directive here and no ACME order of its own (TS_PERMIT_CERT_UID=caddy in /etc/default/tailscaled).
 # Settings, from the environment of caddy.service (EnvironmentFile=/etc/sparkpass/caddy.env):
-#   SPARKPASS_SITE        site address, for example spark.example.net (ACME certificate),
+#   SPARKPASS_SITE        site address: the ts.net name of this node, for example spark.tail1234.ts.net,
 #                         or localhost:8443 for a test (Caddy's internal CA)
 #   SPARKPASS_MODEL_PORT  API port of the model server, for example 8000
+#   SPARKPASS_BIND        listen address; leave it unset on the unit (127.0.0.1, where tailscaled
+#                         forwards Funnel's TCP); only tests/gateway.sh sets it (0.0.0.0)
 #   SPARKPASS_MODEL_HOST  upstream host of the model server; leave it unset on the unit
 #                         (127.0.0.1); only tests/gateway.sh sets it
 # Put no secret in caddy.env: `caddy run --environ` writes the whole environment to the journal.
@@ -14,6 +20,43 @@
 # token file refuses each request. A missing token file stops Caddy from loading this file.
 {
 	grace_period 2s
+	# No HTTP listener on port 80: Funnel forwards only TLS to 443, and a redirect has no use.
+	auto_https disable_redirects
+	# The admin API has no authentication, so no TCP listener (the default is localhost:2019, open to each
+	# local process, also a model container with host networking). A socket in /run/caddy is not in the
+	# network namespace, and only the caddy user and root can connect to it. RuntimeDirectory=caddy in
+	# systemd/caddy-sparkpass.conf makes the directory; without it, Caddy does not start. `caddy reload`
+	# (ExecReload of caddy.service, as the caddy user) reads this address from the config.
+	admin unix//run/caddy/admin.sock
+	# A request whose Host header is not its TLS name gets 421: the site block below matches by Host, and a
+	# request that no site block takes gets an empty 200, not the 401 of the guard (QA of 2026-10-07).
+	servers {
+		strict_sni_host on
+	}
+	# The default logger takes the access line of each request that the logger of the site block does not
+	# take: a request that no site block takes (421), and a served request whose Host differs from the site
+	# name only in letter case (Caddy serves the site with no regard to case, but picks the access logger by an
+	# exact Host match; red team of 2026-10-07). So it keeps the same fields as the site log below: no request
+	# is left out of the log, and no line keeps a query string, headers, or a client address.
+	log default {
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				request>uri regexp "[?].*" ""
+				request>tls delete
+				request>host delete
+				request>proto delete
+				request>remote_ip delete
+				request>remote_port delete
+				request>client_ip delete
+				resp_headers delete
+				bytes_read delete
+				user_id delete
+				duration delete
+			}
+		}
+	}
 	# Caddy autosaves each loaded config (with the current token rule) to autosave.json. `persist_config off`
 	# would stop that, but Caddy 2.6.2 (the Ubuntu 24.04 package) does not know the option. The autosave holds
 	# only the rule that token.caddy holds, for the same readers (root and caddy), and only a unit with
@@ -21,12 +64,15 @@
 }
 
 {$SPARKPASS_SITE} {
+	bind {$SPARKPASS_BIND:127.0.0.1}
+
 	request_body {
 		max_size 4MB
 	}
 
-	# Access log to stderr (the journal of caddy.service): time, client IP address, method,
-	# path, status and size. No headers, no bodies.
+	# Access log to stderr (the journal of caddy.service): time, method, path, status and size. No
+	# headers, no bodies, and no client address: behind Funnel each connection comes from tailscaled on
+	# 127.0.0.1 (Caddy 2.6.2 has no PROXY protocol listener).
 	log {
 		format filter {
 			wrap json
@@ -37,7 +83,9 @@
 				request>tls delete
 				request>host delete
 				request>proto delete
+				request>remote_ip delete
 				request>remote_port delete
+				request>client_ip delete
 				resp_headers delete
 				bytes_read delete
 				user_id delete
@@ -51,11 +99,15 @@
 		import /etc/sparkpass/token.caddy
 		@sparkpass_no_pass not vars sparkpass_pass yes
 		respond @sparkpass_no_pass 401
-		# The matcher of reverse_proxy compares a cleaned copy of the path, but the proxy sends the raw path:
-		# /metrics/../v1/models would reach /metrics of the model server. A dot or empty segment gets 400.
+		# A dot or empty segment gets 400 (a second barrier: no route of the pass has one). The proxy sends
+		# the raw path, and the model server can clean it to another route.
 		@sparkpass_unclean expression `{http.request.uri.path}.contains("/.") || {http.request.uri.path}.contains("//")`
 		respond @sparkpass_unclean 400
-		reverse_proxy /v1/* {$SPARKPASS_MODEL_HOST:127.0.0.1}:{$SPARKPASS_MODEL_PORT} {
+		# The routes of the pass, and no other (owner decision of 2026-10-07): other routes of the model
+		# server can change state that the next guest or the host sees (a LoRA load, a stored response, an
+		# upload). Exact method and path, case-sensitive; the path matcher of Caddy ignores case.
+		@sparkpass_route expression `({method} == "GET" && {http.request.uri.path} == "/v1/models") || ({method} == "POST" && {http.request.uri.path} in ["/v1/chat/completions", "/v1/completions"])`
+		reverse_proxy @sparkpass_route {$SPARKPASS_MODEL_HOST:127.0.0.1}:{$SPARKPASS_MODEL_PORT} {
 			transport http {
 				response_header_timeout 300s
 			}

@@ -8,7 +8,12 @@ Description=sparkpass reconcile: firewall rules, overdue revokes, end timers, ga
 # with no network at boot, this unit waits and the gateway stays closed. systemd-time-wait-sync waits
 # with no limit. The chrony-wait unit of the Ubuntu package stops waiting after 180 s, so install.sh
 # adds a drop-in with TimeoutStartSec=infinity to it.
-After=network-online.target docker.service time-sync.target
+# After tailscaled too: Caddy gets the certificate of the ts.net name from it, and the gateway check runs
+# right after the start of Caddy. After= orders the start only; tailscaled can need its first netmap before
+# it gives the certificate (TODOS.md, the reboot check of "Prove the gateway step on the units"). Not in
+# Wants=: that would start tailscaled at each run (every 5 minutes) and undo an owner's stop of the public
+# route (owner decision D8 of the /ship review, 2026-10-07).
+After=network-online.target docker.service time-sync.target tailscaled.service
 Wants=network-online.target time-sync.target
 
 [Service]
