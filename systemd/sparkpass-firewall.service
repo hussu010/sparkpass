@@ -1,0 +1,17 @@
+# Second unit only (install.sh --second-unit): loads the sparkpass firewall rules at each boot, so the
+# model and control ports refuse connections from the LAN after a reboot of that unit. On the head unit,
+# `sparkpass reconcile` loads the same script. install.sh copies it to /etc/systemd/system/.
+[Unit]
+Description=sparkpass firewall rules (second unit)
+# After Docker, as on the head unit: the jump to the sparkpass chains is the first rule in DOCKER-USER.
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/sparkpass/rules.sh
+# The unit stays active after a load, so `systemctl status` shows that the rules loaded, and a failed
+# load shows in `systemctl --failed`.
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

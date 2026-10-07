@@ -1,0 +1,13 @@
+# Runs pass-reconcile.service every 5 minutes: retry of failed or overdue revokes, and the periodic check
+# that the gateway refuses a wrong key. install.sh copies it to /etc/systemd/system/.
+[Unit]
+Description=sparkpass reconcile every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=1s
+# No catch-up run after a stop: pass-reconcile.service runs at boot on its own.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

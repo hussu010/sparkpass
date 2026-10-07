@@ -1,0 +1,26 @@
+# sparkpass boot gate and retry (docs/designs/guest-pass-mvp.md, "Locking, start order, and the boot gate").
+# It runs at boot (multi-user.target) and from pass-reconcile.timer. Only this unit starts caddy.service.
+# install.sh copies it to /etc/systemd/system/.
+[Unit]
+Description=sparkpass reconcile: firewall rules, overdue revokes, end timers, gateway start and check
+# Docker first, for the DOCKER-USER chain of the firewall rules. time-sync.target waits for a real clock
+# only when its wait service is enabled (install.sh enables systemd-time-wait-sync or chrony-wait):
+# with no network at boot, this unit waits and the gateway stays closed. systemd-time-wait-sync waits
+# with no limit. The chrony-wait unit of the Ubuntu package stops waiting after 180 s, so install.sh
+# adds a drop-in with TimeoutStartSec=infinity to it.
+After=network-online.target docker.service time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+# Oneshot with no RemainAfterExit: the unit is inactive after each run, so the timer can start it again.
+Type=oneshot
+ExecStart=/usr/local/bin/sparkpass reconcile
+# Budget: each system command has a limit of 10 s, and one run with a lease runs at most 15 commands: 14 under
+# the lock with a margin (one long path: firewall, end-timer check, create and check, the revoke of a lease
+# that became overdue, start, two wrong-key checks, stop and the marker notification, 12), and the
+# gateway-down notification after it = 150 s, plus the wait for the lock. systemd stops a run that hangs,
+# the lock opens, and the next run 5 minutes later repeats the work.
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
