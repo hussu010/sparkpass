@@ -1395,4 +1395,21 @@ mod tests {
             assert_eq!(state(&paths), State::Active);
         }
     }
+
+    // Added by the /ship review (2026-10-07, owner decision D8).
+    // Value: protects=the boot run of reconcile starts after tailscaled, and no run of reconcile starts
+    // tailscaled, so an owner's stop of the public route lasts; fails_when=tailscaled.service leaves After=, or
+    // enters Wants=, Requires=, BindsTo= or Upholds= (each starts it at each run of the 5-minute timer);
+    // why_new=no test read systemd/pass-reconcile.service; seam=none
+    #[test]
+    fn reconcile_unit_orders_after_tailscaled_and_does_not_start_it() {
+        let unit = include_str!("../systemd/pass-reconcile.service");
+        let values = |key: &str| -> Vec<&str> {
+            unit.lines().filter_map(|line| line.trim().strip_prefix(key)).flat_map(str::split_whitespace).collect()
+        };
+        assert!(values("After=").contains(&"tailscaled.service"), "{unit}");
+        for key in ["Wants=", "Requires=", "BindsTo=", "Upholds="] {
+            assert!(!values(key).contains(&"tailscaled.service"), "{key} starts tailscaled at each run:\n{unit}");
+        }
+    }
 }

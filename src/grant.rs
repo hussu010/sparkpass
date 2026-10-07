@@ -67,8 +67,9 @@ pub fn grant(paths: &Paths, runner: &dyn Runner, name: &str, ttl: u64, clock: &d
     // Only reconcile starts the gateway (the boot gate). Without this check, step 7 fails late.
     run_ok(runner, &["systemctl", "is-active", "--quiet", "caddy"])
         .map_err(|_| "the gateway is not running; run `sparkpass reconcile` and read its output".to_string())?;
-    // The check of reconcile, through GATEWAY_CHECK_ADDRESS. With a wrong check address, the pass would
-    // work until the next reconcile stops the gateway. A failed check stops the gateway, as in reconcile.
+    // The check of reconcile, through GATEWAY_CHECK_ADDRESS (127.0.0.1). A Caddy that is open there gets no
+    // lease, and a Caddy that does not listen there (a SPARKPASS_BIND line in caddy.env) would give a pass that
+    // works only until the next reconcile stops the gateway. A failed check stops the gateway, as in reconcile.
     check_gateway(paths, runner, &settings)?;
     run_ok(runner, &[config::FIREWALL]).map_err(|e| format!("the firewall rules did not load: {e}"))?;
     // With no lease, the token file must be the deny-all rule. Other content is a key with no end (a lost
@@ -264,7 +265,7 @@ Rules:
 - At the end time the key stops, and open requests close.
 - Prompts and completions are not logged. The delete at the end is not a secure erase: the model server can hold recent prompts in its memory until it restarts.
 - The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).
-- The connection goes through the relays of Tailscale (Tailscale Funnel). Tailscale sees your IP address and the time and size of the traffic.
+- The connection goes through the relays of Tailscale (Tailscale Funnel). Tailscale sees your IP address and the time and size of the traffic. The Tailscale service on the host can log your IP address for a connection that arrives while the gateway restarts or is stopped.
 - Acceptable use: no unlawful use, no attack on other systems, and no resale of the access.",
         settings.public_url,
         format_utc(deadline)
@@ -405,6 +406,8 @@ mod tests {
             "The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).",
             // The inbound route (owner decision D5 of the /ship review, 2026-10-07): a third party sees the client address.
             "The connection goes through the relays of Tailscale (Tailscale Funnel). Tailscale sees your IP address and the time and size of the traffic.",
+            // tailscaled logs the client address of a connection that it cannot forward (owner decision D10).
+            "The Tailscale service on the host can log your IP address for a connection that arrives while the gateway restarts or is stopped.",
             "no unlawful use, no attack on other systems, and no resale",
         ] {
             assert!(pass.contains(part), "{part:?} is not in:\n{pass}");

@@ -59,7 +59,8 @@ Options:
                       first). Step 4 also checks 503 when the stub is stopped, and 504 (not
                       a hang) when the stub is frozen. The frozen check waits for the 300 s
                       header timeout of the gateway: about 5 minutes.
-  --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m, at least 60s).
+  --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m; at least 60s, and
+                      at least 180s with --via-public).
   --via-public        send each request through PUBLIC_URL: public DNS and a relay of
                       Tailscale Funnel (the inbound-path run of the Success Criteria). It
                       needs 'tailscale set --accept-dns=false' on this unit, so that the
@@ -158,7 +159,11 @@ done
 [[ $TTL =~ ^([0-9]{1,6})([sm])$ ]] || usage_error "--ttl must be <n>s or <n>m, for example 5m"
 TTL_S=$((10#${BASH_REMATCH[1]}))
 if [[ ${BASH_REMATCH[2]} == m ]]; then TTL_S=$((TTL_S * 60)); fi
-((TTL_S >= 60)) || usage_error "--ttl must be at least 60s"
+# Through a relay of Funnel each request takes a few round trips, and step 2 sends 58 requests before the
+# end time (owner decision D9 of the /ship review, 2026-10-07).
+MIN_TTL=60
+if [[ $VIA_PUBLIC == yes ]]; then MIN_TTL=180; fi
+((TTL_S >= MIN_TTL)) || usage_error "--ttl must be at least ${MIN_TTL}s$([[ $VIA_PUBLIC == yes ]] && echo ' with --via-public')"
 MAX_TOKENS=${EXPIRY_MAX_TOKENS:-32768}
 [[ $MAX_TOKENS =~ ^[1-9][0-9]{0,6}$ ]] || usage_error "EXPIRY_MAX_TOKENS must be a positive number"
 
@@ -228,10 +233,14 @@ cleanup() {
     "$BIN" revoke "$NAME" || printf 'expiry.sh: the revoke failed too: check sparkpass list\n' >&2
     # After the revoke the last key must get 401 on every path. An HTTP answer other than 401 (not a curl
     # failure, 000) proves an open gateway, also when the failed step was a wait (until_by) and not expect().
-    if [[ -z $OPEN && -n $KEY ]] && ! answers 401 "$KEY" "${EVERY[@]}" && [[ $BAD == *=[1-9]* ]] &&
-      { [[ $VIA_PUBLIC != yes ]] || proven_open "$KEY" "${EVERY[@]}"; }; then
-      OPEN="the last key still passed the gateway after the revoke:$BAD"
-      close_open_gateway
+    if [[ -z $OPEN && -n $KEY ]] && ! answers 401 "$KEY" "${EVERY[@]}" && [[ $BAD == *=[1-9]* ]]; then
+      local public=$BAD
+      if [[ $VIA_PUBLIC != yes ]] || proven_open "$KEY" "${EVERY[@]}"; then
+        OPEN="the last key still passed the gateway after the revoke:$BAD"
+        close_open_gateway
+      else
+        printf 'expiry.sh: after the revoke the public route still answered the last key:%s, and %s gave:%s (no marker; check tailscale funnel status)\n' "$public" "$ADDRESS" "${BAD:- 401 on each route}" >&2
+      fi
     fi
   fi
   stop_stub
@@ -321,6 +330,12 @@ expect() {
   if [[ $want == 401 && $BAD == *=[1-9][0-9][0-9]* ]]; then
     local public=$BAD
     if [[ $VIA_PUBLIC == yes ]] && ! proven_open "$who" "$@"; then
+      # BAD holds the direct answers here. A failed request at the check address is no refusal; a 2xx or 3xx
+      # through the public route is a listener with no key check (grant step 8, owner decision D4).
+      [[ $BAD != *=000* ]] || fail "$label: each answer through $ROUTE must be 401, but:$public; the check at $ADDRESS failed:$BAD$(hint); no marker"
+      if [[ $public == *=[23][0-9][0-9]* ]]; then
+        fail "$label: each answer through $ROUTE must be 401, but:$public; at $ADDRESS the gateway refuses it: another listener serves the public name with no key check, for example a Funnel handler to the model server ('tailscale funnel status' must show only TCP 443 to tcp://127.0.0.1:443); no marker"
+      fi
       fail "$label: each answer through $ROUTE must be 401, but:$public; at $ADDRESS the gateway refuses it: the inbound route does not reach this gateway, or it changes its answers (tailscale funnel status must show TCP 443 to tcp://127.0.0.1:443); no marker"
     fi
     OPEN="tests/expiry.sh step $STEP, $(date -u '+%F %T UTC'): the gateway answered$BAD to $label at $ADDRESS, and each answer must be 401: the gateway does not enforce the token file"

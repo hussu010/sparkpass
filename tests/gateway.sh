@@ -168,12 +168,17 @@ echo "ok   $case: the key gets 200 on the ${#allowed[@]} routes of the pass, the
 case="other Host"
 # A Host header other than the TLS name gets 421 (strict_sni_host), also with the key: with no site block for
 # that Host, Caddy gives an empty 200 and no 401 guard runs. The query text is for the access log case below:
-# no access line may keep it, and the default logger writes none.
+# no access line may keep it (the default logger filters its lines as the site logger does).
 for auth in "$key" "Authorization: Bearer $wrong"; do
 	expect 421 GET "/v1/models?q=sparkpass-query-text" -H "$auth" -H "Host: other.example:8443"
 done
 expect 421 POST /v1/chat/completions -H "$key" -H "Host: other.example:8443"
-echo "ok   $case: a Host header other than the TLS name gets 421, also with the key"
+# The site name in other letter case is the same site: the key and the guard apply. Caddy picks the access
+# logger by an exact Host match, so these lines go to the default logger: the access log case below needs
+# them, filtered.
+expect 200 GET /v1/models -H "$key" -H "Host: LOCALHOST:8443"
+expect 401 GET "/sparkpass-upper-host?q=sparkpass-query-text" -H "Host: LocalHost:8443"
+echo "ok   $case: a Host header other than the TLS name gets 421, also with the key; the name in other letter case is the site"
 
 case="body limit"
 head -c 5000000 /dev/zero >"$work/big"
@@ -224,6 +229,8 @@ access=$(grep -F '"logger":"http.log.access' "$work/caddy.log" || true)
 grep -qF '"uri":"/v1/models"' <<<"$access" || fail "$case: no path in the access log"
 grep -qF '"status":401' <<<"$access" || fail "$case: no status in the access log"
 grep -qF '"method":"POST"' <<<"$access" || fail "$case: no method in the access log"
+# A served request with the site name in other letter case leaves its line too (case "other Host").
+grep -qF '"uri":"/sparkpass-upper-host"' <<<"$access" || fail "$case: a request with the site name in upper case left no access line"
 # Only time, method, path, status and size, plus the log metadata. No client address: behind Funnel each
 # connection comes from tailscaled on 127.0.0.1.
 python3 -c 'import json, sys
