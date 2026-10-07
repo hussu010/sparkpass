@@ -688,6 +688,14 @@ mod tests {
         fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\n").unwrap();
         assert_refused(&paths, &runner, &paths.snapshot());
         assert_eq!(runner.calls(), [] as [&str; 0]);
+
+        // A check address that is not loopback, for example the other Spark: no command runs.
+        let (paths, runner) = host();
+        fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=192.168.1.20\n").unwrap();
+        assert_refused(&paths, &runner, &paths.snapshot());
+        assert_eq!(runner.calls(), [] as [&str; 0]);
+        let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
+        assert!(error.contains("GATEWAY_CHECK_ADDRESS must be a loopback IP address"), "{error}");
     }
 
     #[test]

@@ -377,7 +377,7 @@ mod tests {
         for (settings, connect, url) in [
             ("PUBLIC_URL=https://spark.example.net/\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n", "::127.0.0.1:", "https://spark.example.net/v1/models"),
             ("PUBLIC_URL=https://10.0.0.5:8443\nGATEWAY_CHECK_ADDRESS=::1\n", "::[::1]:", "https://10.0.0.5:8443/v1/models"),
-            ("PUBLIC_URL=https://spark.example.net:8443/api\nGATEWAY_CHECK_ADDRESS=192.168.1.20\n", "::192.168.1.20:", "https://spark.example.net:8443/api/v1/models"),
+            ("PUBLIC_URL=https://spark.example.net:8443/api\nGATEWAY_CHECK_ADDRESS=127.0.0.2\n", "::127.0.0.2:", "https://spark.example.net:8443/api/v1/models"),
             ("PUBLIC_URL=https://[2001:db8::5]:8443\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n", "::127.0.0.1:", "https://[2001:db8::5]:8443/v1/models"),
             ("PUBLIC_URL=https://u@spark.example.net\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n", "::127.0.0.1:", "https://u@spark.example.net/v1/models"),
         ] {
@@ -470,7 +470,13 @@ mod tests {
 
     #[test]
     fn missing_or_bad_settings_file_revokes_overdue_leases_and_stops_the_gateway() {
-        for settings in [None, Some("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\n"), Some("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=localhost\n")] {
+        for settings in [
+            None,
+            Some("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\n"),
+            Some("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=localhost\n"),
+            // Not loopback, for example the other Spark: its 401 answers would prove nothing about this Caddy.
+            Some("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=192.168.1.20\n"),
+        ] {
             let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
             seed(&paths, "bob", 1_000, State::Active);
             write_rule_of_bob(&paths);

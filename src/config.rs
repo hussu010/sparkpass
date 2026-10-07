@@ -74,8 +74,8 @@ pub struct Settings {
     pub public_url: String,
     /// Port of the model server on 127.0.0.1.
     pub model_port: u16,
-    /// IP address of the public listener on this host, for example 127.0.0.1. Grant (step 1) and
-    /// reconcile send their wrong-token check there, with the name of `public_url`.
+    /// A loopback address of this host, for example 127.0.0.1, where Caddy listens (gateway/Caddyfile, `bind`).
+    /// Grant (step 1) and reconcile send their wrong-token check there, with the name of `public_url`.
     pub gateway_check_address: IpAddr,
 }
 
@@ -107,8 +107,11 @@ pub fn read_settings(paths: &Paths) -> Result<Settings, String> {
         .to_string();
     let model_port =
         port.ok_or_else(|| format!("settings file {file}: MODEL_PORT must be a port number"))?;
-    let gateway_check_address = address
-        .ok_or_else(|| format!("settings file {file}: GATEWAY_CHECK_ADDRESS must be an IP address, for example 127.0.0.1"))?;
+    // Loopback only: the check must reach the Caddy of this host. Another address can be the other Spark,
+    // whose 401 answers would make grant and reconcile trust a local Caddy that is open.
+    let gateway_check_address = address.filter(IpAddr::is_loopback).ok_or_else(|| {
+        format!("settings file {file}: GATEWAY_CHECK_ADDRESS must be a loopback IP address, for example 127.0.0.1: the check must reach the Caddy of this host, never the other Spark")
+    })?;
     Ok(Settings {
         public_url,
         model_port,
@@ -212,6 +215,9 @@ mod tests {
         assert_eq!(s.gateway_check_address, IpAddr::from(std::net::Ipv6Addr::LOCALHOST));
         let s = read_settings(&Paths::temp()).unwrap();
         assert_eq!(s.gateway_check_address, IpAddr::from(std::net::Ipv4Addr::LOCALHOST));
+        // Each address of 127.0.0.0/8 is loopback.
+        let s = settings("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.2\n").unwrap();
+        assert_eq!(s.gateway_check_address, IpAddr::from([127, 0, 0, 2]));
     }
 
     #[test]
@@ -242,6 +248,24 @@ mod tests {
         // No address line.
         let error = settings(OK).err().unwrap_or_default();
         assert!(error.contains("GATEWAY_CHECK_ADDRESS"), "{error}");
+    }
+
+    // Added for the P1 item "Prove the gateway step on the units" (2026-10-07).
+    // Value: protects=the wrong-key check of grant and reconcile reaches the Caddy of this host only;
+    // fails_when=read_settings accepts an address that is not loopback, for example the other Spark, whose
+    // 401 answers would make reconcile trust a local Caddy that is open; why_new=each IP address passed; seam=none
+    #[test]
+    fn settings_file_with_a_check_address_that_is_not_loopback_is_refused() {
+        // A LAN or QSFP address (the other Spark), a wildcard, a public, a link-local, and an IPv4-mapped address.
+        for address in ["192.168.1.20", "10.0.0.2", "0.0.0.0", "::", "2001:db8::5", "169.254.1.1", "::ffff:127.0.0.1", "100.101.102.103"] {
+            let error = settings(&format!("PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS={address}\n"))
+                .err()
+                .unwrap_or_default();
+            assert!(
+                error.contains("GATEWAY_CHECK_ADDRESS must be a loopback IP address") && error.contains("never the other Spark"),
+                "{address}: {error}"
+            );
+        }
     }
 
     #[test]

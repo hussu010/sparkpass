@@ -242,10 +242,11 @@ value_of() {
 check_address=$(sed 's/#.*//' /etc/sparkpass/config | value_of GATEWAY_CHECK_ADDRESS)
 model_port=$(sed 's/#.*//' /etc/sparkpass/config | value_of MODEL_PORT)
 caddy_port=$(value_of SPARKPASS_MODEL_PORT </etc/sparkpass/caddy.env)
-if [[ -z $check_address ]]; then
-	warn "/etc/sparkpass/config has no GATEWAY_CHECK_ADDRESS value. Until it has one, sparkpass reconcile
-keeps Caddy stopped and sparkpass grant refuses. Add the line GATEWAY_CHECK_ADDRESS=127.0.0.1
-(see $repo/etc/config.example)."
+# Loopback only (read_settings in src/config.rs decides; this test knows the usual forms).
+if ! [[ $check_address =~ ^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ || $check_address == ::1 ]]; then
+	warn "GATEWAY_CHECK_ADDRESS in /etc/sparkpass/config is \"$check_address\", and it must be a loopback
+address of THIS host, for example 127.0.0.1 (never the other Spark). Until it is one, sparkpass
+reconcile keeps Caddy stopped and sparkpass grant refuses (see $repo/etc/config.example)."
 fi
 if [[ -n $model_port && $caddy_port != "$model_port" ]] || [[ -n $caddy_port && ! $caddy_port =~ ^[0-9]+$ ]]; then
 	warn "SPARKPASS_MODEL_PORT in /etc/sparkpass/caddy.env is \"$caddy_port\", and MODEL_PORT in
@@ -265,8 +266,8 @@ Caddy is stopped and disabled at boot: only 'sparkpass reconcile' starts it.
 
 Next steps, as root:
   1. Fill /etc/sparkpass/config: PUBLIC_URL (https only), MODEL_PORT, GATEWAY_CHECK_ADDRESS (a loopback
-     or local address of THIS host, for example 127.0.0.1, never an address of the other Spark), and
-     the optional NOTIFY_URL.
+     address of THIS host, for example 127.0.0.1, never an address of the other Spark), and the optional
+     NOTIFY_URL.
   2. Fill /etc/sparkpass/caddy.env: SPARKPASS_SITE (the host of PUBLIC_URL) and SPARKPASS_MODEL_PORT
      (the same value as MODEL_PORT).
   3. If /var/lib/sparkpass/gateway-open exists, a check proved that the gateway is open. While it
