@@ -128,8 +128,10 @@ case="admin socket"
 # Each reload of this test (load) goes to that socket, as `systemctl reload caddy` does on the unit.
 docker exec "$box" test -S /run/caddy/admin.sock || fail "$case: /run/caddy/admin.sock is not a socket"
 # Each TCP listener of the container (state 0A in /proc/net/tcp and tcp6), as its hex port: only the site,
-# 8443 (20FB). No admin listener (the default is 2019, 07E3), and no HTTP listener on 80 (0050).
-listeners=$(docker exec "$box" cat /proc/net/tcp /proc/net/tcp6 | awk '$4 == "0A" {sub(/.*:/, "", $2); print $2}' | sort -u | tr '\n' ' ')
+# 8443 (20FB). No admin listener (the default is 2019, 07E3), and no HTTP listener on 80 (0050). A host
+# with no IPv6 has no tcp6 file; the site listens on IPv4 (bind 0.0.0.0), so the check is never empty.
+listeners=$(docker exec "$box" sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; true' |
+	awk '$4 == "0A" {sub(/.*:/, "", $2); print $2}' | sort -u | tr '\n' ' ')
 [[ $listeners == "20FB " ]] || fail "$case: the TCP listeners (hex ports) are: $listeners; only 20FB (8443) is allowed"
 echo "ok   $case: the admin API is on /run/caddy/admin.sock, and the only TCP listener is 8443"
 
