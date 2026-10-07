@@ -381,10 +381,11 @@ mod tests {
     #[test]
     fn check_with_a_wrong_token_goes_to_the_check_address_with_the_name_of_the_public_url() {
         // An IPv6 literal and a user part in PUBLIC_URL need no parse: curl takes the host and the port from the URL.
+        // The check address is always 127.0.0.1 (config::CHECK_ADDRESS, owner decision D3 of 2026-10-07).
         for (settings, connect, url) in [
             ("PUBLIC_URL=https://spark.example.net/\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n", "::127.0.0.1:", "https://spark.example.net/v1/models"),
-            ("PUBLIC_URL=https://10.0.0.5:8443\nGATEWAY_CHECK_ADDRESS=::1\n", "::[::1]:", "https://10.0.0.5:8443/v1/models"),
-            ("PUBLIC_URL=https://spark.example.net:8443/api\nGATEWAY_CHECK_ADDRESS=127.0.0.2\n", "::127.0.0.2:", "https://spark.example.net:8443/api/v1/models"),
+            ("PUBLIC_URL=https://10.0.0.5:8443\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n", "::127.0.0.1:", "https://10.0.0.5:8443/v1/models"),
+            ("PUBLIC_URL=https://spark.example.net:8443/api\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n", "::127.0.0.1:", "https://spark.example.net:8443/api/v1/models"),
             ("PUBLIC_URL=https://[2001:db8::5]:8443\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n", "::127.0.0.1:", "https://[2001:db8::5]:8443/v1/models"),
             ("PUBLIC_URL=https://u@spark.example.net\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n", "::127.0.0.1:", "https://u@spark.example.net/v1/models"),
         ] {

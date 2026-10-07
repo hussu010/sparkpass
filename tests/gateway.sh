@@ -165,6 +165,16 @@ status GET "/v1/models?q=sparkpass-query-text" -H "$key" >/dev/null
 refused_cases
 echo "ok   $case: the key gets 200 on the ${#allowed[@]} routes of the pass, the gateway's 404 on ${#denied[@]} other routes, 400 for a dot or empty segment; each other header gets 401 on each route"
 
+case="other Host"
+# A Host header other than the TLS name gets 421 (strict_sni_host), also with the key: with no site block for
+# that Host, Caddy gives an empty 200 and no 401 guard runs. The query text is for the access log case below:
+# no access line may keep it, and the default logger writes none.
+for auth in "$key" "Authorization: Bearer $wrong"; do
+	expect 421 GET "/v1/models?q=sparkpass-query-text" -H "$auth" -H "Host: other.example:8443"
+done
+expect 421 POST /v1/chat/completions -H "$key" -H "Host: other.example:8443"
+echo "ok   $case: a Host header other than the TLS name gets 421, also with the key"
+
 case="body limit"
 head -c 5000000 /dev/zero >"$work/big"
 got=$(curl -q --noproxy '*' -sk --connect-to "localhost:8443:127.0.0.1:$published" -o /dev/null -m 30 -w '%{http_code}' \

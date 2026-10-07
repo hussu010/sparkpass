@@ -12,9 +12,10 @@ PUBLIC_URL=
 # SPARKPASS_MODEL_PORT in /etc/sparkpass/caddy.env.
 MODEL_PORT=
 
-# A loopback address of THIS host, where Caddy listens: 127.0.0.1. Grant and reconcile send their
-# wrong-key check there, with the name of PUBLIC_URL. sparkpass refuses any other address: it can be
-# the other Spark, whose 401 answers would make reconcile trust a local Caddy that is open.
+# 127.0.0.1, where Caddy listens (bind in gateway/Caddyfile). Grant and reconcile send their wrong-key
+# check there, with the name of PUBLIC_URL. sparkpass refuses any other value: another address can be
+# the other Spark, whose 401 answers would make reconcile trust a local Caddy that is open, and Caddy
+# does not listen on ::1 or another loopback address.
 GATEWAY_CHECK_ADDRESS=127.0.0.1
 
 # Optional owner notification: one POST of a plain text to this https URL, for example an ntfy topic

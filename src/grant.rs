@@ -22,12 +22,12 @@
 use crate::config::{self, Paths, Settings};
 use crate::gateway;
 use crate::lease::{self, Lease, State};
+use crate::notify;
 use crate::revoke::revoke;
 use crate::runner::{Runner, exit_text, run_ok};
 use crate::time::format_utc;
 use std::fs;
 use std::io::{self, Write};
-use std::net::IpAddr;
 
 /// Time limit of each curl call, in seconds. It must stay below the command limit in main.rs,
 /// so that curl reports its own error before the runner kills it.
@@ -174,9 +174,22 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
         Some((url, Ok(code))) => {
             let public = format!("the self-check with a wrong token through {url} got {code}, and it must get 401");
             check_gateway(paths, runner, settings).map_err(|e| format!("{public}; {e}"))?;
+            let at = settings.gateway_check_address;
+            // The gateway at the check address refuses the wrong token, so another listener gave this answer. A
+            // 2xx or 3xx serves the wrong key: that listener does not check the key, for example a Funnel handler
+            // straight to the model server (owner decision D4 of the /ship review, 2026-10-07). A stop of Caddy
+            // does not close it, so the owner also gets a notification, after the stop; no marker, because the
+            // Caddyfile is not the cause.
+            if code.starts_with(['2', '3']) {
+                let text = format!(
+                    "{public}, but the gateway refuses the wrong token at {at}: another listener serves the public name with no key check, for example a Funnel handler to the model server; 'tailscale funnel status' must show only TCP 443 to tcp://127.0.0.1:443; {}",
+                    gateway::stop(runner)
+                );
+                notify::send(paths, runner, &format!("sparkpass: {text}"));
+                return Err(text);
+            }
             return Err(format!(
-                "{public}, but the gateway refuses the wrong token at {}: the inbound route does not reach this gateway, or it changes its answers; {}",
-                settings.gateway_check_address,
+                "{public}, but the gateway refuses the wrong token at {at}: the inbound route does not reach this gateway, or it changes its answers; {}",
                 gateway::stop(runner)
             ));
         }
@@ -187,15 +200,13 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
 
 /// Step 1, the decision of step 8, and the proof of reconcile after each start (TODO branch of 2026-10-06;
 /// it extends the self-check of eng review D5): the public listener of this host refuses a wrong token.
-/// `--connect-to` with an empty host and port sends each connection to GATEWAY_CHECK_ADDRESS (loopback, see
+/// `--connect-to` with an empty host and port sends each connection to GATEWAY_CHECK_ADDRESS (127.0.0.1, see
 /// config.rs) on the port of PUBLIC_URL, never through the public route or DNS, and TLS still checks the
 /// name of PUBLIC_URL. No part of the URL is parsed here. Each failure stops the gateway (fail closed), and
 /// a proven answer other than 401 then writes the marker that keeps it stopped.
 pub fn check_gateway(paths: &Paths, runner: &dyn Runner, settings: &Settings) -> Result<(), String> {
-    let address = match settings.gateway_check_address {
-        IpAddr::V6(address) => format!("[{address}]"),
-        address => address.to_string(),
-    };
+    // Always 127.0.0.1 (config::CHECK_ADDRESS), so no IPv6 brackets.
+    let address = settings.gateway_check_address;
     match wrong_token_answer(runner, &["--connect-to", &format!("::{address}:")], &settings.public_url) {
         None => Ok(()),
         Some((url, Ok(code))) => {
@@ -253,6 +264,7 @@ Rules:
 - At the end time the key stops, and open requests close.
 - Prompts and completions are not logged. The delete at the end is not a secure erase: the model server can hold recent prompts in its memory until it restarts.
 - The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).
+- The connection goes through the relays of Tailscale (Tailscale Funnel). Tailscale sees your IP address and the time and size of the traffic.
 - Acceptable use: no unlawful use, no attack on other systems, and no resale of the access.",
         settings.public_url,
         format_utc(deadline)
@@ -391,6 +403,8 @@ mod tests {
             "until it restarts",
             // The log filter of gateway/Caddyfile deletes the client address (tests/gateway.sh, case "access log").
             "The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).",
+            // The inbound route (owner decision D5 of the /ship review, 2026-10-07): a third party sees the client address.
+            "The connection goes through the relays of Tailscale (Tailscale Funnel). Tailscale sees your IP address and the time and size of the traffic.",
             "no unlawful use, no attack on other systems, and no resale",
         ] {
             assert!(pass.contains(part), "{part:?} is not in:\n{pass}");
@@ -543,7 +557,7 @@ mod tests {
     #[test]
     fn wrong_token_answer_of_the_public_route_alone_stops_the_gateway_with_no_marker() {
         for (request, url) in [(WRONG_GET, MODELS), (WRONG_POST, CHAT)] {
-            for code in ["502", "530", "200", ""] {
+            for code in ["502", "530", "404", ""] {
                 let (paths, runner) = host();
                 runner.on(request, output(0, code));
                 let result = grant(&paths, &runner, "bob", TTL, &|| NOW);
@@ -558,6 +572,39 @@ mod tests {
                 assert_eq!(runner.count(CHECK_GET), 2);
                 let calls = runner.calls();
                 assert!(calls.ends_with(&[CHECK_GET, CHECK_POST, STOP_CADDY, RESTART, STOP_TIMER, CHECK_TIMER].map(String::from)), "{calls:?}");
+                assert_revoked(&paths, &runner, result);
+            }
+        }
+    }
+
+    // Added by the /ship review (2026-10-07, owner decision D4).
+    // Value: protects=a public route that serves a wrong key while the gateway refuses it is reported as a
+    // listener with no key check, and the owner gets a notification after the stop; fails_when=step 8 gives the
+    // text of a route that does not reach the gateway, sends no notification, or writes a marker;
+    // why_new=the 2xx and 3xx answers had the same text as a 502; seam=none
+    #[test]
+    fn wrong_token_served_by_the_public_route_alone_names_a_listener_with_no_key_check() {
+        const NOTIFY: &str = "curl -q -fsS -o /dev/null -m 8 --data-binary sparkpass: the self-check with a wrong token through ";
+        for (request, url) in [(WRONG_GET, MODELS), (WRONG_POST, CHAT)] {
+            for code in ["200", "204", "302"] {
+                let (paths, runner) = host();
+                fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\nNOTIFY_URL=https://ntfy.example.net/t\n").unwrap();
+                runner.on(request, output(0, code));
+                let result = grant(&paths, &runner, "bob", TTL, &|| NOW);
+                let error = result.as_ref().unwrap_err();
+                let text = format!(
+                    "the self-check with a wrong token through {url} got {code}, and it must get 401, but the gateway refuses the wrong token at 127.0.0.1: another listener serves the public name with no key check, for example a Funnel handler to the model server; 'tailscale funnel status' must show only TCP 443 to tcp://127.0.0.1:443; the gateway is stopped"
+                );
+                assert!(error.contains(&text), "{error}");
+                assert!(!paths.gateway_open.exists(), "{error}");
+                // The check of step 1 again, the stop, one notification with the same text, then the revoke.
+                let calls = runner.calls();
+                let sent: Vec<&String> = calls.iter().filter(|c| c.starts_with(NOTIFY)).collect();
+                assert_eq!(sent.len(), 1, "{calls:?}");
+                assert!(sent[0].contains(&format!("sparkpass: {text} https://ntfy.example.net/t")), "{calls:?}");
+                let stop = calls.iter().position(|c| c == STOP_CADDY).unwrap();
+                assert!(calls[stop - 2..stop] == [CHECK_GET, CHECK_POST] && calls[stop + 1].starts_with(NOTIFY), "{calls:?}");
+                assert!(calls.ends_with(&[RESTART, STOP_TIMER, CHECK_TIMER].map(String::from)), "{calls:?}");
                 assert_revoked(&paths, &runner, result);
             }
         }
@@ -772,13 +819,13 @@ mod tests {
         assert_refused(&paths, &runner, &paths.snapshot());
         assert_eq!(runner.calls(), [] as [&str; 0]);
 
-        // A check address that is not loopback, for example the other Spark: no command runs.
+        // A check address other than 127.0.0.1, for example the other Spark: no command runs.
         let (paths, runner) = host();
         fs::write(&paths.config, "PUBLIC_URL=https://spark.example.net\nMODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=192.168.1.20\n").unwrap();
         assert_refused(&paths, &runner, &paths.snapshot());
         assert_eq!(runner.calls(), [] as [&str; 0]);
         let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
-        assert!(error.contains("GATEWAY_CHECK_ADDRESS must be a loopback IP address"), "{error}");
+        assert!(error.contains("GATEWAY_CHECK_ADDRESS must be 127.0.0.1"), "{error}");
     }
 
     #[test]

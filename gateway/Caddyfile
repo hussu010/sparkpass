@@ -28,6 +28,16 @@
 	# systemd/caddy-sparkpass.conf makes the directory; without it, Caddy does not start. `caddy reload`
 	# (ExecReload of caddy.service, as the caddy user) reads this address from the config.
 	admin unix//run/caddy/admin.sock
+	# A request whose Host header is not its TLS name gets 421: the site block below matches by Host, and a
+	# request that no site block takes gets an empty 200, not the 401 of the guard (QA of 2026-10-07).
+	servers {
+		strict_sni_host on
+	}
+	# Access lines only from the filtered logger of the site block: the default logger would write the full
+	# line (query string, headers) of each request that no site block takes.
+	log default {
+		exclude http.log.access
+	}
 	# Caddy autosaves each loaded config (with the current token rule) to autosave.json. `persist_config off`
 	# would stop that, but Caddy 2.6.2 (the Ubuntu 24.04 package) does not know the option. The autosave holds
 	# only the rule that token.caddy holds, for the same readers (root and caddy), and only a unit with

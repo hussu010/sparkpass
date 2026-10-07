@@ -41,13 +41,13 @@ Steps:
      an empty bearer value, a wrong key, and the key with one more character get 401.
   3  a stream with the key runs past the end time, and a different process holds the
      sparkpass lock from 5 s before the end time for 40 s (eng review D8). Not later than
-     15 s after the end time, the stream ends and the key gets 401; within 30 s after the
-     lock hold, sparkpass list shows no lease and the end timer is gone. The model server
-     shows zero running requests.
+     15 s after the end time, the stream ends and the key gets 401 (then on every path, and
+     the other callers too); within 30 s after the lock hold, sparkpass list shows no lease
+     and the end timer is gone. The model server shows zero running requests.
   4  grant and an early revoke: the key gets 401, and the end timer is gone.
   5  a new grant of the same name, with the TTL of step 3: the new key works, and the
      earlier keys get 401. The new lease ends at its own end time: the new key gets 401
-     on every path within 15 s, and within 30 s no lease and no end timer stay.
+     within 15 s (then on every path), and within 30 s no lease and no end timer stay.
   6  a summary.
 "Every path": the routes of the pass (GET /v1/models, POST /v1/chat/completions,
 POST /v1/completions), then GET /v1/chat/completions, POST /v1/models,
@@ -65,7 +65,9 @@ Options:
                       needs 'tailscale set --accept-dns=false' on this unit, so that the
                       ts.net name resolves to a relay and not to the tailnet address of
                       this unit. Without this option, each request goes to
-                      GATEWAY_CHECK_ADDRESS (loopback) with curl --connect-to.
+                      GATEWAY_CHECK_ADDRESS (127.0.0.1) with curl --connect-to. With this
+                      option, an answer other than 401 proves an open gateway only when
+                      127.0.0.1 gives one too, as in grant step 8.
   --skip-reboot-note  do not print the reboot procedures at the end.
   -h, --help          print this text and the manual procedures.
 
@@ -99,7 +101,8 @@ Manual: reboot inside an active lease
   1. sparkpass grant $NAME --ttl 30m. Keep the API key.
   2. reboot. After the boot run of pass-reconcile.service: systemctl list-timers
      'sparkpass-end-*' lists the end timer again, and the key gets 200 (503 until the
-     model runs).
+     model runs). journalctl -b -u pass-reconcile.service shows no failed check of the
+     boot run; curl exit code 35 there is the race with tailscaled (TODOS.md).
   3. sparkpass revoke $NAME. The key gets 401.
   Build phase 2 adds: the home data stays, and SSH connects with no host key warning.
 
@@ -111,17 +114,18 @@ procedure that install.sh prints). Also after the unit was off for a long time. 
 the host of PUBLIC_URL:
   1. grep TS_PERMIT_CERT_UID /etc/default/tailscaled prints TS_PERMIT_CERT_UID=caddy.
   2. tailscale cert --cert-file - <name> >/dev/null succeeds: tailscaled has the certificate.
-  3. After sparkpass reconcile, journalctl -u caddy shows no TLS handshake error for <name>.
-     This command shows <name> and a public CA (Let's Encrypt); Caddy 2.6.2 logs no line for
-     a certificate from tailscaled:
+  3. After sparkpass reconcile, this command shows <name> and a public CA (Let's Encrypt).
+     Caddy 2.6.2 logs no line for a certificate from tailscaled, and none for a failed
+     handshake, so journalctl -u caddy proves nothing here:
        openssl s_client -connect 127.0.0.1:443 -servername <name> </dev/null | openssl x509 -noout -subject -issuer
+     and this command, with the normal certificate check, gives 401:
+       curl -sS -o /dev/null -w '%{http_code}\n' --connect-to ::127.0.0.1: https://<name>/v1/models
   4. tailscale funnel status shows TCP 443 of this node, forwarded to 127.0.0.1:443.
   5. getent hosts <name> gives a public address (a relay of Funnel), not a 100.x tailnet
      address: 'tailscale set --accept-dns=false' is on, so --via-public takes the public route.
   6. tests/expiry.sh, then tests/expiry.sh --via-public. Each check uses TLS with the name
      of PUBLIC_URL and a normal certificate check, so a pass also proves the certificate.
-Check a key with the command below. Put an IPv6 GATEWAY_CHECK_ADDRESS in brackets, for
-example --connect-to ::[::1]:
+Check a key with the command below (GATEWAY_CHECK_ADDRESS is always 127.0.0.1):
   $check
 Manual: no network at boot (one time, design task T13)
   1. With no lease, disconnect the network of the head unit, and reboot.
@@ -189,10 +193,11 @@ if ! [[ $MODEL_PORT =~ ^[0-9]{1,5}$ ]] || ((10#$MODEL_PORT < 1 || 10#$MODEL_PORT
 fi
 MODEL_PORT=$((10#$MODEL_PORT))
 [[ -n $ADDRESS ]] || die "$CONFIG: GATEWAY_CHECK_ADDRESS is missing"
-if [[ $ADDRESS == *:* ]]; then ADDRESS="[$ADDRESS]"; fi # IPv6
 # Without --via-public, each connection goes to GATEWAY_CHECK_ADDRESS on the port of PUBLIC_URL, as
-# the reconcile check does. TLS still checks the name of PUBLIC_URL.
-VIA=(--connect-to "::$ADDRESS:")
+# the reconcile check does. TLS still checks the name of PUBLIC_URL. DIRECT keeps that route for
+# proven_open, also with --via-public.
+DIRECT=(--connect-to "::$ADDRESS:")
+VIA=("${DIRECT[@]}")
 ROUTE="--connect-to $ADDRESS"
 if [[ $VIA_PUBLIC == yes ]]; then
   VIA=()
@@ -223,7 +228,8 @@ cleanup() {
     "$BIN" revoke "$NAME" || printf 'expiry.sh: the revoke failed too: check sparkpass list\n' >&2
     # After the revoke the last key must get 401 on every path. An HTTP answer other than 401 (not a curl
     # failure, 000) proves an open gateway, also when the failed step was a wait (until_by) and not expect().
-    if [[ -z $OPEN && -n $KEY ]] && ! answers 401 "$KEY" "${EVERY[@]}" && [[ $BAD == *=[1-9]* ]]; then
+    if [[ -z $OPEN && -n $KEY ]] && ! answers 401 "$KEY" "${EVERY[@]}" && [[ $BAD == *=[1-9]* ]] &&
+      { [[ $VIA_PUBLIC != yes ]] || proven_open "$KEY" "${EVERY[@]}"; }; then
       OPEN="the last key still passed the gateway after the revoke:$BAD"
       close_open_gateway
     fi
@@ -285,9 +291,20 @@ answers() {
   [[ -z $BAD ]]
 }
 
+# proven_open WHO ROUTE...: an answer other than 401 through the public route proves an open gateway
+# only when GATEWAY_CHECK_ADDRESS gives one too (grant step 8): another listener on the public route can
+# answer, for example tailscaled when Funnel runs in HTTPS mode. BAD then holds the direct answers.
+proven_open() {
+  local route=("${VIA[@]}") rc=0
+  VIA=("${DIRECT[@]}")
+  answers 401 "$@" || rc=1
+  VIA=("${route[@]}")
+  ((rc)) && [[ $BAD == *=[1-9][0-9][0-9]* ]]
+}
+
 hint() {
   if [[ $BAD == *=000* ]]; then
-    printf '\n  000: curl failed (see its error above). For a TLS error: see "the certificate from tailscaled" in --help.'
+    printf '\n  000: curl failed (see its error above). For a TLS error: see "the certificate from tailscaled" in --help; also check that tailscale status shows this unit online and that /etc/default/tailscaled has TS_PERMIT_CERT_UID=caddy.'
   fi
   if [[ $BAD == *=404+body* ]]; then
     printf '\n  404+body: the request passed the gateway, and the model server answered it.'
@@ -299,9 +316,14 @@ expect() {
   local want=$1 who=$2 label=$3
   shift 3
   answers "$want" "$who" "$@" && return 0
-  # An HTTP answer other than 401 (000 is a curl failure, not an answer) proves the gateway open.
+  # An HTTP answer other than 401 (000 is a curl failure, not an answer) proves the gateway open. Through
+  # the public route it is no proof by itself: the check address decides (proven_open), as in grant step 8.
   if [[ $want == 401 && $BAD == *=[1-9][0-9][0-9]* ]]; then
-    OPEN="tests/expiry.sh step $STEP, $(date -u '+%F %T UTC'): the gateway answered$BAD to $label through $ROUTE, and each answer must be 401: the gateway does not enforce the token file"
+    local public=$BAD
+    if [[ $VIA_PUBLIC == yes ]] && ! proven_open "$who" "$@"; then
+      fail "$label: each answer through $ROUTE must be 401, but:$public; at $ADDRESS the gateway refuses it: the inbound route does not reach this gateway, or it changes its answers (tailscale funnel status must show TCP 443 to tcp://127.0.0.1:443); no marker"
+    fi
+    OPEN="tests/expiry.sh step $STEP, $(date -u '+%F %T UTC'): the gateway answered$BAD to $label at $ADDRESS, and each answer must be 401: the gateway does not enforce the token file"
   fi
   fail "$label: each answer must be $want, but:$BAD$(hint)"
 }
@@ -458,12 +480,16 @@ STREAM_PID=""
 ((stream_rc != 0)) || fail "the stream ended on its own (curl exit 0), not by the cut; raise EXPIRY_MAX_TOKENS or use a shorter --ttl"
 read -r stream_code stream_size <"$TMP/stream" || true
 [[ ${stream_code:-} == 200 && ${stream_size:-0} -gt 0 ]] || fail "the stream got \"${stream_code:-none}\" with ${stream_size:-0} bytes; it must get 200 with data"
-until_by $((DEADLINE + BOUND)) "the key does not get 401 on every path $BOUND s after the end time" answers 401 "$KEY1" "${EVERY[@]}"
+# One route times the cut: the deny-all rule is one token file for every route. Every route and the other
+# callers follow after the time limits, because through a relay of Funnel each request takes a few round
+# trips, and 12 to 48 requests would count against the limits of the revoke.
+until_by $((DEADLINE + BOUND)) "the key does not get 401 $BOUND s after the end time" answers 401 "$KEY1" "GET /v1/models"
 cut_at=$(($(date +%s) - DEADLINE))
-refused
 until_by $((DEADLINE + lock_end + 30)) "sparkpass list still shows a lease 30 s after the end of the lock hold" no_lease
 until_by $((DEADLINE + lock_end + 30)) "$TIMER or another end timer still exists 30 s after the end of the lock hold (systemctl list-timers --all 'sparkpass-end-*')" timer_gone
 gone_at=$(($(date +%s) - DEADLINE))
+expect 401 "$KEY1" "the key after the end time" "${EVERY[@]}"
+refused
 if [[ -n $(running) ]]; then
   until_by $(($(date +%s) + BOUND)) "the model server still runs a request after the stream closed (design Open Question 4)" idle
   model_note="the model server runs zero requests"
@@ -524,12 +550,14 @@ say "the new key works, and the earlier keys get 401; waiting for the end time o
 # The new lease ends at its own end time (design, Success Criteria): not before it, and not later than the bounds.
 wait_until $((DEADLINE - 3))
 expect 200 "$KEY3" "the key of the new grant, 3 s before its end time" "GET /v1/models"
-until_by $((DEADLINE + BOUND)) "the new key does not get 401 on every path $BOUND s after its end time" answers 401 "$KEY3" "${EVERY[@]}"
+# One route times the cut, as in step 3.
+until_by $((DEADLINE + BOUND)) "the new key does not get 401 $BOUND s after its end time" answers 401 "$KEY3" "GET /v1/models"
 recut_at=$(($(date +%s) - DEADLINE))
-refused
 until_by $((DEADLINE + 30)) "sparkpass list still shows a lease 30 s after the end time of the new lease" no_lease
 until_by $((DEADLINE + 30)) "$TIMER or another end timer still exists 30 s after the end time (systemctl list-timers --all 'sparkpass-end-*')" timer_gone
 regone_at=$(($(date +%s) - DEADLINE))
+expect 401 "$KEY3" "the new key after its end time" "${EVERY[@]}"
+refused
 ARMED=no
 say "ok 5: the new lease ended at its own end time: the key got 401 at +${recut_at}s, the lease and its end timer were gone at +${regone_at}s"
 
