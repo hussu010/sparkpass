@@ -1,0 +1,24 @@
+# sparkpass settings: /etc/sparkpass/config (owner root, mode 0600). install.sh copies this file there
+# only when that file does not exist. One KEY=VALUE on each line; "#" starts a comment.
+# sparkpass grant and sparkpass reconcile read it; sparkpass revoke reads only NOTIFY_URL. With a missing
+# or bad value of one of the three keys below, grant refuses and reconcile keeps Caddy stopped.
+
+# Public URL of the gateway, https only (the API key travels in each request), with no path and no
+# trailing slash, for example https://spark.example.net. The inbound method of milestone 1 decides it.
+# SPARKPASS_SITE in /etc/sparkpass/caddy.env must name the same host.
+PUBLIC_URL=
+
+# API port of the model server on 127.0.0.1, for example 8000. The same value as
+# SPARKPASS_MODEL_PORT in /etc/sparkpass/caddy.env.
+MODEL_PORT=
+
+# An IP address of the public listener of Caddy on THIS host: a loopback address, or a local address
+# that `ip -o addr` lists. Grant and reconcile send their wrong-key check there, with the name of PUBLIC_URL.
+# Never an address of the other Spark: its 401 answers would make reconcile trust a local Caddy
+# that is open.
+GATEWAY_CHECK_ADDRESS=127.0.0.1
+
+# Optional owner notification: one POST of a plain text to this https URL, for example an ntfy topic
+# URL. It is a secret: for ntfy, the topic name is the only access control. https only: any other
+# value means no notification, with no error.
+#NOTIFY_URL=https://ntfy.sh/<a long random topic>

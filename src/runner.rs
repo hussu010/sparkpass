@@ -2,7 +2,7 @@
 //! so that the unit tests run with fake commands and no hardware.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{self, Read};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -57,6 +57,9 @@ pub fn run_ok(runner: &dyn Runner, argv: &[&str]) -> Result<Output, String> {
     }
 }
 
+/// The part of each pipe that `RealRunner` keeps in memory: a broken command must not exhaust it.
+const PIPE_LIMIT: u64 = 1 << 20;
+
 pub struct RealRunner {
     /// Time limit for each command. A command that hangs must not hold the lock without end.
     pub limit: Duration,
@@ -110,7 +113,9 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> Receiver<String> {
     thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
+            let _ = pipe.by_ref().take(PIPE_LIMIT).read_to_end(&mut bytes);
+            // The rest is read and discarded: the child must not block on a full pipe.
+            let _ = io::copy(&mut pipe, &mut io::sink());
         }
         let _ = tx.send(String::from_utf8_lossy(&bytes).into_owned());
     });
@@ -133,6 +138,8 @@ pub mod fake {
         /// `healthy()` only: is an end timer active? `None`: each command gives exit code 0.
         /// ponytail: one state for all units, because one guest has access at a time.
         timer: Mutex<Option<bool>>,
+        /// `healthy()` only: does Caddy run? `start` and `stop` change it; `try-restart` does not start it.
+        caddy: Mutex<Option<bool>>,
     }
 
     pub fn output(code: i32, stdout: &str) -> Result<Output, RunError> {
@@ -144,13 +151,18 @@ pub mod fake {
     }
 
     impl FakeRunner {
-        /// A host in the normal state: the model answers, and no end timer is active.
+        /// A host in the normal state: the model answers, Caddy runs, and no end timer is active.
         /// `systemd-run` makes the end timer active, and `systemctl stop <unit>.timer` ends it.
         pub fn healthy() -> FakeRunner {
-            let runner = FakeRunner { timer: Mutex::new(Some(false)), ..FakeRunner::default() };
-            runner.on("curl -fsS -m 8 http://127.0.0.1:8000/v1/models", output(0, r#"{"object":"list","data":[{"id":"test-model"}]}"#));
-            // The gateway refuses a request with no token.
-            runner.on("curl -sS -o /dev/null -m 8 -w %{http_code}", output(0, "401"));
+            let runner = FakeRunner { timer: Mutex::new(Some(false)), caddy: Mutex::new(Some(true)), ..FakeRunner::default() };
+            runner.on("curl -q --noproxy * -fsS -m 8 http://127.0.0.1:8000/v1/models", output(0, r#"{"object":"list","data":[{"id":"test-model"}]}"#));
+            // The gateway accepts the pass key and refuses the wrong key of grant (the newer rule wins).
+            runner.on("curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} -H Authorization: Bearer ", output(0, "200"));
+            runner.on(&format!("curl -q --noproxy * -sS -o /dev/null -m 8 -w %{{http_code}} -H Authorization: Bearer {}", "0".repeat(64)), output(0, "401"));
+            // The public listener at GATEWAY_CHECK_ADDRESS refuses the wrong token of the reconcile check.
+            runner.on("curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ", output(0, "401"));
+            // The notification endpoint (NOTIFY_URL) accepts each message.
+            runner.on("curl -q -fsS -o /dev/null", output(0, "200"));
             runner
         }
 
@@ -201,6 +213,14 @@ pub mod fake {
                     ["systemctl", "stop", unit] if unit.ends_with(".timer") => *active = false,
                     // systemctl gives 3 for a unit that is not active.
                     ["systemctl", "is-active", "--quiet", unit] if unit.ends_with(".timer") && !*active => return output(3, ""),
+                    _ => {}
+                }
+            }
+            if let Some(active) = self.caddy.lock().unwrap().as_mut() {
+                match argv {
+                    ["systemctl", "start", "caddy"] => *active = true,
+                    ["systemctl", "stop", "caddy"] => *active = false,
+                    ["systemctl", "is-active", "--quiet", "caddy"] if !*active => return output(3, ""),
                     _ => {}
                 }
             }
@@ -277,6 +297,17 @@ mod tests {
         assert_eq!(out.code, Some(0));
         assert_eq!(out.stdout, "x".repeat(200_000));
         assert_eq!(out.stderr, "y".repeat(200_000));
+    }
+
+    #[test]
+    fn real_runner_keeps_the_first_1_mib_of_each_pipe_and_discards_the_rest() {
+        // 2 MiB on each pipe: 1 MiB of x, then 1 MiB of z.
+        let script = "for c in x z; do head -c 1048576 /dev/zero | tr '\\0' $c; head -c 1048576 /dev/zero | tr '\\0' $c >&2; done";
+        // A result in the limit: the child did not block on a full pipe after the first 1 MiB.
+        let out = real(20_000).run(&["sh", "-c", script]).unwrap();
+        assert_eq!(out.code, Some(0));
+        assert!(out.stdout == "x".repeat(1 << 20), "stdout has {} bytes", out.stdout.len());
+        assert!(out.stderr == "x".repeat(1 << 20), "stderr has {} bytes", out.stderr.len());
     }
 
     #[test]

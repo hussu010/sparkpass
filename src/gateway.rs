@@ -1,18 +1,23 @@
 //! The gateway (Caddy): the token file, and the commands that close and stop the gateway.
 
 use crate::config::Paths;
+use crate::lease;
+use crate::notify;
 use crate::runner::{Runner, run_ok};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 
-/// The content of the token file. This function is the only place that knows the format,
-/// because the format can change on the hardware.
-/// `None` is the deny-all rule. `Some((name, token))` permits only requests with the token.
+/// The content of the token file. This function is the only place that knows the format, together with
+/// gateway/Caddyfile (its guard), tests/gateway.sh (`lease_rule`), which tests it with a real Caddy, and the
+/// deny-all text in install.sh and tests/expiry.sh. A test below checks each copy.
+/// `None` is the deny-all rule. `Some((name, token))` only sets the pass marker for a request with the
+/// token; the Caddyfile answers 401 to each request without the marker, so an empty or cut file, or a
+/// rule in an old format, refuses each request (TODO batch 2 of 2026-10-06).
 pub fn rule(active: Option<(&str, &str)>) -> String {
     match active {
         None => "# sparkpass: deny-all\nrespond 401\n".into(),
         Some((name, token)) => format!(
-            "# sparkpass: lease {name}\n@sparkpass_denied not header Authorization \"Bearer {token}\"\nrespond @sparkpass_denied 401\n"
+            "# sparkpass: lease {name}\n@sparkpass_pass header Authorization \"Bearer {token}\"\nvars @sparkpass_pass sparkpass_pass yes\n"
         ),
     }
 }
@@ -21,13 +26,17 @@ pub fn rule(active: Option<(&str, &str)>) -> String {
 /// The tool never creates the file: a file that root creates has no group that Caddy can read,
 /// and the cause would show only in the journal of Caddy.
 pub fn write_rule(paths: &Paths, rule: &str) -> io::Result<()> {
-    // ponytail: the write is not atomic. A power cut between the truncate and the write leaves an
-    // empty file, and a gateway that imports an empty file has no token check. Only the boot gate
-    // covers this: reconcile closes the gateway for such a file before it starts the gateway.
-    // Upgrade: a Caddyfile that does not load without the rule, or a temporary file with chown and rename.
+    // The write is not atomic: a power cut between the truncate and the write leaves an empty or cut file.
+    // The Caddyfile refuses each request for such a file (no pass marker), and the boot gate of reconcile
+    // also closes it before it starts the gateway.
+    write_unsynced(paths, rule)?.sync_all()
+}
+
+/// The write of `write_rule` without the sync to disk. The caller syncs the returned file.
+fn write_unsynced(paths: &Paths, rule: &str) -> io::Result<File> {
     let mut file = File::options().write(true).truncate(true).open(&paths.token)?;
     file.write_all(rule.as_bytes())?;
-    file.sync_all()
+    Ok(file)
 }
 
 pub fn is_deny_all(paths: &Paths) -> bool {
@@ -37,14 +46,19 @@ pub fn is_deny_all(paths: &Paths) -> bool {
 /// The token file is the complete active rule of this lease, with any token.
 /// False for the empty or cut file that a power cut in `write_rule` leaves.
 pub fn is_rule_of(paths: &Paths, name: &str) -> bool {
-    // `rule` stays the only owner of the format: the token is the text between the two fixed parts.
-    let frame = rule(Some((name, "\0")));
-    let (Ok(text), Some((head, tail))) = (fs::read_to_string(&paths.token), frame.split_once('\0')) else {
-        return false;
-    };
-    text.strip_prefix(head)
-        .and_then(|rest| rest.strip_suffix(tail))
-        .is_some_and(|token| !token.is_empty() && token.bytes().all(|b| b.is_ascii_hexdigit()))
+    rule_name(paths).is_some_and(|owner| owner == name)
+}
+
+/// The lease name of the token file, if the file is the complete active rule of a lease, with any token.
+pub fn rule_name(paths: &Paths) -> Option<String> {
+    let text = fs::read_to_string(&paths.token).ok()?;
+    // `rule` stays the only owner of the format: the name and the token are the texts between its fixed parts.
+    let frame = rule(Some(("\0", "\0")));
+    let mut parts = frame.split('\0');
+    let (head, middle, tail) = (parts.next()?, parts.next()?, parts.next()?);
+    let (name, token) = text.strip_prefix(head)?.strip_suffix(tail)?.split_once(middle)?;
+    // A name that grant cannot make (a directive in it) is no lease.
+    (!token.is_empty() && token.bytes().all(|b| b.is_ascii_hexdigit()) && lease::valid_name(name)).then(|| name.to_string())
 }
 
 /// Test helper: the token in a token file that holds an active rule, of any lease.
@@ -63,18 +77,68 @@ pub fn new_token() -> io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Closes the gateway: revoke steps 2 and 3. Safe at any time, with or without the lock.
+/// Closes the gateway: revoke steps 1 and 2. Safe at any time, with or without the lock.
 /// Fail closed (eng review D7): if the gateway cannot close in the normal way, it stops.
 pub fn close(paths: &Paths, runner: &dyn Runner) -> Result<(), String> {
-    // 2. Deny-all rule. If the write failed, a restart can load the old token: stop, do not restart.
-    if let Err(e) = write_rule(paths, &rule(None)) {
-        return Err(format!("deny-all write to {}: {e}; {}", paths.token.display(), stop(runner)));
-    }
-    // 3. The restart closes each open connection after the grace period. No effect if Caddy is not active.
+    // 1. Deny-all rule. If the write failed, a restart can load the old token: stop, do not restart.
+    let file = match write_unsynced(paths, &rule(None)) {
+        Ok(file) => file,
+        Err(e) => return Err(format!("deny-all write to {}: {e}; {}", paths.token.display(), stop(runner))),
+    };
+    // 2. The restart closes each open connection after the grace period. No effect if Caddy is not active.
+    // It comes before the sync (owner decision of 2026-10-06): a slow or stuck disk must not delay the cut.
     if let Err(e) = run_ok(runner, &["systemctl", "try-restart", "caddy"]) {
         return Err(format!("gateway restart: {e}; {}", stop(runner)));
     }
-    Ok(())
+    // The sync after the cut. Caddy read the rule from memory already. A failed sync is an error, so that
+    // the lease stays (REVOKE-FAILED) and reconcile closes again: after a power cut the old rule can return.
+    // ponytail: no test fakes a failed or slow sync; a test seam for File::sync_all is not worth it.
+    file.sync_all()
+        .map_err(|e| format!("the deny-all rule is active, but its sync to disk failed: {e}"))
+}
+
+/// The marker of a gateway proven open, as text for an error, or `None` with no marker. A failed check
+/// counts as a marker (fail closed).
+pub fn open_marker(paths: &Paths) -> Option<String> {
+    let marker = paths.gateway_open.display();
+    match paths.gateway_open.try_exists() {
+        Ok(false) => None,
+        Ok(true) => Some(format!(
+            "the gateway was proven open earlier ({marker}: {}); it stays stopped until you repair the Caddyfile and remove {marker}",
+            fs::read_to_string(&paths.gateway_open).unwrap_or_default().trim()
+        )),
+        Err(e) => Some(format!("cannot check the marker {marker}: {e}")),
+    }
+}
+
+/// A proven answer other than 401 to a wrong token: the gateway does not enforce the token file. The gateway
+/// stops first: the cut must not wait for the notification. Then the marker keeps it stopped (reconcile
+/// does not start it, grant refuses) until the owner repairs the Caddyfile and removes it; a curl failure
+/// never writes it. Returns the text for the error, which is also the text of the notification.
+pub fn mark_open(paths: &Paths, runner: &dyn Runner, evidence: &str) -> String {
+    let stopped = stop(runner);
+    let marker = paths.gateway_open.display();
+    // The marker must stay after a power cut: the boot run of reconcile reads it. The sync of the file and
+    // of its directory, as for a lease file.
+    // ponytail: no test fakes a failed sync, as for `close`.
+    let write = || -> io::Result<()> {
+        let mut file = File::create(&paths.gateway_open)?;
+        file.write_all(format!("{evidence}\n").as_bytes())?;
+        file.sync_all()?;
+        File::open(paths.gateway_open.parent().unwrap_or(std::path::Path::new("/")))?.sync_all()
+    };
+    let marked = match write() {
+        // Each reconcile run stops the gateway while the marker exists, also after a failed stop here.
+        Ok(()) => format!("each reconcile run stops the gateway until you repair the Caddyfile and remove {marker}"),
+        // A path that exists, or that cannot be checked, counts as a marker (open_marker).
+        Err(e) if !matches!(paths.gateway_open.try_exists(), Ok(false)) => {
+            format!("THE MARKER {marker} MAY NOT BE COMPLETE ON DISK: {e}; while the path exists or cannot be checked, each reconcile run stops the gateway")
+        }
+        Err(e) => format!("THE MARKER {marker} WAS NOT WRITTEN: {e}; the next reconcile can start the gateway again"),
+    };
+    let text = format!("{evidence}; {stopped}; {marked}");
+    notify::send(paths, runner, &format!("sparkpass: {text}"));
+    text
 }
 
 /// Stops the gateway. Returns the result as text for the journal.
@@ -96,7 +160,7 @@ mod tests {
         assert_eq!(rule(None), "# sparkpass: deny-all\nrespond 401\n");
         assert_eq!(
             rule(Some(("bob", "abc123"))),
-            "# sparkpass: lease bob\n@sparkpass_denied not header Authorization \"Bearer abc123\"\nrespond @sparkpass_denied 401\n"
+            "# sparkpass: lease bob\n@sparkpass_pass header Authorization \"Bearer abc123\"\nvars @sparkpass_pass sparkpass_pass yes\n"
         );
     }
 
@@ -136,6 +200,27 @@ mod tests {
     }
 
     #[test]
+    fn rule_name_is_the_lease_of_a_complete_rule_only() {
+        let paths = Paths::temp();
+        let rule_of_bob = rule(Some(("bob", &"ab".repeat(32))));
+        for (text, name) in [
+            (rule_of_bob.as_str(), Some("bob")),
+            (&rule(Some(("guest-1", "f"))), Some("guest-1")),
+            (&rule(None), None),
+            ("", None),
+            (&rule_of_bob[..rule_of_bob.len() - 5], None),
+            (&format!("{rule_of_bob}respond 200\n"), None),
+            (&rule(Some(("bob", ""))), None),
+            (&rule(Some(("bob", "x\"\nrespond 200\n#"))), None),
+            (&rule(Some(("bob\nrespond 200", "ab"))), None),
+        ] {
+            fs::write(&paths.token, text).unwrap();
+            assert_eq!(rule_name(&paths).as_deref(), name, "{text:?}");
+            assert_eq!(is_rule_of(&paths, "bob"), name == Some("bob"), "{text:?}");
+        }
+    }
+
+    #[test]
     fn close_writes_deny_all_and_then_restarts() {
         let (paths, runner) = (Paths::temp(), FakeRunner::default());
         write_rule(&paths, &rule(Some(("bob", "abc")))).unwrap();
@@ -152,5 +237,99 @@ mod tests {
         let error = close(&paths, &runner).unwrap_err();
         assert!(error.contains("THE GATEWAY STOP FAILED ALSO"), "{error}");
         assert_eq!(runner.calls(), ["systemctl try-restart caddy", "systemctl stop caddy"]);
+    }
+
+    #[test]
+    fn deny_all_rule_is_in_the_file_when_the_gateway_restarts() {
+        let (paths, runner) = (Paths::temp(), FakeRunner::default());
+        write_rule(&paths, &rule(Some(("bob", "abc")))).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        runner.hook({
+            let (seen, token) = (seen.clone(), paths.token.clone());
+            move |argv| {
+                if argv.join(" ") == "systemctl try-restart caddy" {
+                    *seen.lock().unwrap() = fs::read_to_string(&token).unwrap();
+                }
+            }
+        });
+        assert_eq!(close(&paths, &runner), Ok(()));
+        assert_eq!(*seen.lock().unwrap(), rule(None));
+    }
+
+    #[test]
+    fn marker_of_an_open_gateway_holds_the_evidence_until_the_owner_removes_it() {
+        let (paths, runner) = (Paths::temp(), FakeRunner::default());
+        fs::write(&paths.config, "NOTIFY_URL=https://ntfy.example.net/secret-topic\n").unwrap();
+        assert_eq!(open_marker(&paths), None);
+        let text = mark_open(&paths, &runner, "the gateway answered 200 through https://x/v1/models to a request with a wrong token");
+        assert!(text.contains("wrong token; the gateway is stopped; each reconcile run stops the gateway until you repair the Caddyfile and remove "), "{text}");
+        let marker = open_marker(&paths).unwrap();
+        assert!(marker.contains("answered 200 through https://x/v1/models") && marker.contains("remove"), "{marker}");
+        // The stop first, then one notification with the same text: the cut does not wait for the notification.
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0], "systemctl stop caddy");
+        assert!(calls[1].starts_with(&format!("curl -q -fsS -o /dev/null -m 8 --data-binary sparkpass: {text} ")), "{calls:?}");
+        fs::remove_file(&paths.gateway_open).unwrap();
+        assert_eq!(open_marker(&paths), None);
+
+        // The marker write fails, but a path exists, which still counts as a marker: the text says so. The
+        // notification says what is true: the stop failed too.
+        fs::create_dir(&paths.gateway_open).unwrap();
+        let runner = FakeRunner::default();
+        runner.exit("systemctl stop caddy", 1);
+        let text = mark_open(&paths, &runner, "evidence");
+        assert!(text.contains("THE GATEWAY STOP FAILED ALSO") && text.contains("MAY NOT BE COMPLETE ON DISK"), "{text}");
+        assert!(runner.calls().last().unwrap().contains(&text), "{:?}", runner.calls());
+        assert!(open_marker(&paths).is_some());
+
+        // No marker file at all (the state directory is gone): the next reconcile can start the gateway.
+        let gone = Paths::temp();
+        fs::remove_dir_all(gone.gateway_open.parent().unwrap()).unwrap();
+        let text = mark_open(&gone, &FakeRunner::default(), "evidence");
+        assert!(text.contains("WAS NOT WRITTEN") && text.contains("the next reconcile can start the gateway again"), "{text}");
+
+        // Extended by the /ship test coverage audit (2026-10-06, TODO batch 2): a failed check of the marker.
+        // Value: protects=a marker path that cannot be checked counts as a marker, so grant refuses and reconcile keeps the gateway stopped;
+        // fails_when=open_marker uses Path::exists (false on an error), and a gateway proven open starts again when the stat fails;
+        // why_new=the cases above (no marker, a file, a directory) give the same result with exists(); seam=none
+        fs::remove_dir(&paths.gateway_open).unwrap();
+        // A symbolic link to itself: the stat fails, and the cause is not "no such file".
+        std::os::unix::fs::symlink("gateway-open", &paths.gateway_open).unwrap();
+        let text = open_marker(&paths).unwrap_or_default();
+        assert!(text.starts_with("cannot check the marker"), "{text}");
+        // The text of mark_open agrees: the gateway stays stopped (added by the /ship review, Step 11 round 3).
+        let text = mark_open(&paths, &FakeRunner::default(), "evidence");
+        assert!(text.contains("MAY NOT BE COMPLETE ON DISK") && !text.contains("can start the gateway again"), "{text}");
+    }
+
+    // Added by the /ship test coverage audit (2026-10-06, TODO batch 2).
+    // Value: protects=tests/gateway.sh proves with a real Caddy the exact text that `rule` writes, and the guard of
+    // gateway/Caddyfile reads the pass marker that `rule` sets, from the token file of production;
+    // fails_when=one of the copies of the format changes alone: gateway.sh then passes for a rule that the tool
+    // never writes (an open matcher goes unseen), or each pass gets 401 on the units;
+    // why_new=rule_has_the_exact_format pins `rule` alone, and gateway.sh pins only its own copy; seam=none
+    #[test]
+    fn token_rule_is_the_same_in_the_caddyfile_and_in_the_gateway_test() {
+        // deny_all and lease_rule of tests/gateway.sh: `rule` as a printf format, with %s for the name and the token.
+        let script = include_str!("../tests/gateway.sh");
+        let printf = |text: String| format!("printf '{}'", text.replace('\n', "\\n"));
+        for text in [rule(None), rule(Some(("%s", "%s")))] {
+            assert!(script.contains(&printf(text.clone())), "tests/gateway.sh has no {}", printf(text));
+        }
+        // install.sh writes the deny-all rule, and tests/expiry.sh compares the token file with it.
+        for (file, script) in [("install.sh", include_str!("../install.sh")), ("tests/expiry.sh", include_str!("../tests/expiry.sh"))] {
+            assert!(script.contains(&printf(rule(None))), "{file} has no {}", printf(rule(None)));
+        }
+        let caddyfile: Vec<&str> = include_str!("../gateway/Caddyfile").lines().map(str::trim).collect();
+        let import = format!("import {}", Paths::new(std::path::Path::new("/")).token.display());
+        assert!(caddyfile.contains(&import.as_str()), "gateway/Caddyfile has no {import}");
+        // The last line of an active rule is `vars <matcher> <name> <value>`. The guard refuses each request
+        // that does not have this name with this value.
+        let active = rule(Some(("bob", "ab")));
+        let vars: Vec<&str> = active.lines().last().unwrap().split(' ').collect();
+        assert!(vars.len() == 4 && vars[0] == "vars", "{active}");
+        let guard = format!(" not vars {} {}", vars[2], vars[3]);
+        assert!(caddyfile.iter().any(|line| line.ends_with(&guard)), "gateway/Caddyfile has no guard{guard}");
     }
 }

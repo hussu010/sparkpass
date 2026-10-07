@@ -1,0 +1,77 @@
+# sparkpass gateway. Design: docs/designs/guest-pass-mvp.md, section "The gateway".
+#
+# caddy.service starts it with `caddy run --environ --config /etc/caddy/Caddyfile`,
+# never with --resume (that loads the last autosaved config, not this file).
+# Settings, from the environment of caddy.service (EnvironmentFile=/etc/sparkpass/caddy.env):
+#   SPARKPASS_SITE        site address, for example spark.example.net (ACME certificate),
+#                         or localhost:8443 for a test (Caddy's internal CA)
+#   SPARKPASS_MODEL_PORT  API port of the model server, for example 8000
+#   SPARKPASS_MODEL_HOST  upstream host of the model server; leave it unset on the unit
+#                         (127.0.0.1); only tests/gateway.sh sets it
+# Put no secret in caddy.env: `caddy run --environ` writes the whole environment to the journal.
+# The token file /etc/sparkpass/token.caddy belongs to sparkpass (src/gateway.rs, `rule`).
+# Each request gets 401 unless the imported rule sets the pass marker, so an empty or cut
+# token file refuses each request. A missing token file stops Caddy from loading this file.
+{
+	grace_period 2s
+	# Caddy autosaves each loaded config (with the current token rule) to autosave.json. `persist_config off`
+	# would stop that, but Caddy 2.6.2 (the Ubuntu 24.04 package) does not know the option. The autosave holds
+	# only the rule that token.caddy holds, for the same readers (root and caddy), and only a unit with
+	# --resume loads it: install.sh pins ExecStart without --resume and masks caddy-api.service.
+}
+
+{$SPARKPASS_SITE} {
+	request_body {
+		max_size 4MB
+	}
+
+	# Access log to stderr (the journal of caddy.service): time, client IP address, method,
+	# path, status and size. No headers, no bodies.
+	log {
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				# The path only: a query string can hold guest text.
+				request>uri regexp "[?].*" ""
+				request>tls delete
+				request>host delete
+				request>proto delete
+				request>remote_port delete
+				resp_headers delete
+				bytes_read delete
+				user_id delete
+				duration delete
+			}
+		}
+	}
+
+	# All routing is in this one route, and the token file is its first line.
+	route {
+		import /etc/sparkpass/token.caddy
+		@sparkpass_no_pass not vars sparkpass_pass yes
+		respond @sparkpass_no_pass 401
+		# The matcher of reverse_proxy compares a cleaned copy of the path, but the proxy sends the raw path:
+		# /metrics/../v1/models would reach /metrics of the model server. A dot or empty segment gets 400.
+		@sparkpass_unclean expression `{http.request.uri.path}.contains("/.") || {http.request.uri.path}.contains("//")`
+		respond @sparkpass_unclean 400
+		reverse_proxy /v1/* {$SPARKPASS_MODEL_HOST:127.0.0.1}:{$SPARKPASS_MODEL_PORT} {
+			transport http {
+				response_header_timeout 300s
+			}
+		}
+		respond 404
+	}
+
+	# Errors, in this order: a body over the limit gets 413 (Caddy 2.6.2, the Ubuntu 24.04 package, reports
+	# it as a 502 from the proxy, with "request body too large" in the message); the model server refused
+	# the connection (or another transport error) gets 503.
+	handle_errors {
+		route {
+			@sparkpass_too_large expression `{http.error.status_code} == 502 && {http.error.message}.contains("request body too large")`
+			respond @sparkpass_too_large 413
+			@sparkpass_refused expression {http.error.status_code} == 502
+			respond @sparkpass_refused 503
+		}
+	}
+}
