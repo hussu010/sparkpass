@@ -2,18 +2,6 @@
 
 ## Pass tool
 
-### Owner notification
-
-**What:** Send a push message to the owner when a lease becomes `REVOKE-FAILED` or when the model endpoint is down during an active lease.
-
-**Why:** The guest sees 503 until the owner restarts the model by hand, and the owner does not know. A guest can lose hours of a 24-hour slot.
-
-**Context:** From the eng review of 2026-10-05 (finding A-3, decision D12). Revoke already cuts access first and retries each 5 minutes, so safety does not depend on this item. The faults show only in the journal and in `pass list`. Start at `systemd/pass-reconcile.service`: add an `OnFailure=` unit that sends one message, plus a health-check timer for the model endpoint during a lease. It needs a message channel and its secret (for example ntfy or a chat webhook).
-
-**Effort:** S
-**Priority:** P3
-**Depends on:** Build phase 1 complete (API-only pass works).
-
 ### Stronger erase of guest data
 
 **What:** Encrypt the home image of each lease (LUKS) with a random key that revoke discards, and restart the model server between guests.
@@ -25,30 +13,6 @@
 **Effort:** M
 **Priority:** P3
 **Depends on:** Build phase 2 complete (the home image exists).
-
-### Exact end timers in reconcile after a backward clock step
-
-**What:** Count the `--on-active` time of an end timer that reconcile creates again from a monotonic source (for example `std::time::Instant` in the production clock of main.rs), not from the wall clock.
-
-**Why:** A backward clock step during reconcile steps 1 to 3 adds their time (at most about 20 seconds) to the end of such a timer. The design text names this as the one exception to "an open stream ends not later than 15 seconds after the deadline".
-
-**Context:** From the /ship adversarial review of 2026-10-06 (Codex adversarial P2, verified by a skeptic). Grant has no such gap: it reads the clock once, after its checks, and `--on-active` equals the TTL. Reconcile keeps a monotonic wrapper over the injected clock for one run (src/reconcile.rs), so a test clock stays possible.
-
-**Effort:** S
-**Priority:** P3
-**Depends on:** None
-
-### The access cut waits for the sync of the token file
-
-**What:** In `gateway::close`, restart Caddy before the fsync of the deny-all file, or give the sync a time limit.
-
-**Why:** `write_rule` calls `sync_all` before `systemctl try-restart caddy`, and that sync has no time limit. On ext4 a journal commit that carries other dirty data (a model download, guest writes in phase 2) can delay the access cut past the 15-second bound, and a stalled device blocks it in D state, where systemd cannot kill the process.
-
-**Context:** From the /ship adversarial review of 2026-10-06, second round (Claude adversarial, INVESTIGATE); the order existed before branch fix/todos-before-first-guest. The boot gate of reconcile already handles each token-file state after a power cut, so the sync before the restart adds little safety. Decide the durability trade-off first.
-
-**Effort:** S
-**Priority:** P3
-**Depends on:** None
 
 ### One retry of the reconcile probe on a network error
 
@@ -64,72 +28,17 @@
 
 ## Gateway (Caddyfile step)
 
-### Fail closed when the gateway does not enforce the token file
+### Prove the gateway step on the units
 
-**What:** Write the Caddyfile so that it refuses each request when the import holds no rule, and prove it on the units with tests/expiry.sh. Acceptance rules for this step:
-1. Import the token file once, as the first line inside one top-level `route { }` block that holds all the routing (for example `route { import /etc/sparkpass/token.caddy; reverse_proxy /v1/* 127.0.0.1:<MODEL_PORT>; respond 404 }`). A per-route or per-`handle` import leaves other paths of the model server open (`/invocations`, `/tokenize`, `/metrics`, `/v1/completions`) while both wrong-token checks get 401.
-2. The caddy unit starts with `caddy run --environ --config <Caddyfile>`, never with `--resume`, which loads the last autosaved config and not the Caddyfile.
-3. `GATEWAY_CHECK_ADDRESS` reaches the same site block as `PUBLIC_URL` on THIS host: a loopback or a local address, never the other Spark, because its 401 answers would make reconcile trust a local Caddy that is open. Consider a check in `read_settings` (a loopback address, or one that `ip -o addr` lists). Upgrade order: set the key in /etc/sparkpass/config before you install this build, at a time with no active lease. Without it, reconcile keeps Caddy stopped (an active guest loses access) and grant refuses.
-4. The ACME procedure for the first certificate and for a host that was off past the end of its certificate: stop pass-reconcile.timer, start caddy, wait for the certificate, start the timer, run `sparkpass reconcile`. Include first issuance in the tests/expiry.sh proof.
-5. Extend tests/expiry.sh: during an active lease, a wrong token to `/v1/completions`, `/invocations`, `/tokenize`, `/metrics` and a path outside `/v1` gets 401; after a grant and a revoke, the old token gets 401.
+**What:** On the head unit, after milestone 1 (firewall/rules.sh, the inbound method, the settings): run `sudo ./install.sh`, fill /etc/sparkpass/config and caddy.env, follow the first-ACME-certificate procedure that install.sh prints, and run `sudo tests/expiry.sh --stub`, `sudo tests/expiry.sh`, and `sudo tests/expiry.sh --via-public`. Then the manual checks that the script prints: a reboot inside an active lease, a boot with no network (the gateway stays closed), and the first certificate. Also: `gh attestation verify sparkpass -R hussu010/sparkpass` on the CI binary; one real `NOTIFY_URL` message (for example a REVOKE-FAILED test lease); `systemctl show -p After multi-user.target` for the chrony-wait drop-in (with no network the boot waits for the clock); and decide the Caddy admin API on localhost:2019, which has no authentication (option: `admin unix//run/caddy/admin.sock` and check that `caddy reload` finds it on 2.6.2). From the /ship review of batch 2 (owner decision D14): list the `/v1` routes of the pinned model server with its flags (runtime LoRA load and unload, a stored Responses API, file or batch upload), and allow in gateway/Caddyfile only the routes that the pass names, because a guest can change state that the next guest or the host sees; prove on the unit that a `systemctl try-restart caddy` of the end timer's revoke, sent while reconcile's `systemctl start caddy` is still activating, restarts Caddy after the start (systemd 240 and later collapse a try-restart of an activating unit into a restart; then the old key gets 401 at once; owner decision D17, from Codex round 3); and consider `systemctl show -p ActiveState --value caddy` in place of `is-active` after a failed step in reconcile, because exit code 3 also means `activating` and `deactivating` (during the restart of a concurrent revoke, reconcile skips the check for 2-3 seconds and can send a false "does not run" message).
 
-**Why:** A gateway that does not import the token file is open to all. The code part is done (see Context), but only the Caddyfile and the unit decide what the gateway enforces.
+**Why:** The Caddyfile is proven in Docker, and the tool with fakes, but only the units prove systemd, the caddy package, the inbound path, the stream cut within 15 seconds, and the boot gate.
 
-**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): security CRITICAL (confidence 6) at src/grant.rs:110 and red team at src/reconcile.rs:92, cycle 3. The code part landed on branch fix/todos-before-first-guest (2026-10-06): grant stops Caddy on any self-check failure, and reconcile sends the same two wrong-token requests after each start through `--connect-to` to `GATEWAY_CHECK_ADDRESS` and stops Caddy on any other answer. Rules 1, 2 and 4 come from the /ship adversarial review of 2026-10-06 (Claude adversarial, Codex adversarial, and a completeness critic), each verified by a skeptic.
+**Context:** Split from "Fail closed when the gateway does not enforce the token file" (TODO batch 2 of 2026-10-06). Rule 3 of that item also asked to consider a check that `GATEWAY_CHECK_ADDRESS` is a loopback or local address (never the other Spark); the code does not check it yet. The review notes of the batch are in the PR of the branch.
 
 **Effort:** M
 **Priority:** P1 (before the first guest)
-**Depends on:** The Caddyfile and the systemd units (plan steps A1 and C1).
-
-### Keep a gateway stopped after proof that it is open
-
-**What:** On a proven answer other than 401 to a wrong token (grant step 8 or the reconcile check), write a marker file under /var/lib/sparkpass. Reconcile does not start Caddy while the marker exists (or while its check fails), and names the file to remove after the Caddyfile repair. A curl failure writes no marker.
-
-**Why:** Today each reconcile after such a stop runs start, check, stop: the gateway is open to all for each check window, every 5 minutes, until the owner repairs the Caddyfile. If `PUBLIC_URL` and `GATEWAY_CHECK_ADDRESS` reach different listeners, reconcile starts a gateway that grant proved open and returns success.
-
-**Context:** From the /ship reviews of 2026-10-06: red team cycle 1, Claude adversarial (its top recommendation), verified by a skeptic in a scratch copy. About 20 code lines and 15 test lines. Write the repair step into the Caddyfile item above.
-
-**Effort:** S
-**Priority:** P1 (before the first guest)
-**Depends on:** None
-
-### Grant also checks through GATEWAY_CHECK_ADDRESS
-
-**What:** In grant step 1 (or step 8), also send the reconcile check (`--connect-to` to `GATEWAY_CHECK_ADDRESS`) and refuse the grant when it fails.
-
-**Why:** Grant proves the gateway only through `PUBLIC_URL`. With a wrong check address, grant prints a pass, and the next reconcile stops the gateway for the whole lease.
-
-**Context:** From the /ship review of 2026-10-06, red team cycle 1 (confidence 5). It adds two commands to grant: raise `HAND_OUT_TIME` or count them in step 1.
-
-**Effort:** S
-**Priority:** P1 (before the first guest)
-**Depends on:** None
-
-### Reconcile checks a running Caddy also after a failed step
-
-**What:** When an earlier reconcile step failed, still send the wrong-token check if `systemctl is-active caddy` succeeds, and stop Caddy on an answer other than 401. Keep the rule "no start and no stop" for all other failures.
-
-**Why:** A failure that repeats on each run (for example a REVOKE-FAILED lease whose timer stop fails) stops the only periodic proof of the gateway, and a gateway that answers 200 to a wrong key stays up.
-
-**Context:** From the /ship review of 2026-10-06, red team cycle 2 (confidence 5), at the early return before the start in src/reconcile.rs. It changes the design rule of reconcile step 4.
-
-**Effort:** S
-**Priority:** P1 (before the first guest)
-**Depends on:** None
-
-## CI
-
-### Build-provenance attestation for the release binary
-
-**What:** Add `actions/attest-build-provenance` (pinned SHA, `subject-path: target/release/sparkpass`, job permissions `id-token: write` and `attestations: write`), and verify on the unit with `gh attestation verify sparkpass -R hussu010/sparkpass`. Optional: `sha256sum sparkpass | tee sparkpass.sha256`, so that the hash is also in the job log.
-
-**Why:** The sha256 file shares the artifact with the binary: it finds a corrupt download, not a changed artifact.
-
-**Context:** From the /ship adversarial review of 2026-10-06 (Claude adversarial, verified). Do it when the CI binary becomes the install path on the units.
-
-**Effort:** S
-**Priority:** P3
-**Depends on:** None
+**Depends on:** Milestone 1 (Next Steps 1 to 3 of the design: the model on the pair, the inbound method, firewall/rules.sh).
 
 ## Completed
 
@@ -287,4 +196,113 @@
 **Effort:** S
 **Priority:** P3
 **Depends on:** None
-**Completed:** branch fix/todos-before-first-guest (2026-10-06). The sha256 shares the artifact with the binary; see the attestation item under CI.
+**Completed:** branch fix/todos-before-first-guest (2026-10-06). The sha256 shares the artifact with the binary; see the completed item "Build-provenance attestation for the release binary".
+
+### Owner notification
+
+**What:** Send a push message to the owner when a lease becomes `REVOKE-FAILED` or when the model endpoint is down during an active lease.
+
+**Why:** The guest sees 503 until the owner restarts the model by hand, and the owner does not know. A guest can lose hours of a 24-hour slot.
+
+**Context:** From the eng review of 2026-10-05 (finding A-3, decision D12). Revoke already cuts access first and retries each 5 minutes, so safety does not depend on this item. The faults show only in the journal and in `pass list`. Start at `systemd/pass-reconcile.service`: add an `OnFailure=` unit that sends one message, plus a health-check timer for the model endpoint during a lease. It needs a message channel and its secret (for example ntfy or a chat webhook).
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** Build phase 1 complete (API-only pass works).
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06). Grant, revoke and reconcile POST one plain-text message to the optional `NOTIFY_URL` of /etc/sparkpass/config (owner decision D3): a lease that becomes REVOKE-FAILED, a model outage during a lease and its end (one message each, through the marker /var/lib/sparkpass/model-down), a gateway that reconcile stops or does not start during a lease and its next start (marker gateway-down, added in the /ship review), and a gateway proven open. In-process, not an OnFailure= unit. Proof with a real topic: see "Prove the gateway step on the units".
+
+### Exact end timers in reconcile after a backward clock step
+
+**What:** Count the `--on-active` time of an end timer that reconcile creates again from a monotonic source (for example `std::time::Instant` in the production clock of main.rs), not from the wall clock.
+
+**Why:** A backward clock step during reconcile steps 1 to 3 adds their time (at most about 20 seconds) to the end of such a timer. The design text names this as the one exception to "an open stream ends not later than 15 seconds after the deadline".
+
+**Context:** From the /ship adversarial review of 2026-10-06 (Codex adversarial P2, verified by a skeptic). Grant has no such gap: it takes the deadline from one clock read after its checks, and `--on-active` is at most the TTL minus the time of its lease write (a clock read right before systemd-run; /ship review of batch 2). Reconcile keeps a monotonic wrapper over the injected clock for one run (src/reconcile.rs), so a test clock stays possible.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06). The production clock of main.rs is steady: never earlier than its first read plus the time since then (`Instant`), so a backward clock step cannot move an end later in any command.
+
+### The access cut waits for the sync of the token file
+
+**What:** In `gateway::close`, restart Caddy before the fsync of the deny-all file, or give the sync a time limit.
+
+**Why:** `write_rule` calls `sync_all` before `systemctl try-restart caddy`, and that sync has no time limit. On ext4 a journal commit that carries other dirty data (a model download, guest writes in phase 2) can delay the access cut past the 15-second bound, and a stalled device blocks it in D state, where systemd cannot kill the process.
+
+**Context:** From the /ship adversarial review of 2026-10-06, second round (Claude adversarial, INVESTIGATE); the order existed before branch fix/todos-before-first-guest. The boot gate of reconcile already handles each token-file state after a power cut, so the sync before the restart adds little safety. Decide the durability trade-off first.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06). `gateway::close` restarts Caddy before the fsync of the deny-all file (owner decision D4); a failed sync is an error, so the lease stays REVOKE-FAILED and reconcile closes again.
+
+### Keep a gateway stopped after proof that it is open
+
+**What:** On a proven answer other than 401 to a wrong token (grant step 8 or the reconcile check), write a marker file under /var/lib/sparkpass. Reconcile does not start Caddy while the marker exists (or while its check fails), and names the file to remove after the Caddyfile repair. A curl failure writes no marker.
+
+**Why:** Today each reconcile after such a stop runs start, check, stop: the gateway is open to all for each check window, every 5 minutes, until the owner repairs the Caddyfile. If `PUBLIC_URL` and `GATEWAY_CHECK_ADDRESS` reach different listeners, reconcile starts a gateway that grant proved open and returns success.
+
+**Context:** From the /ship reviews of 2026-10-06: red team cycle 1, Claude adversarial (its top recommendation), verified by a skeptic in a scratch copy. About 20 code lines and 15 test lines. Write the repair step into the Caddyfile item above.
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06). The marker /var/lib/sparkpass/gateway-open (with the evidence) is written on a proven non-401 answer in grant step 1, grant step 8 and the reconcile check; reconcile keeps Caddy stopped and grant refuses while it exists; a notification goes out.
+
+### Grant also checks through GATEWAY_CHECK_ADDRESS
+
+**What:** In grant step 1 (or step 8), also send the reconcile check (`--connect-to` to `GATEWAY_CHECK_ADDRESS`) and refuse the grant when it fails.
+
+**Why:** Grant proves the gateway only through `PUBLIC_URL`. With a wrong check address, grant prints a pass, and the next reconcile stops the gateway for the whole lease.
+
+**Context:** From the /ship review of 2026-10-06, red team cycle 1 (confidence 5). It adds two commands to grant: raise `HAND_OUT_TIME` or count them in step 1.
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06). Grant step 1 sends the reconcile check after the check that Caddy runs; a failure stops Caddy and refuses.
+
+### Reconcile checks a running Caddy also after a failed step
+
+**What:** When an earlier reconcile step failed, still send the wrong-token check if `systemctl is-active caddy` succeeds, and stop Caddy on an answer other than 401. Keep the rule "no start and no stop" for all other failures.
+
+**Why:** A failure that repeats on each run (for example a REVOKE-FAILED lease whose timer stop fails) stops the only periodic proof of the gateway, and a gateway that answers 200 to a wrong key stays up.
+
+**Context:** From the /ship review of 2026-10-06, red team cycle 2 (confidence 5), at the early return before the start in src/reconcile.rs. It changes the design rule of reconcile step 4.
+
+**Effort:** S
+**Priority:** P1 (before the first guest)
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06). After a failed step, a Caddy that runs gets the same check, and a failed check stops it.
+
+### Build-provenance attestation for the release binary
+
+**What:** Add `actions/attest-build-provenance` (pinned SHA, `subject-path: target/release/sparkpass`, job permissions `id-token: write` and `attestations: write`), and verify on the unit with `gh attestation verify sparkpass -R hussu010/sparkpass`. Optional: `sha256sum sparkpass | tee sparkpass.sha256`, so that the hash is also in the job log.
+
+**Why:** The sha256 file shares the artifact with the binary: it finds a corrupt download, not a changed artifact.
+
+**Context:** From the /ship adversarial review of 2026-10-06 (Claude adversarial, verified). Do it when the CI binary becomes the install path on the units.
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** None
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06). CI has a separate release job (push to main only) with `id-token: write` and `attestations: write`, `actions/attest-build-provenance` v4.2.2 (pinned SHA), and the sha256 also in the job log (tee). The check `gh attestation verify` on the unit is part of "Prove the gateway step on the units".
+
+### Fail closed when the gateway does not enforce the token file
+
+**What:** Write the Caddyfile so that it refuses each request when the import holds no rule, and prove it on the units with tests/expiry.sh. Acceptance rules for this step:
+1. Import the token file once, as the first line inside one top-level `route { }` block that holds all the routing (for example `route { import /etc/sparkpass/token.caddy; reverse_proxy /v1/* 127.0.0.1:<MODEL_PORT>; respond 404 }`). A per-route or per-`handle` import leaves other paths of the model server open (`/invocations`, `/tokenize`, `/metrics`, `/v1/completions`) while both wrong-token checks get 401.
+2. The caddy unit starts with `caddy run --environ --config <Caddyfile>`, never with `--resume`, which loads the last autosaved config and not the Caddyfile.
+3. `GATEWAY_CHECK_ADDRESS` reaches the same site block as `PUBLIC_URL` on THIS host: a loopback or a local address, never the other Spark, because its 401 answers would make reconcile trust a local Caddy that is open. Consider a check in `read_settings` (a loopback address, or one that `ip -o addr` lists). Upgrade order: set the key in /etc/sparkpass/config before you install this build, at a time with no active lease. Without it, reconcile keeps Caddy stopped (an active guest loses access) and grant refuses.
+4. The ACME procedure for the first certificate and for a host that was off past the end of its certificate: stop pass-reconcile.timer, start caddy, wait for the certificate, start the timer, run `sparkpass reconcile`. Include first issuance in the tests/expiry.sh proof.
+5. Extend tests/expiry.sh: during an active lease, a wrong token to `/v1/completions`, `/invocations`, `/tokenize`, `/metrics` and a path outside `/v1` gets 401; after a grant and a revoke, the old token gets 401.
+
+**Why:** A gateway that does not import the token file is open to all. The code part is done (see Context), but only the Caddyfile and the unit decide what the gateway enforces.
+
+**Context:** From the /ship review of 2026-10-06 (branch feat/api-only-pass): security CRITICAL (confidence 6) at src/grant.rs:110 and red team at src/reconcile.rs:92, cycle 3. The code part landed on branch fix/todos-before-first-guest (2026-10-06): grant stops Caddy on any self-check failure, and reconcile sends the same two wrong-token requests after each start through `--connect-to` to `GATEWAY_CHECK_ADDRESS` and stops Caddy on any other answer. Rules 1, 2 and 4 come from the /ship adversarial review of 2026-10-06 (Claude adversarial, Codex adversarial, and a completeness critic), each verified by a skeptic.
+
+**Effort:** M
+**Priority:** P1 (before the first guest)
+**Depends on:** The Caddyfile and the systemd units (plan steps A1 and C1).
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06), except the proof on the units. gateway/Caddyfile (rule 1: one route, the import first, then a guard that refuses each request without the pass marker of `gateway::rule`, so an empty or cut token file refuses too), systemd/caddy-sparkpass.conf (rule 2), install.sh (rule 3 upgrade order, the ACME procedure of rule 4), tests/expiry.sh (rule 5). tests/gateway.sh proves the Caddyfile with a real Caddy in Docker, on 2.11 and 2.6.2 (the Ubuntu 24.04 package), in CI too. The proof on the units is the new item "Prove the gateway step on the units".

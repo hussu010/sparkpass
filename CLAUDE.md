@@ -15,8 +15,7 @@ RUN rustup component add clippy
 EOF
 ```
 
-Three checks, the same as `.github/workflows/ci.yml`. Run all three before a push.
-CI also runs `shellcheck` on each tracked `*.sh` file. The repository has no shell file yet.
+Five checks, the same as `.github/workflows/ci.yml`. Run all five before a push.
 
 Unit tests:
 
@@ -36,6 +35,18 @@ Stub model server:
 python3 tests/stub-model.py --self-test
 ```
 
+Shell files (the local image `koalaman/shellcheck:stable`; CI runs the same check):
+
+```bash
+git ls-files '*.sh' | xargs docker run --rm -v "$PWD":/mnt:ro -w /mnt koalaman/shellcheck:stable
+```
+
+Gateway, with a real Caddy in Docker (the images `caddy:2` and `caddy:2.6.2`, the Ubuntu 24.04 package):
+
+```bash
+bash tests/gateway.sh && CADDY_IMAGE=caddy:2.6.2 bash tests/gateway.sh
+```
+
 Rules for tests:
 
 - Unit tests live in `#[cfg(test)]` modules next to the code. They use the `FakeRunner`
@@ -45,4 +56,9 @@ Rules for tests:
 - The container runs as root, so permission bits do not force a failed write. To force
   one, use a path that is a directory.
 - Each test must fail if the behavior that it protects is removed.
-- systemd, Caddy, and curl behavior cannot be tested here. It is proven only on the units.
+- systemd and curl behavior cannot be tested here. Caddy is tested in Docker by `tests/gateway.sh`
+  (the Caddyfile and the token rule); its systemd unit and the inbound path are proven only on the units.
+- `install.sh` and `tests/expiry.sh` change the host. Never run them here; they run on the head unit.
+- The token rule format lives in `gateway::rule` in `src/gateway.rs`, the guard in `gateway/Caddyfile`,
+  `lease_rule` and `deny_all` in `tests/gateway.sh`, and the deny-all text in `install.sh` and
+  `tests/expiry.sh`. Change all of them together. A unit test in `src/gateway.rs` checks each copy.
