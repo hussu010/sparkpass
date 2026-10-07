@@ -332,4 +332,47 @@ mod tests {
         let guard = format!(" not vars {} {}", vars[2], vars[3]);
         assert!(caddyfile.iter().any(|line| line.ends_with(&guard)), "gateway/Caddyfile has no guard{guard}");
     }
+
+    // Added by the /ship test coverage audit (2026-10-07, branch feat/tunnel-and-p1-code).
+    // Value: protects=a first install (install.sh copies etc/caddy.env.example) leaves SPARKPASS_BIND unset, so
+    // Caddy listens on 127.0.0.1 only; fails_when=the template gets a SPARKPASS_BIND line, also an empty one as for
+    // SPARKPASS_SITE: Caddy 2.6.2 (Ubuntu 24.04) then listens on all addresses; why_new=tests/gateway.sh adapts the
+    // Caddyfile with the variable unset, and install.sh only warns, on the unit; seam=none
+    #[test]
+    fn caddy_env_template_sets_no_listen_address() {
+        // The keys of the KEY=VALUE lines, as systemd reads the EnvironmentFile: "#" starts a comment line.
+        let keys: Vec<&str> = include_str!("../etc/caddy.env.example")
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim_end()))
+            .collect();
+        // The parse finds the two values that the owner fills, so the check below is not empty.
+        assert!(keys.contains(&"SPARKPASS_SITE") && keys.contains(&"SPARKPASS_MODEL_PORT"), "{keys:?}");
+        assert!(!keys.contains(&"SPARKPASS_BIND"), "etc/caddy.env.example sets SPARKPASS_BIND: {keys:?}");
+    }
+
+    // Added by the /ship test coverage audit, pass 2 (2026-10-07, branch feat/tunnel-and-p1-code).
+    // Value: protects=the admin socket of gateway/Caddyfile is in a directory that RuntimeDirectory= of the
+    // caddy.service drop-in makes for the caddy user; fails_when=the drop-in loses RuntimeDirectory=caddy, or one
+    // file moves the socket alone: on the unit Caddy does not start, and no grant works; why_new=tests/gateway.sh
+    // makes /run/caddy itself, and no test reads systemd/caddy-sparkpass.conf; seam=none
+    #[test]
+    fn admin_socket_is_in_the_runtime_directory_of_the_caddy_unit() {
+        use std::path::Path;
+        let socket = include_str!("../gateway/Caddyfile")
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("admin unix/"))
+            .expect("gateway/Caddyfile has no admin socket");
+        // systemd makes /run/<name> for each name of RuntimeDirectory= (a list) at each start of caddy.service.
+        let made: Vec<_> = include_str!("../systemd/caddy-sparkpass.conf")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .filter(|(key, _)| key.trim() == "RuntimeDirectory")
+            .flat_map(|(_, names)| names.split_whitespace())
+            .map(|name| Path::new("/run").join(name))
+            .collect();
+        let directory = Path::new(socket).parent();
+        assert!(directory.is_some_and(|d| made.iter().any(|m| m == d)), "{socket} is not in a RuntimeDirectory of the drop-in: {made:?}");
+    }
 }
