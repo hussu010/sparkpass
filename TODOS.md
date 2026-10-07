@@ -40,6 +40,26 @@
 **Priority:** P1 (before the first guest)
 **Depends on:** Milestone 1 (Next Steps 1 to 3 of the design: the model on the pair, the Funnel setup, firewall/rules.sh).
 
+### Review follow-ups of the Funnel branch
+
+**What:** Fix the small items that the /ship review of branch feat/tunnel-and-p1-code found in its last cycle and in its adversarial step:
+1. The test `reconcile_unit_orders_after_tailscaled_and_does_not_start_it` (src/reconcile.rs) matches keys with `strip_prefix("Wants=")`, so a valid systemd line `Wants = tailscaled.service` (spaces around "=") passes. Parse as `admin_socket_is_in_the_runtime_directory_of_the_caddy_unit` does (split at "=", trim the key). That test in src/gateway.rs also misses an empty `RuntimeDirectory=` line, which resets the list.
+2. The cleanup comment of tests/expiry.sh ("an HTTP answer other than 401 ... proves an open gateway") does not say that with --via-public, proven_open decides.
+3. The pass text names no route. Add "Routes: GET /v1/models, POST /v1/chat/completions and POST /v1/completions only; each other route gets 404." and pin it in the pass-text test.
+4. tests/expiry.sh times each 15-second cut on GET /v1/models only. Also send POST /v1/chat/completions in the timed check (Codex adversarial, P2).
+5. A PUBLIC_URL whose host ends with "." (the DNSName of `tailscale status --json`) gets 421 from strict_sni_host, and check_gateway then writes a false gateway-open marker with the wrong repair hint. Refuse such a PUBLIC_URL in read_settings, or count 421 as a failed check (stop, no marker).
+6. Grant step 8 sends no notification for a public 2xx or 3xx answer when the loopback check fails, and none for a listener that serves only POST (the GET gets 401, the POST a 400 or 422 of the model server). Consider one notification for each public answer other than 401.
+7. On the unit: check that a Funnel relay does not close a silent connection before the 300 s response-header limit of Caddy (a long prefill), for example with one `tests/expiry.sh --via-public` request whose first header comes after about 290 s.
+Optional (advisory): proven_open can use `local VIA=("${DIRECT[@]}")` (bash locals are dynamically scoped) in place of the save and restore; tests/expiry.sh can refuse a GATEWAY_CHECK_ADDRESS other than 127.0.0.1 before it arms.
+
+**Why:** Each item fails closed or is a gap in a test, but together they make the errors and the tests of the gateway exact before the first guest.
+
+**Context:** From cycle 3 and Step 11 of the /ship review of branch feat/tunnel-and-p1-code (specialists, red team, the Claude adversarial pass, the Codex adversarial challenge; 2026-10-07). A /ship run stops before the push when a third fixing cycle edits a file, so the owner moved these items to the next branch (owner decisions D11 and D12). Item 5 matters on the unit now: put the ts.net name with no trailing dot in PUBLIC_URL and SPARKPASS_SITE.
+
+**Effort:** S
+**Priority:** P1 (with the milestone-1 PR, before the first guest)
+**Depends on:** None (items 4 and 7 run on the head unit).
+
 ### Check the Funnel setup in reconcile and install.sh
 
 **What:** Reconcile reads `tailscale serve status --json` (local, no network) and requires exactly one handler: TCP 443 to tcp://127.0.0.1:443, with Funnel only for the name of PUBLIC_URL on port 443. On a mismatch it sends a NOTIFY_URL message and grant refuses, because a stop of Caddy does not close another listener. install.sh warns when `getent ahosts <SPARKPASS_SITE>` gives an address in 100.64.0.0/10 (accept-dns is still on) or when the TCP forward is missing. Optional: during a lease, reconcile sends one wrong-key request through PUBLIC_URL and notifies (no stop) when it does not get 401.
@@ -331,4 +351,4 @@
 **Effort:** M
 **Priority:** P1 (before the first guest)
 **Depends on:** The Caddyfile and the systemd units (plan steps A1 and C1).
-**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06), except the proof on the units. gateway/Caddyfile (rule 1: one route, the import first, then a guard that refuses each request without the pass marker of `gateway::rule`, so an empty or cut token file refuses too), systemd/caddy-sparkpass.conf (rule 2), install.sh (rule 3 upgrade order, the ACME procedure of rule 4), tests/expiry.sh (rule 5). tests/gateway.sh proves the Caddyfile with a real Caddy in Docker, on 2.11 and 2.6.2 (the Ubuntu 24.04 package), in CI too. The proof on the units is the new item "Prove the gateway step on the units". On 2026-10-07, the loopback check of read_settings replaced the "consider" of rule 3, and the Tailscale Funnel procedure of install.sh replaced the ACME procedure of rule 4 (owner decision of that day).
+**Completed:** branch fix/todos-before-first-guest, TODO batch 2 (2026-10-06), except the proof on the units. gateway/Caddyfile (rule 1: one route, the import first, then a guard that refuses each request without the pass marker of `gateway::rule`, so an empty or cut token file refuses too), systemd/caddy-sparkpass.conf (rule 2), install.sh (rule 3 upgrade order, the ACME procedure of rule 4), tests/expiry.sh (rule 5). tests/gateway.sh proves the Caddyfile with a real Caddy in Docker, on 2.11 and 2.6.2 (the Ubuntu 24.04 package), in CI too. The proof on the units is the new item "Prove the gateway step on the units". On 2026-10-07, the check of read_settings (127.0.0.1 only, owner decision D3 of the /ship review) replaced the "consider" of rule 3, and the Tailscale Funnel procedure of install.sh replaced the ACME procedure of rule 4 (owner decision of that day).
