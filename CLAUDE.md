@@ -57,7 +57,9 @@ Rules for tests:
   one, use a path that is a directory.
 - Each test must fail if the behavior that it protects is removed.
 - systemd and curl behavior cannot be tested here. Caddy is tested in Docker by `tests/gateway.sh`
-  (the Caddyfile and the token rule); its systemd unit and the inbound path are proven only on the units.
+  (the Caddyfile, the token rule, the route allowlist, and the admin socket); its systemd unit
+  (RuntimeDirectory, the reload as the caddy user), the certificate from tailscaled, and the inbound
+  path (Tailscale Funnel) are proven only on the units.
 - `install.sh` and `tests/expiry.sh` change the host. Never run them here; they run on the head unit.
 - The token rule format lives in `gateway::rule` in `src/gateway.rs`, the guard in `gateway/Caddyfile`,
   `lease_rule` and `deny_all` in `tests/gateway.sh`, and the deny-all text in `install.sh` and
