@@ -217,10 +217,11 @@ fn steps(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64, runs: &Cel
     }
     // Start the gateway (no effect if it runs). A start that failed or timed out can still complete in
     // systemd, and that gateway has no proof: stop it.
-    // ponytail: one check, right after the start. A Caddy that still waits for its first ACME certificate
-    // (a first install, or a host that was off past the end of its certificate) fails the TLS check, and
-    // each run stops it again. Upgrade: repeat the check for the time of an ACME order. Until then, the
-    // owner starts Caddy by hand, waits for the certificate, and runs reconcile.
+    // ponytail: one check, right after the start. Caddy gets the certificate of the ts.net name from
+    // tailscaled at the first TLS handshake. When tailscaled must order it first (a first install, or a host
+    // that was off past the end of its certificate), the check can time out, and each run stops the gateway
+    // again. Upgrade: repeat the check for the time of an order. Until then, the procedure of install.sh
+    // gets the certificate before the start (`tailscale cert`).
     if let Err(e) = run_ok(runner, &["systemctl", "start", "caddy"]) {
         return fail_closed(runner, e);
     }

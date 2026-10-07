@@ -4,8 +4,8 @@
 # or bad value of one of the three keys below, grant refuses and reconcile keeps Caddy stopped.
 
 # Public URL of the gateway, https only (the API key travels in each request), with no path and no
-# trailing slash, for example https://spark.example.net. The inbound method of milestone 1 decides it.
-# SPARKPASS_SITE in /etc/sparkpass/caddy.env must name the same host.
+# trailing slash: the ts.net name of this unit on Tailscale Funnel, for example
+# https://spark.tail1234.ts.net. SPARKPASS_SITE in /etc/sparkpass/caddy.env must name the same host.
 PUBLIC_URL=
 
 # API port of the model server on 127.0.0.1, for example 8000. The same value as

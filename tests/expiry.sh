@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Forced-end, deny-all and re-grant test of the guest pass, build phase 1 (API only).
-# Design: docs/designs/guest-pass-mvp.md, "Success Criteria" and "Next Steps" 6; TODOS.md,
-# completed item "Fail closed when the gateway does not enforce the token file", acceptance rules 4 and 5.
+# Design: docs/designs/guest-pass-mvp.md, "Success Criteria" and "Next Steps" 6; TODOS.md, item "Prove
+# the gateway step on the units", and completed item "Fail closed when the gateway does not enforce the
+# token file", acceptance rule 5.
 # The owner runs it by hand as root on the head unit, after install.sh. It uses the real
 # sparkpass binary, systemd, Caddy and curl, so it does not run in CI.
 set -Eeuo pipefail
@@ -17,10 +18,13 @@ NAME=expiry-test
 BOUND=15     # seconds after the end time: the stream ends and the key gets 401
 LOCK_HOLD=40 # seconds: in step 3 a different process holds the lock across the end time (eng review D8)
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# Each "every path" check. The last four are outside /v1: the key gets 404 there.
+# Each "every path" check. The first three are the routes of the pass. On each other route the key gets
+# the 404 of the gateway (the route allowlist of gateway/Caddyfile): other routes of the model server can
+# change state that the next guest sees.
 EVERY=("GET /v1/models" "POST /v1/chat/completions" "POST /v1/completions"
-  "POST /invocations" "POST /tokenize" "GET /metrics" "GET /health")
-OUTSIDE=("${EVERY[@]:3}")
+  "GET /v1/chat/completions" "POST /v1/models" "POST /v1/embeddings" "POST /v1/responses"
+  "POST /v1/load_lora_adapter" "POST /invocations" "POST /tokenize" "GET /metrics" "GET /health")
+DENIED=("${EVERY[@]:3}")
 
 usage() {
   cat <<'EOF'
@@ -32,9 +36,9 @@ the lease name "expiry-test", and it revokes that lease after each failure.
 
 Steps:
   1  sparkpass reconcile. With the deny-all rule, each request gets 401.
-  2  grant: the key gets 200 on GET /v1/models, and outside /v1 the 404 of the gateway
-     (a 404 with no body: the model server sends a body); no header, an empty bearer
-     value, a wrong key, and the key with one more character get 401.
+  2  grant: the key gets 200 on GET /v1/models, and on each route outside the pass the
+     404 of the gateway (a 404 with no body: the model server sends a body); no header,
+     an empty bearer value, a wrong key, and the key with one more character get 401.
   3  a stream with the key runs past the end time, and a different process holds the
      sparkpass lock from 5 s before the end time for 40 s (eng review D8). Not later than
      15 s after the end time, the stream ends and the key gets 401; within 30 s after the
@@ -45,7 +49,9 @@ Steps:
      earlier keys get 401. The new lease ends at its own end time: the new key gets 401
      on every path within 15 s, and within 30 s no lease and no end timer stay.
   6  a summary.
-"Every path": GET /v1/models, POST /v1/chat/completions, POST /v1/completions,
+"Every path": the routes of the pass (GET /v1/models, POST /v1/chat/completions,
+POST /v1/completions), then GET /v1/chat/completions, POST /v1/models,
+POST /v1/embeddings, POST /v1/responses, POST /v1/load_lora_adapter,
 POST /invocations, POST /tokenize, GET /metrics, GET /health.
 
 Options:
@@ -54,10 +60,12 @@ Options:
                       a hang) when the stub is frozen. The frozen check waits for the 300 s
                       header timeout of the gateway: about 5 minutes.
   --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m, at least 60s).
-  --via-public        send each request through PUBLIC_URL: DNS and the inbound path
-                      (the inbound-path run of the Success Criteria). The public name must
-                      reach this unit from the unit itself. Without this option, each
-                      request goes to GATEWAY_CHECK_ADDRESS with curl --connect-to.
+  --via-public        send each request through PUBLIC_URL: public DNS and a relay of
+                      Tailscale Funnel (the inbound-path run of the Success Criteria). It
+                      needs 'tailscale set --accept-dns=false' on this unit, so that the
+                      ts.net name resolves to a relay and not to the tailnet address of
+                      this unit. Without this option, each request goes to
+                      GATEWAY_CHECK_ADDRESS (loopback) with curl --connect-to.
   --skip-reboot-note  do not print the reboot procedures at the end.
   -h, --help          print this text and the manual procedures.
 
@@ -98,16 +106,20 @@ Manual: reboot inside an active lease
 EOF
   fi
   cat <<EOF
-Manual: first ACME certificate (TODOS.md, completed item "Fail closed when the gateway does not enforce the token file", rule 4). Also for a unit that was off
-past the end of its certificate. Do it with no lease and no $MARKER:
-  1. systemctl stop pass-reconcile.timer
-  2. systemctl start caddy
-  3. journalctl -u caddy -f, until it logs "certificate obtained successfully" for the
-     name of PUBLIC_URL.
-  4. systemctl start pass-reconcile.timer
-  5. sparkpass reconcile
-  6. tests/expiry.sh. Each check uses TLS with the name of PUBLIC_URL, so a pass also
-     proves the certificate.
+Manual: the certificate from tailscaled and the route of Tailscale Funnel (step 1 of the
+procedure that install.sh prints). Also after the unit was off for a long time. <name> is
+the host of PUBLIC_URL:
+  1. grep TS_PERMIT_CERT_UID /etc/default/tailscaled prints TS_PERMIT_CERT_UID=caddy.
+  2. tailscale cert --cert-file - <name> >/dev/null succeeds: tailscaled has the certificate.
+  3. After sparkpass reconcile, journalctl -u caddy shows no TLS handshake error for <name>.
+     This command shows <name> and a public CA (Let's Encrypt); Caddy 2.6.2 logs no line for
+     a certificate from tailscaled:
+       openssl s_client -connect 127.0.0.1:443 -servername <name> </dev/null | openssl x509 -noout -subject -issuer
+  4. tailscale funnel status shows TCP 443 of this node, forwarded to 127.0.0.1:443.
+  5. getent hosts <name> gives a public address (a relay of Funnel), not a 100.x tailnet
+     address: 'tailscale set --accept-dns=false' is on, so --via-public takes the public route.
+  6. tests/expiry.sh, then tests/expiry.sh --via-public. Each check uses TLS with the name
+     of PUBLIC_URL and a normal certificate check, so a pass also proves the certificate.
 Check a key with the command below. Put an IPv6 GATEWAY_CHECK_ADDRESS in brackets, for
 example --connect-to ::[::1]:
   $check
@@ -184,7 +196,7 @@ VIA=(--connect-to "::$ADDRESS:")
 ROUTE="--connect-to $ADDRESS"
 if [[ $VIA_PUBLIC == yes ]]; then
   VIA=()
-  ROUTE="the public name (DNS and the inbound path)"
+  ROUTE="the public name (public DNS and Tailscale Funnel)"
 fi
 WRONG=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 CHUNKS=$(((TTL_S + 300) * 2)) # stub stream at 0.5 s per chunk: it runs 5 minutes past the end time
@@ -275,7 +287,7 @@ answers() {
 
 hint() {
   if [[ $BAD == *=000* ]]; then
-    printf '\n  000: curl failed (see its error above). A TLS error before the first certificate: see "first ACME certificate" in --help.'
+    printf '\n  000: curl failed (see its error above). For a TLS error: see "the certificate from tailscaled" in --help.'
   fi
   if [[ $BAD == *=404+body* ]]; then
     printf '\n  404+body: the request passed the gateway, and the model server answered it.'
@@ -409,8 +421,8 @@ grant "${TTL_S}s"
 KEY1=$KEY
 expect 200 "$KEY1" "the key" "GET /v1/models"
 refused "$KEY1"
-expect 404 "$KEY1" "the key, outside /v1" "${OUTSIDE[@]}"
-say "ok 2: the key gets 200 on /v1/models and the 404 of the gateway (no body) outside /v1; other callers get 401 on every path"
+expect 404 "$KEY1" "the key, on a route outside the pass" "${DENIED[@]}"
+say "ok 2: the key gets 200 on /v1/models and the 404 of the gateway (no body) on each route outside the pass; other callers get 401 on every path"
 
 STEP="3 (forced end, lock held)"
 stream_body=$(printf '{"model": "%s", "stream": true, "max_tokens": %s, "ignore_eos": true, "messages": [{"role": "user", "content": "Count from 1 to 100000, one number on each line."}]}' "$MODEL" "$MAX_TOKENS")
@@ -525,7 +537,7 @@ cat <<EOF
 
 PASS: tests/expiry.sh, build phase 1 (API only), through $ROUTE
   deny-all:       401 on every path for no header, an empty bearer value, and a wrong key
-  active lease:   200 on /v1/models, the 404 of the gateway (no body) outside /v1; 401 for the other callers
+  active lease:   200 on /v1/models, the 404 of the gateway (no body) on each route outside the pass; 401 for the other callers
   forced end:     lock held until +${lock_end}s; stream ended at +${stream_end}s (curl exit $stream_rc), key 401 at +${cut_at}s (limit +${BOUND}s), no lease and no end timer at +${gone_at}s (limit +$((lock_end + 30))s)
   model server:   $model_note
   early revoke:   401 on every path, no end timer
