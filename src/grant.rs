@@ -165,11 +165,12 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     // request above for everyone, and only these requests show it.
     match wrong_token_answer(runner, &[], &settings.public_url) {
         None => {}
-        // An answer other than 401 through the public route is no proof by itself: a relay of the inbound
-        // route (Tailscale Funnel) can give its own answer. The check of step 1 decides: a proven answer
-        // there writes the marker (the gateway is open to all, and the revoke cannot close it), and a failed
-        // request stops the gateway. A gateway that refuses the wrong token there stops too (fail closed),
-        // with no marker: the public route does not reach it.
+        // An answer other than 401 through the public route is no proof by itself: the route can end at
+        // another listener, for example tailscaled when Funnel runs in HTTPS mode, not TCP (a setup error; the
+        // relays forward the TLS bytes unchanged, and curl checks the certificate). The check of step 1
+        // decides: a proven answer there writes the marker (the gateway is open to all, and the revoke cannot
+        // close it), and a failed request stops the gateway. A gateway that refuses the wrong token there
+        // stops too (fail closed), with no marker: the public route does not reach it.
         Some((url, Ok(code))) => {
             let public = format!("the self-check with a wrong token through {url} got {code}, and it must get 401");
             check_gateway(paths, runner, settings).map_err(|e| format!("{public}; {e}"))?;
@@ -535,8 +536,8 @@ mod tests {
     }
 
     // Added for the P1 item "Prove the gateway step on the units" (2026-10-07).
-    // Value: protects=an answer of the inbound route alone (a relay of Tailscale Funnel answers with its own
-    // error) writes no marker, and the grant still fails closed; fails_when=step 8 writes the marker for a
+    // Value: protects=an answer of the inbound route alone (for example tailscaled when Funnel runs in HTTPS
+    // mode) writes no marker, and the grant still fails closed; fails_when=step 8 writes the marker for a
     // public answer that the check address does not confirm, or the gateway stays up; why_new=step 8 trusted
     // the public answer; seam=none
     #[test]
