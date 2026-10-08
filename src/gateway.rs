@@ -70,6 +70,18 @@ pub fn token_in(token_file: &std::path::Path) -> Option<String> {
     Some(token.to_string())
 }
 
+/// Test helper: the value of each `KEY=VALUE` line of a systemd unit file for `key`, in order, as systemd reads
+/// them: spaces around "=" are allowed, and a comment line ("#" or ";" first) has no key. An empty value is an
+/// empty entry; for a list setting such as RuntimeDirectory=, it resets the list (not for a dependency).
+#[cfg(test)]
+pub fn unit_values<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
+    unit.lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, _)| name.trim() == key)
+        .map(|(_, value)| value.trim())
+        .collect()
+}
+
 /// 32 random bytes as 64 lower-case hex characters.
 pub fn new_token() -> io::Result<String> {
     let mut bytes = [0u8; 32];
@@ -352,26 +364,40 @@ mod tests {
         assert!(!keys.contains(&"SPARKPASS_BIND"), "etc/caddy.env.example sets SPARKPASS_BIND: {keys:?}");
     }
 
+    // Added for the TODO item "Review follow-ups of the Funnel branch", item 1 (2026-10-08).
+    // Value: protects=the unit-file tests read a key as systemd does; fails_when=unit_values matches the
+    // text "Key=" (a line "Wants = x" is then missed) or reads a comment line; why_new=the test of
+    // pass-reconcile.service missed "Wants = tailscaled.service"; seam=none
+    #[test]
+    fn unit_values_reads_each_line_of_a_key_as_systemd_does() {
+        let unit = "[Unit]\nWants = a.service  b.service\n#Wants=c.service\n; Wants=d.service\nWantsX=e.service\nWants=\n";
+        assert_eq!(unit_values(unit, "Wants"), ["a.service  b.service", ""]);
+    }
+
     // Added by the /ship test coverage audit, pass 2 (2026-10-07, branch feat/tunnel-and-p1-code).
     // Value: protects=the admin socket of gateway/Caddyfile is in a directory that RuntimeDirectory= of the
     // caddy.service drop-in makes for the caddy user; fails_when=the drop-in loses RuntimeDirectory=caddy, or one
     // file moves the socket alone: on the unit Caddy does not start, and no grant works; why_new=tests/gateway.sh
     // makes /run/caddy itself, and no test reads systemd/caddy-sparkpass.conf; seam=none
+    // Extended for the TODO item "Review follow-ups of the Funnel branch", item 1 (2026-10-08): an empty
+    // RuntimeDirectory= line resets the list.
     #[test]
     fn admin_socket_is_in_the_runtime_directory_of_the_caddy_unit() {
-        use std::path::Path;
+        use std::path::{Path, PathBuf};
         let socket = include_str!("../gateway/Caddyfile")
             .lines()
             .find_map(|line| line.trim().strip_prefix("admin unix/"))
             .expect("gateway/Caddyfile has no admin socket");
         // systemd makes /run/<name> for each name of RuntimeDirectory= (a list) at each start of caddy.service.
-        let made: Vec<_> = include_str!("../systemd/caddy-sparkpass.conf")
-            .lines()
-            .filter_map(|line| line.split_once('='))
-            .filter(|(key, _)| key.trim() == "RuntimeDirectory")
-            .flat_map(|(_, names)| names.split_whitespace())
-            .map(|name| Path::new("/run").join(name))
-            .collect();
+        // An empty value resets the list: only the lines after the last empty one count.
+        let runtime_directories = |unit| -> Vec<PathBuf> {
+            let lines = unit_values(unit, "RuntimeDirectory");
+            let after_reset = lines.rsplit(|value| value.is_empty()).next().unwrap_or_default();
+            after_reset.iter().flat_map(|names| names.split_whitespace()).map(|name| Path::new("/run").join(name)).collect()
+        };
+        assert_eq!(runtime_directories("RuntimeDirectory=caddy\nRuntimeDirectory=\n"), [] as [PathBuf; 0]);
+        assert_eq!(runtime_directories("RuntimeDirectory=\nRuntimeDirectory = caddy x\n"), [Path::new("/run/caddy"), Path::new("/run/x")]);
+        let made = runtime_directories(include_str!("../systemd/caddy-sparkpass.conf"));
         let directory = Path::new(socket).parent();
         assert!(directory.is_some_and(|d| made.iter().any(|m| m == d)), "{socket} is not in a RuntimeDirectory of the drop-in: {made:?}");
     }
