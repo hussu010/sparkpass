@@ -321,8 +321,8 @@ mod tests {
     fn settings_file_with_a_trailing_dot_in_the_public_host_is_refused() {
         const REST: &str = "MODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n";
         for url in [
-            "https://spark-e11c.tail53b16b.ts.net.",
-            "https://spark-e11c.tail53b16b.ts.net./",
+            "https://spark.tail1234.ts.net.",
+            "https://spark.tail1234.ts.net./",
             "https://spark.example.net.:443",
             "https://spark.example.net./api",
             "https://u@spark.example.net.",
