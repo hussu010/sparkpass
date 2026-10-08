@@ -18,7 +18,8 @@
 //!      each other state (activating, deactivating, unknown) ──▶ stop Caddy
 //!    no failure ──▶ start Caddy ── fail ──▶ stop Caddy, exit non-zero
 //!    a wrong token (GET and POST) to the public listener at GATEWAY_CHECK_ADDRESS gets no 401 ──▶ stop Caddy,
-//!      exit non-zero (D5); a proven answer other than 401 ──▶ also write gateway-open
+//!      exit non-zero (D5); a proven answer other than 401 ──▶ also write gateway-open (not for a 421: the
+//!      request did not reach the token check)
 //!    success with an active lease ──▶ model check (one notification at the start and at the end of an outage)
 //!    gateway stopped or not started with an active lease ──▶ one notification; the next successful start ──▶ one more
 //! ```
@@ -413,6 +414,7 @@ mod tests {
             (PROBE, output(7, "000"), "the check with a wrong token through https://spark.example.net/v1/models at 127.0.0.1 failed: curl exit code 7"),
             (PROBE, output(60, "000"), "failed: curl exit code 60"),
             (PROBE, hang(), "failed: curl: no result after 10s"),
+            (PROBE, output(0, "421"), "the check with a wrong token through https://spark.example.net/v1/models at 127.0.0.1 got 421: the request did not reach the token check"),
             // The list route refuses the wrong token, but the route of the model does not: grant stops
             // such a gateway, so reconcile must not start it again.
             (PROBE_POST, output(0, "200"), "the gateway answered 200 through https://spark.example.net/v1/chat/completions at 127.0.0.1"),
@@ -1010,9 +1012,11 @@ mod tests {
         }
     }
 
+    // Extended for the TODO item "Review follow-ups of the Funnel branch", item 5 (2026-10-08): a 421
+    // (strict_sni_host, for example a PUBLIC_URL host with a trailing dot) never reached the token check.
     #[test]
     fn wrong_token_answer_other_than_401_writes_the_marker_and_a_curl_failure_does_not() {
-        for (answer, marked) in [(output(0, "200"), true), (output(28, "000"), false)] {
+        for (answer, marked) in [(output(0, "200"), true), (output(28, "000"), false), (output(0, "421"), false)] {
             let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
             runner.on(PROBE, answer);
             assert!(reconcile(&paths, &runner, &|| NOW).is_err());
@@ -1401,15 +1405,15 @@ mod tests {
     // tailscaled, so an owner's stop of the public route lasts; fails_when=tailscaled.service leaves After=, or
     // enters Wants=, Requires=, BindsTo= or Upholds= (each starts it at each run of the 5-minute timer);
     // why_new=no test read systemd/pass-reconcile.service; seam=none
+    // Extended for the TODO item "Review follow-ups of the Funnel branch", item 1 (2026-10-08): a key with
+    // spaces around "=" (gateway::unit_values). No reset for an empty value: systemd cannot reset a dependency.
     #[test]
     fn reconcile_unit_orders_after_tailscaled_and_does_not_start_it() {
         let unit = include_str!("../systemd/pass-reconcile.service");
-        let values = |key: &str| -> Vec<&str> {
-            unit.lines().filter_map(|line| line.trim().strip_prefix(key)).flat_map(str::split_whitespace).collect()
-        };
-        assert!(values("After=").contains(&"tailscaled.service"), "{unit}");
-        for key in ["Wants=", "Requires=", "BindsTo=", "Upholds="] {
-            assert!(!values(key).contains(&"tailscaled.service"), "{key} starts tailscaled at each run:\n{unit}");
+        let values = |key: &str| -> Vec<&str> { gateway::unit_values(unit, key).into_iter().flat_map(str::split_whitespace).collect() };
+        assert!(values("After").contains(&"tailscaled.service"), "{unit}");
+        for key in ["Wants", "Requires", "BindsTo", "Upholds"] {
+            assert!(!values(key).contains(&"tailscaled.service"), "{key}= starts tailscaled at each run:\n{unit}");
         }
     }
 }

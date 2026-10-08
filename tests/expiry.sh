@@ -68,7 +68,9 @@ Options:
                       this unit. Without this option, each request goes to
                       GATEWAY_CHECK_ADDRESS (127.0.0.1) with curl --connect-to. With this
                       option, an answer other than 401 proves an open gateway only when
-                      127.0.0.1 gives one too, as in grant step 8.
+                      127.0.0.1 gives one too, as in grant step 8. A 421 at 127.0.0.1
+                      (strict_sni_host) never proves an open gateway: the request did
+                      not reach the token check.
   --skip-reboot-note  do not print the reboot procedures at the end.
   -h, --help          print this text and the manual procedures.
 
@@ -233,13 +235,17 @@ cleanup() {
     "$BIN" revoke "$NAME" || printf 'expiry.sh: the revoke failed too: check sparkpass list\n' >&2
     # After the revoke the last key must get 401 on every path. An HTTP answer other than 401 (not a curl
     # failure, 000) proves an open gateway, also when the failed step was a wait (until_by) and not expect().
+    # With --via-public, the answer of the public route is no proof by itself: proven_open decides, as in expect().
+    # A 421 at the check address is no proof either: the request did not reach the token check (grant step 8).
     if [[ -z $OPEN && -n $KEY ]] && ! answers 401 "$KEY" "${EVERY[@]}" && [[ $BAD == *=[1-9]* ]]; then
       local public=$BAD
-      if [[ $VIA_PUBLIC != yes ]] || proven_open "$KEY" "${EVERY[@]}"; then
+      if [[ $VIA_PUBLIC != yes && $BAD != *=421* ]] || { [[ $VIA_PUBLIC == yes ]] && proven_open "$KEY" "${EVERY[@]}"; }; then
         OPEN="the last key still passed the gateway after the revoke:$BAD"
         close_open_gateway
+      elif [[ $VIA_PUBLIC != yes ]]; then
+        printf 'expiry.sh: after the revoke the check at %s failed:%s%s (no marker)\n' "$ADDRESS" "$BAD" "$(hint)" >&2
       else
-        printf 'expiry.sh: after the revoke the public route still answered the last key:%s, and %s gave:%s (no marker; check tailscale funnel status)\n' "$public" "$ADDRESS" "${BAD:- 401 on each route}" >&2
+        printf 'expiry.sh: after the revoke the public route still answered the last key:%s, and %s gave:%s%s (no marker; check tailscale funnel status)\n' "$public" "$ADDRESS" "${BAD:- 401 on each route}" "$(hint)" >&2
       fi
     fi
   fi
@@ -302,13 +308,14 @@ answers() {
 
 # proven_open WHO ROUTE...: an answer other than 401 through the public route proves an open gateway
 # only when GATEWAY_CHECK_ADDRESS gives one too (grant step 8): another listener on the public route can
-# answer, for example tailscaled when Funnel runs in HTTPS mode. BAD then holds the direct answers.
+# answer, for example tailscaled when Funnel runs in HTTPS mode. A 421 there is no proof: the request did
+# not reach the token check (strict_sni_host). BAD then holds the direct answers.
 proven_open() {
   local route=("${VIA[@]}") rc=0
   VIA=("${DIRECT[@]}")
   answers 401 "$@" || rc=1
   VIA=("${route[@]}")
-  ((rc)) && [[ $BAD == *=[1-9][0-9][0-9]* ]]
+  ((rc)) && [[ $BAD == *=[1-9][0-9][0-9]* && $BAD != *=421* ]]
 }
 
 hint() {
@@ -318,6 +325,9 @@ hint() {
   if [[ $BAD == *=404+body* ]]; then
     printf '\n  404+body: the request passed the gateway, and the model server answered it.'
   fi
+  if [[ $BAD == *=421* ]]; then
+    printf '\n  421: Caddy (strict_sni_host) refused the request before the token check: its Host header is not the TLS name of the gateway. The host of PUBLIC_URL must be SPARKPASS_SITE of caddy.env, with no trailing dot.'
+  fi
 }
 
 # expect WANT WHO LABEL ROUTE...: answers, or fail. LABEL names WHO; the message never holds a key.
@@ -325,20 +335,21 @@ expect() {
   local want=$1 who=$2 label=$3
   shift 3
   answers "$want" "$who" "$@" && return 0
-  # An HTTP answer other than 401 (000 is a curl failure, not an answer) proves the gateway open. Through
-  # the public route it is no proof by itself: the check address decides (proven_open), as in grant step 8.
+  # An HTTP answer other than 401 (000 is a curl failure, not an answer) proves the gateway open, but a 421
+  # at the check address is no proof: the request did not reach the token check. Through the public route
+  # an answer is no proof by itself: the check address decides (proven_open). Both as in grant step 8.
   if [[ $want == 401 && $BAD == *=[1-9][0-9][0-9]* ]]; then
     local public=$BAD
     if [[ $VIA_PUBLIC == yes ]] && ! proven_open "$who" "$@"; then
-      # BAD holds the direct answers here. A failed request at the check address is no refusal; a 2xx or 3xx
-      # through the public route is a listener with no key check (grant step 8, owner decision D4).
-      [[ $BAD != *=000* ]] || fail "$label: each answer through $ROUTE must be 401, but:$public; the check at $ADDRESS failed:$BAD$(hint); no marker"
+      # BAD holds the direct answers here. A failed request or a 421 at the check address is no refusal; a 2xx
+      # or 3xx through the public route is a listener with no key check (grant step 8, owner decision D4).
+      [[ $BAD != *=000* && $BAD != *=421* ]] || fail "$label: each answer through $ROUTE must be 401, but:$public; the check at $ADDRESS failed:$BAD$(hint); no marker"
       if [[ $public == *=[23][0-9][0-9]* ]]; then
         fail "$label: each answer through $ROUTE must be 401, but:$public; at $ADDRESS the gateway refuses it: another listener serves the public name with no key check, for example a Funnel handler to the model server ('tailscale funnel status' must show only TCP 443 to tcp://127.0.0.1:443); no marker"
       fi
       fail "$label: each answer through $ROUTE must be 401, but:$public; at $ADDRESS the gateway refuses it: the inbound route does not reach this gateway, or it changes its answers (tailscale funnel status must show TCP 443 to tcp://127.0.0.1:443); no marker"
     fi
-    OPEN="tests/expiry.sh step $STEP, $(date -u '+%F %T UTC'): the gateway answered$BAD to $label at $ADDRESS, and each answer must be 401: the gateway does not enforce the token file"
+    [[ $BAD == *=421* ]] || OPEN="tests/expiry.sh step $STEP, $(date -u '+%F %T UTC'): the gateway answered$BAD to $label at $ADDRESS, and each answer must be 401: the gateway does not enforce the token file"
   fi
   fail "$label: each answer must be $want, but:$BAD$(hint)"
 }

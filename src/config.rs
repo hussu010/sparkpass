@@ -109,6 +109,14 @@ pub fn read_settings(paths: &Paths) -> Result<Settings, String> {
         .filter(|u| u.starts_with("https://"))
         .ok_or_else(|| format!("settings file {file}: PUBLIC_URL must start with https://"))?
         .to_string();
+    // A host with a trailing dot (the DNSName of `tailscale status --json` has one) is not the TLS name of
+    // Caddy's site: curl sends the Host header with the dot and the TLS name without it, so Caddy answers 421
+    // (strict_sni_host) to each request, before the token check, and no pass works.
+    if host(&public_url).ends_with('.') {
+        return Err(format!(
+            "settings file {file}: PUBLIC_URL has a host name with a trailing dot (the DNSName of `tailscale status --json` has one): remove the trailing dot, here and in SPARKPASS_SITE of caddy.env; Caddy answers 421 to each request for such a name"
+        ));
+    }
     let model_port =
         port.ok_or_else(|| format!("settings file {file}: MODEL_PORT must be a port number"))?;
     // 127.0.0.1 only: the check must reach the Caddy of this host, and Caddy listens only there. Another
@@ -122,6 +130,17 @@ pub fn read_settings(paths: &Paths) -> Result<Settings, String> {
         model_port,
         gateway_check_address,
     })
+}
+
+/// The host of an `https://` URL, with a user part if it has one: the text up to the path, with no port.
+fn host(url: &str) -> &str {
+    let authority = url["https://".len()..].split(['/', '?', '#']).next().unwrap_or("");
+    // A port is digits after the last ":". Another ":" is no port, for example the ":" of a password in a
+    // user part ("u:PASSWORD@host."): without the digit test, the host would be "u".
+    authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host)
 }
 
 /// NOTIFY_URL of the settings file (owner decision of 2026-10-06), if it is an https URL. It is optional and
@@ -292,6 +311,30 @@ mod tests {
             .expect("etc/config.example has no GATEWAY_CHECK_ADDRESS line");
         assert_eq!((bind, example), ("127.0.0.1", "127.0.0.1"));
         assert_eq!(CHECK_ADDRESS.to_string(), bind);
+    }
+
+    // Added for the TODO item "Review follow-ups of the Funnel branch", item 5 (2026-10-08).
+    // Value: protects=a PUBLIC_URL host with a trailing dot (the DNSName of `tailscale status --json`) is
+    // refused with the fix in the message; fails_when=read_settings accepts it: each check then gets 421 from
+    // strict_sni_host, and no pass works; why_new=each https URL passed; seam=none
+    #[test]
+    fn settings_file_with_a_trailing_dot_in_the_public_host_is_refused() {
+        const REST: &str = "MODEL_PORT=8000\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n";
+        for url in [
+            "https://spark-e11c.tail53b16b.ts.net.",
+            "https://spark-e11c.tail53b16b.ts.net./",
+            "https://spark.example.net.:443",
+            "https://spark.example.net./api",
+            "https://u@spark.example.net.",
+            "https://u:PASSWORD@spark.example.net.",
+        ] {
+            let error = settings(&format!("PUBLIC_URL={url}\n{REST}")).err().unwrap_or_default();
+            assert!(error.contains("PUBLIC_URL has a host name with a trailing dot") && error.contains("remove the trailing dot"), "{url}: {error}");
+        }
+        // A dot elsewhere is no trailing dot: a port, a path, an IPv6 literal, a user part.
+        for url in ["https://spark.example.net:8443", "https://spark.example.net/v.", "https://[2001:db8::5]:8443", "https://[2001:db8::5]", "https://u.@spark.example.net"] {
+            assert!(settings(&format!("PUBLIC_URL={url}\n{REST}")).is_ok(), "{url}");
+        }
     }
 
     #[test]

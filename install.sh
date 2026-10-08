@@ -284,7 +284,7 @@ Caddy is stopped and disabled at boot: only 'sparkpass reconcile' starts it.
 
 Next steps, as root. The inbound route is Tailscale Funnel with raw TCP passthrough: TLS ends at Caddy
 (docs/designs/guest-pass-mvp.md, "The gateway"). <name> is the ts.net name of this unit, for example
-spark.tail1234.ts.net.
+spark.tail1234.ts.net, with no trailing dot (the DNSName of 'tailscale status --json' ends with one).
   1. Tailscale on this unit:
        install Tailscale (https://tailscale.com/download/linux), then: tailscale up
        In the admin console: MagicDNS and HTTPS certificates on, the funnel node attribute in the
