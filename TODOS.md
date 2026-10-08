@@ -43,12 +43,12 @@
 ### Review follow-ups of the Funnel branch
 
 **What:** Fix the small items that the /ship review of branch feat/tunnel-and-p1-code found in its last cycle and in its adversarial step:
-1. The test `reconcile_unit_orders_after_tailscaled_and_does_not_start_it` (src/reconcile.rs) matches keys with `strip_prefix("Wants=")`, so a valid systemd line `Wants = tailscaled.service` (spaces around "=") passes. Parse as `admin_socket_is_in_the_runtime_directory_of_the_caddy_unit` does (split at "=", trim the key). That test in src/gateway.rs also misses an empty `RuntimeDirectory=` line, which resets the list.
-2. The cleanup comment of tests/expiry.sh ("an HTTP answer other than 401 ... proves an open gateway") does not say that with --via-public, proven_open decides.
-3. The pass text names no route. Add "Routes: GET /v1/models, POST /v1/chat/completions and POST /v1/completions only; each other route gets 404." and pin it in the pass-text test.
+1. (Done.) The test `reconcile_unit_orders_after_tailscaled_and_does_not_start_it` (src/reconcile.rs) matches keys with `strip_prefix("Wants=")`, so a valid systemd line `Wants = tailscaled.service` (spaces around "=") passes. Parse as `admin_socket_is_in_the_runtime_directory_of_the_caddy_unit` does (split at "=", trim the key). That test in src/gateway.rs also misses an empty `RuntimeDirectory=` line, which resets the list.
+2. (Done.) The cleanup comment of tests/expiry.sh ("an HTTP answer other than 401 ... proves an open gateway") does not say that with --via-public, proven_open decides.
+3. (Done.) The pass text names no route. Add "Routes: GET /v1/models, POST /v1/chat/completions and POST /v1/completions only; each other route gets 404." and pin it in the pass-text test.
 4. tests/expiry.sh times each 15-second cut on GET /v1/models only. Also send POST /v1/chat/completions in the timed check (Codex adversarial, P2).
-5. A PUBLIC_URL whose host ends with "." (the DNSName of `tailscale status --json`) gets 421 from strict_sni_host, and check_gateway then writes a false gateway-open marker with the wrong repair hint. Refuse such a PUBLIC_URL in read_settings, or count 421 as a failed check (stop, no marker).
-6. Grant step 8 sends no notification for a public 2xx or 3xx answer when the loopback check fails, and none for a listener that serves only POST (the GET gets 401, the POST a 400 or 422 of the model server). Consider one notification for each public answer other than 401.
+5. (Done.) A PUBLIC_URL whose host ends with "." (the DNSName of `tailscale status --json`) gets 421 from strict_sni_host, and check_gateway then writes a false gateway-open marker with the wrong repair hint. Refuse such a PUBLIC_URL in read_settings, or count 421 as a failed check (stop, no marker).
+6. (Done.) Grant step 8 sends no notification for a public 2xx or 3xx answer when the loopback check fails, and none for a listener that serves only POST (the GET gets 401, the POST a 400 or 422 of the model server). Consider one notification for each public answer other than 401.
 7. On the unit: check that a Funnel relay does not close a silent connection before the 300 s response-header limit of Caddy (a long prefill), for example with one `tests/expiry.sh --via-public` request whose first header comes after about 290 s.
 Optional (advisory): proven_open can use `local VIA=("${DIRECT[@]}")` (bash locals are dynamically scoped) in place of the save and restore; tests/expiry.sh can refuse a GATEWAY_CHECK_ADDRESS other than 127.0.0.1 before it arms.
 
@@ -59,6 +59,7 @@ Optional (advisory): proven_open can use `local VIA=("${DIRECT[@]}")` (bash loca
 **Effort:** S
 **Priority:** P1 (with the milestone-1 PR, before the first guest)
 **Depends on:** None (items 4 and 7 run on the head unit).
+**Completed (items 1, 2, 3, 5 and 6):** branch fix/funnel-review-followups (2026-10-08). Items 4 and 7 and the optional advisories stay open. Item 1: the test helper `gateway::unit_values` reads a unit key as systemd does (split at "=", the key trimmed), both unit-file tests use it, and the test of the caddy drop-in honors an empty `RuntimeDirectory=` (a reset; a dependency such as Wants= has no reset). Item 2: the comment names proven_open for --via-public. Item 3: the pass text has the routes line, and `routes_of_the_pass_text_are_the_routes_of_the_caddyfile` compares it with `@sparkpass_route` of gateway/Caddyfile. Item 5, both ways: `read_settings` refuses a PUBLIC_URL host with a trailing dot and names the fix, and the gateway check (grant steps 1 and 8, reconcile) counts a 421 as a failed check (stop, no marker), and so does tests/expiry.sh at the check address (in proven_open, expect and the cleanup check); etc/config.example, etc/caddy.env.example and install.sh say "no trailing dot". Item 6: each stop of step 8 for a public answer other than 401 sends one notification after the stop, with a text that names the case (also a 400 or 422 to the POST: a listener with no key check); a proven answer sends only the notification of the marker.
 
 ### Check the Funnel setup in reconcile and install.sh
 

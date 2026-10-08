@@ -64,3 +64,6 @@ Rules for tests:
 - The token rule format lives in `gateway::rule` in `src/gateway.rs`, the guard in `gateway/Caddyfile`,
   `lease_rule` and `deny_all` in `tests/gateway.sh`, and the deny-all text in `install.sh` and
   `tests/expiry.sh`. Change all of them together. A unit test in `src/gateway.rs` checks each copy.
+- The routes of the pass live in `@sparkpass_route` in `gateway/Caddyfile`, in the routes line of
+  `pass_text` in `src/grant.rs`, and in `allowed` in `tests/gateway.sh`. Change all of them together.
+  A unit test in `src/grant.rs` checks each copy.
