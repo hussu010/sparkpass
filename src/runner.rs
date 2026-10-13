@@ -164,6 +164,11 @@ pub mod fake {
             runner.on("curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ", output(0, "401"));
             // The notification endpoint (NOTIFY_URL) accepts each message.
             runner.on("curl -q -fsS -o /dev/null", output(0, "200"));
+            // tailscaled serves the one handler of the inbound route (src/funnel.rs) for the name of `Paths::temp`.
+            runner.on(
+                "tailscale serve status --json",
+                output(0, r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"}},"AllowFunnel":{"spark.example.net:443":true}}"#),
+            );
             runner
         }
 

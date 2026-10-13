@@ -20,10 +20,11 @@ Wants=network-online.target time-sync.target
 # Oneshot with no RemainAfterExit: the unit is inactive after each run, so the timer can start it again.
 Type=oneshot
 ExecStart=/usr/local/bin/sparkpass reconcile
-# Budget: each system command has a limit of 10 s, and one run with a lease runs at most 15 commands: 14 under
+# Budget: each system command has a limit of 10 s, and one run with a lease runs at most 17 commands: 14 under
 # the lock with a margin (one long path: firewall, end-timer check, create and check, the revoke of a lease
-# that became overdue, start, two wrong-key checks, stop and the marker notification, 12), and the
-# gateway-down notification after it = 150 s, plus the wait for the lock. systemd stops a run that hangs,
+# that became overdue, start, two wrong-key checks, stop and the marker notification, 12), and after it the
+# gateway-down notification, the read of the serve config of tailscaled and its notification = 170 s, plus the
+# wait for the lock. systemd stops a run that hangs,
 # the lock opens, and the next run 5 minutes later repeats the work.
 TimeoutStartSec=180
 
