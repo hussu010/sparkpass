@@ -36,30 +36,23 @@ pub fn mismatch(serve: &Value, public_url: &str) -> Option<String> {
     let mut expected = json!({"TCP": {"443": {"TCPForward": "127.0.0.1:443"}}, "AllowFunnel": {}});
     expected["AllowFunnel"][&site] = json!(true);
     (*serve != expected).then(|| {
-        let serve = without_user_parts(serve);
+        let serve = shown(serve);
         format!(
-            "the serve config of tailscaled is {serve}, and it must be exactly {expected}: a stop of the gateway does not close another handler of tailscaled, for example one straight to the model server; see `tailscale funnel status`, then `tailscale funnel reset` and `tailscale funnel --bg --tcp=443 tcp://127.0.0.1:443`"
+            "the serve config of tailscaled is {serve}, and it must be exactly {expected}: a stop of the gateway does not close another handler of tailscaled, for example one straight to the model server; see `tailscale serve status --json` and `tailscale funnel status`, then `tailscale funnel reset` and `tailscale funnel --bg --tcp=443 tcp://127.0.0.1:443`"
         )
     })
 }
 
-/// The serve config with the user part of each URL cut ("http://***@127.0.0.1:8000"): a proxy URL of a
-/// handler can hold a password, and the error text goes to the journal and to NOTIFY_URL. tailscaled writes
-/// each proxy target with its scheme (`ExpandProxyTargetValue` in ipn/serve.go).
-fn without_user_parts(value: &Value) -> Value {
+/// The serve config for an error text: each string value is "…", except a TCP forward address. A proxy URL, a
+/// redirect or a text handler can hold a password, and the error text goes to the journal and to NOTIFY_URL;
+/// the keys (ports, names, paths) and the forward targets show which handler is wrong.
+fn shown(value: &Value) -> Value {
     match value {
-        Value::String(text) => {
-            let Some((scheme, rest)) = text.split_once("://") else {
-                return value.clone();
-            };
-            let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-            match authority.rfind('@') {
-                Some(at) => json!(format!("{scheme}://***@{}", &rest[at + 1..])),
-                None => value.clone(),
-            }
-        }
-        Value::Array(items) => Value::Array(items.iter().map(without_user_parts).collect()),
-        Value::Object(fields) => Value::Object(fields.iter().map(|(key, field)| (key.clone(), without_user_parts(field))).collect()),
+        Value::Object(fields) => Value::Object(
+            fields.iter().map(|(key, field)| (key.clone(), if key == "TCPForward" { field.clone() } else { shown(field) })).collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(shown).collect()),
+        Value::String(_) => json!("…"),
         _ => value.clone(),
     }
 }
@@ -129,20 +122,21 @@ mod tests {
     }
 
     // Added for the Codex review of the land (2026-10-13).
-    // Value: protects=a password in the proxy URL of another handler stays out of the error text, which goes to
-    // the grant output, the journal and the NOTIFY_URL message; fails_when=the error prints the serve config as
-    // it is; why_new=only the user part of PUBLIC_URL was kept out; seam=none
+    // Value: protects=a password in a proxy URL, a redirect or a text handler of another handler stays out of the
+    // error text, which goes to the grant output, the journal and the NOTIFY_URL message; fails_when=the error
+    // prints a string value of the serve config other than a TCP forward address; why_new=only the user part of
+    // PUBLIC_URL was kept out; seam=none
     #[test]
-    fn error_text_holds_no_user_part_of_a_handler_url() {
+    fn error_text_holds_no_secret_of_a_handler() {
         let serve = serde_json::from_str::<Value>(
-            r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"HTTPS":true}},"Web":{"spark.example.net:8443":{"Handlers":{"/":{"Proxy":"http://u:SECRET@127.0.0.1:8000/v1"},"/a":{"Proxy":"http://127.0.0.1:8001"}}}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#,
+            r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"HTTPS":true},"10000":{"TCPForward":"127.0.0.1:8000"}},"Web":{"spark.example.net:8443":{"Handlers":{"/":{"Proxy":"http://u:SECRET@127.0.0.1:8000/v1"},"/r":{"Redirect":"301://u:SECRET@127.0.0.1:8000/v1"},"/s":{"Redirect":"//u:SECRET@127.0.0.1:8000/v1"},"/t":{"Text":"key SECRET, see https://docs.example.net"}}}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#,
         )
         .unwrap();
         let error = mismatch(&serve, URL).unwrap();
-        assert!(!error.contains("SECRET") && !error.contains("u:"), "{error}");
-        // The rest of the config stays, so the owner can see which handler is wrong.
-        assert!(error.contains(r#""Proxy":"http://***@127.0.0.1:8000/v1""#) && error.contains(r#""Proxy":"http://127.0.0.1:8001""#), "{error}");
-        assert!(error.contains(r#""spark.example.net:8443":true"#), "{error}");
+        assert!(!error.contains("SECRET") && !error.contains("u:") && !error.contains("docs.example.net"), "{error}");
+        // The keys and the forward targets stay, so the owner can see which handler is wrong.
+        assert!(error.contains(r#""10000":{"TCPForward":"127.0.0.1:8000"}"#) && error.contains(r#""/r":{"Redirect":"…"}"#), "{error}");
+        assert!(error.contains(r#""spark.example.net:8443":true"#) && error.contains("`tailscale serve status --json`"), "{error}");
     }
 
     #[test]
