@@ -43,13 +43,23 @@ pub fn mismatch(serve: &Value, public_url: &str) -> Option<String> {
     })
 }
 
-/// The serve config for an error text: each string value is "…", except a TCP forward address. A proxy URL, a
-/// redirect or a text handler can hold a password, and the error text goes to the journal and to NOTIFY_URL;
-/// the keys (ports, names, paths) and the forward targets show which handler is wrong.
+/// The serve config for an error text: each string value is "…", except a plain TCP forward address
+/// (host:port). A proxy URL, a redirect, a text handler or a raw `tailscale serve set-raw` value can hold a
+/// password, and the error text goes to the journal and to NOTIFY_URL; the keys (ports, names, paths) and the
+/// forward targets show which handler is wrong.
 fn shown(value: &Value) -> Value {
     match value {
         Value::Object(fields) => Value::Object(
-            fields.iter().map(|(key, field)| (key.clone(), if key == "TCPForward" { field.clone() } else { shown(field) })).collect(),
+            fields
+                .iter()
+                .map(|(key, field)| {
+                    let field = match field.as_str() {
+                        Some(address) if key == "TCPForward" && address.bytes().all(|b| b.is_ascii_alphanumeric() || b".:-[]".contains(&b)) => field.clone(),
+                        _ => shown(field),
+                    };
+                    (key.clone(), field)
+                })
+                .collect(),
         ),
         Value::Array(items) => Value::Array(items.iter().map(shown).collect()),
         Value::String(_) => json!("…"),
@@ -122,20 +132,21 @@ mod tests {
     }
 
     // Added for the Codex review of the land (2026-10-13).
-    // Value: protects=a password in a proxy URL, a redirect or a text handler of another handler stays out of the
-    // error text, which goes to the grant output, the journal and the NOTIFY_URL message; fails_when=the error
-    // prints a string value of the serve config other than a TCP forward address; why_new=only the user part of
-    // PUBLIC_URL was kept out; seam=none
+    // Value: protects=a password in a proxy URL, a redirect, a text handler or a raw TCP forward value of another
+    // handler stays out of the error text, which goes to the grant output, the journal and the NOTIFY_URL message;
+    // fails_when=the error prints a string value of the serve config other than a plain host:port forward address;
+    // why_new=only the user part of PUBLIC_URL was kept out; seam=none
     #[test]
     fn error_text_holds_no_secret_of_a_handler() {
         let serve = serde_json::from_str::<Value>(
-            r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"HTTPS":true},"10000":{"TCPForward":"127.0.0.1:8000"}},"Web":{"spark.example.net:8443":{"Handlers":{"/":{"Proxy":"http://u:SECRET@127.0.0.1:8000/v1"},"/r":{"Redirect":"301://u:SECRET@127.0.0.1:8000/v1"},"/s":{"Redirect":"//u:SECRET@127.0.0.1:8000/v1"},"/t":{"Text":"key SECRET, see https://docs.example.net"}}}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#,
+            r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"HTTPS":true},"10000":{"TCPForward":"127.0.0.1:8000"},"8444":{"TCPForward":"tcp://u:SECRET@127.0.0.1:8000"},"8445":{"TCPForward":"[::1]:8000"}},"Web":{"spark.example.net:8443":{"Handlers":{"/":{"Proxy":"http://u:SECRET@127.0.0.1:8000/v1"},"/r":{"Redirect":"301://u:SECRET@127.0.0.1:8000/v1"},"/s":{"Redirect":"//u:SECRET@127.0.0.1:8000/v1"},"/t":{"Text":"key SECRET, see https://docs.example.net"}}}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#,
         )
         .unwrap();
         let error = mismatch(&serve, URL).unwrap();
         assert!(!error.contains("SECRET") && !error.contains("u:") && !error.contains("docs.example.net"), "{error}");
-        // The keys and the forward targets stay, so the owner can see which handler is wrong.
-        assert!(error.contains(r#""10000":{"TCPForward":"127.0.0.1:8000"}"#) && error.contains(r#""/r":{"Redirect":"…"}"#), "{error}");
+        // The keys and the plain forward targets stay, so the owner can see which handler is wrong.
+        assert!(error.contains(r#""10000":{"TCPForward":"127.0.0.1:8000"}"#) && error.contains(r#""8445":{"TCPForward":"[::1]:8000"}"#), "{error}");
+        assert!(error.contains(r#""8444":{"TCPForward":"…"}"#) && error.contains(r#""/r":{"Redirect":"…"}"#), "{error}");
         assert!(error.contains(r#""spark.example.net:8443":true"#) && error.contains("`tailscale serve status --json`"), "{error}");
     }
 
