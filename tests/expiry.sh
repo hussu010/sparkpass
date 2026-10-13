@@ -41,13 +41,15 @@ Steps:
      an empty bearer value, a wrong key, and the key with one more character get 401.
   3  a stream with the key runs past the end time, and a different process holds the
      sparkpass lock from 5 s before the end time for 40 s (eng review D8). Not later than
-     15 s after the end time, the stream ends and the key gets 401 (then on every path, and
-     the other callers too); within 30 s after the lock hold, sparkpass list shows no lease
-     and the end timer is gone. The model server shows zero running requests.
+     15 s after the end time, the stream ends and the key gets 401 on GET /v1/models and
+     POST /v1/chat/completions (then on every path, and the other callers too); within
+     30 s after the lock hold, sparkpass list shows no lease and the end timer is gone.
+     The model server shows zero running requests.
   4  grant and an early revoke: the key gets 401, and the end timer is gone.
   5  a new grant of the same name, with the TTL of step 3: the new key works, and the
      earlier keys get 401. The new lease ends at its own end time: the new key gets 401
-     within 15 s (then on every path), and within 30 s no lease and no end timer stay.
+     on the two routes of step 3 within 15 s (then on every path), and within 30 s no
+     lease and no end timer stay.
   6  a summary.
 "Every path": the routes of the pass (GET /v1/models, POST /v1/chat/completions,
 POST /v1/completions), then GET /v1/chat/completions, POST /v1/models,
@@ -58,7 +60,9 @@ Options:
   --stub              run against tests/stub-model.py on MODEL_PORT (stop the real model
                       first). Step 4 also checks 503 when the stub is stopped, and 504 (not
                       a hang) when the stub is frozen. The frozen check waits for the 300 s
-                      header timeout of the gateway: about 5 minutes.
+                      header timeout of the gateway: about 5 minutes. With --via-public, that
+                      request is silent for 300 s on a relay of Funnel, so it also proves that
+                      the relay keeps a silent connection open (a long prefill).
   --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m; at least 60s, and
                       at least 180s with --via-public).
   --via-public        send each request through PUBLIC_URL: public DNS and a relay of
@@ -199,7 +203,7 @@ if ! [[ $MODEL_PORT =~ ^[0-9]{1,5}$ ]] || ((10#$MODEL_PORT < 1 || 10#$MODEL_PORT
   die "$CONFIG: MODEL_PORT must be a port number"
 fi
 MODEL_PORT=$((10#$MODEL_PORT))
-[[ -n $ADDRESS ]] || die "$CONFIG: GATEWAY_CHECK_ADDRESS is missing"
+[[ $ADDRESS == 127.0.0.1 ]] || die "$CONFIG: GATEWAY_CHECK_ADDRESS must be 127.0.0.1, where Caddy listens (sparkpass refuses each other value)"
 # Without --via-public, each connection goes to GATEWAY_CHECK_ADDRESS on the port of PUBLIC_URL, as
 # the reconcile check does. TLS still checks the name of PUBLIC_URL. DIRECT keeps that route for
 # proven_open, also with --via-public.
@@ -311,10 +315,9 @@ answers() {
 # answer, for example tailscaled when Funnel runs in HTTPS mode. A 421 there is no proof: the request did
 # not reach the token check (strict_sni_host). BAD then holds the direct answers.
 proven_open() {
-  local route=("${VIA[@]}") rc=0
-  VIA=("${DIRECT[@]}")
+  # bash locals are dynamically scoped: status() sees this VIA, and the caller's VIA stays.
+  local VIA=("${DIRECT[@]}") rc=0
   answers 401 "$@" || rc=1
-  VIA=("${route[@]}")
   ((rc)) && [[ $BAD == *=[1-9][0-9][0-9]* && $BAD != *=421* ]]
 }
 
@@ -506,10 +509,11 @@ STREAM_PID=""
 ((stream_rc != 0)) || fail "the stream ended on its own (curl exit 0), not by the cut; raise EXPIRY_MAX_TOKENS or use a shorter --ttl"
 read -r stream_code stream_size <"$TMP/stream" || true
 [[ ${stream_code:-} == 200 && ${stream_size:-0} -gt 0 ]] || fail "the stream got \"${stream_code:-none}\" with ${stream_size:-0} bytes; it must get 200 with data"
-# One route times the cut: the deny-all rule is one token file for every route. Every route and the other
-# callers follow after the time limits, because through a relay of Funnel each request takes a few round
-# trips, and 12 to 48 requests would count against the limits of the revoke.
-until_by $((DEADLINE + BOUND)) "the key does not get 401 $BOUND s after the end time" answers 401 "$KEY1" "GET /v1/models"
+# Two routes time the cut: GET /v1/models and POST /v1/chat/completions, the route of the stream (Codex
+# adversarial, P2). Before the cut, the POST sends {}, which starts no stream.
+# Every route and the other callers follow after the time limits, because through a relay of Funnel each
+# request takes a few round trips, and 12 to 48 requests would count against the limits of the revoke.
+until_by $((DEADLINE + BOUND)) "the key does not get 401 $BOUND s after the end time" answers 401 "$KEY1" "GET /v1/models" "POST /v1/chat/completions"
 cut_at=$(($(date +%s) - DEADLINE))
 until_by $((DEADLINE + lock_end + 30)) "sparkpass list still shows a lease 30 s after the end of the lock hold" no_lease
 until_by $((DEADLINE + lock_end + 30)) "$TIMER or another end timer still exists 30 s after the end of the lock hold (systemctl list-timers --all 'sparkpass-end-*')" timer_gone
@@ -551,7 +555,11 @@ if [[ $STUB == yes ]]; then
   frozen_s=$(($(date +%s) - frozen_start))
   kill -CONT "$STUB_PID"
   if [[ $frozen_code != 504 ]] || ((frozen_s < 290 || frozen_s > 315)); then
-    fail "with the stub frozen, the key got \"$frozen_code\" after $frozen_s s; it must get 504 after 290 to 315 s (the 300 s response header timeout)"
+    relay=""
+    if [[ $VIA_PUBLIC == yes ]] && ((frozen_s < 290)); then
+      relay="; through Funnel, an early end can be a relay that closes a silent connection before the 300 s limit of the gateway (a long prefill gets the same error)"
+    fi
+    fail "with the stub frozen, the key got \"$frozen_code\" after $frozen_s s; it must get 504 after 290 to 315 s (the 300 s response header timeout)$relay"
   fi
   stub_note="503 with the stub stopped; 504 after ${frozen_s}s with the stub frozen"
   say "ok: with the stub frozen, the key gets 504 after ${frozen_s}s"
@@ -576,8 +584,8 @@ say "the new key works, and the earlier keys get 401; waiting for the end time o
 # The new lease ends at its own end time (design, Success Criteria): not before it, and not later than the bounds.
 wait_until $((DEADLINE - 3))
 expect 200 "$KEY3" "the key of the new grant, 3 s before its end time" "GET /v1/models"
-# One route times the cut, as in step 3.
-until_by $((DEADLINE + BOUND)) "the new key does not get 401 $BOUND s after its end time" answers 401 "$KEY3" "GET /v1/models"
+# The two routes of step 3 time the cut.
+until_by $((DEADLINE + BOUND)) "the new key does not get 401 $BOUND s after its end time" answers 401 "$KEY3" "GET /v1/models" "POST /v1/chat/completions"
 recut_at=$(($(date +%s) - DEADLINE))
 until_by $((DEADLINE + 30)) "sparkpass list still shows a lease 30 s after the end time of the new lease" no_lease
 until_by $((DEADLINE + 30)) "$TIMER or another end timer still exists 30 s after the end time (systemctl list-timers --all 'sparkpass-end-*')" timer_gone
