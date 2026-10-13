@@ -6,6 +6,7 @@
 use crate::config;
 use crate::runner::{Runner, run_ok};
 use serde_json::{Value, json};
+use std::net::SocketAddr;
 
 /// The serve config of tailscaled, as `tailscale serve status --json` prints it (a local call, no network).
 pub fn serve_config(runner: &dyn Runner) -> Result<Value, String> {
@@ -43,10 +44,10 @@ pub fn mismatch(serve: &Value, public_url: &str) -> Option<String> {
     })
 }
 
-/// The serve config for an error text: each string value is "…", except a plain TCP forward address
-/// (host:port). A proxy URL, a redirect, a text handler or a raw `tailscale serve set-raw` value can hold a
-/// password, and the error text goes to the journal and to NOTIFY_URL; the keys (ports, names, paths) and the
-/// forward targets show which handler is wrong.
+/// The serve config for an error text: each string value is "…", except a TCP forward address that is an IP
+/// address and a port (127.0.0.1:8000, [::1]:8000). A proxy URL, a redirect, a text handler or a raw
+/// `tailscale serve set-raw` value can hold a password, and the error text goes to the journal and to NOTIFY_URL;
+/// the keys (ports, names, paths) and the forward targets show which handler is wrong.
 fn shown(value: &Value) -> Value {
     match value {
         Value::Object(fields) => Value::Object(
@@ -54,7 +55,7 @@ fn shown(value: &Value) -> Value {
                 .iter()
                 .map(|(key, field)| {
                     let field = match field.as_str() {
-                        Some(address) if key == "TCPForward" && address.bytes().all(|b| b.is_ascii_alphanumeric() || b".:-[]".contains(&b)) => field.clone(),
+                        Some(address) if key == "TCPForward" && address.parse::<SocketAddr>().is_ok() => field.clone(),
                         _ => shown(field),
                     };
                     (key.clone(), field)
@@ -134,12 +135,12 @@ mod tests {
     // Added for the Codex review of the land (2026-10-13).
     // Value: protects=a password in a proxy URL, a redirect, a text handler or a raw TCP forward value of another
     // handler stays out of the error text, which goes to the grant output, the journal and the NOTIFY_URL message;
-    // fails_when=the error prints a string value of the serve config other than a plain host:port forward address;
+    // fails_when=the error prints a string value of the serve config other than a TCP forward to an IP and a port;
     // why_new=only the user part of PUBLIC_URL was kept out; seam=none
     #[test]
     fn error_text_holds_no_secret_of_a_handler() {
         let serve = serde_json::from_str::<Value>(
-            r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"HTTPS":true},"10000":{"TCPForward":"127.0.0.1:8000"},"8444":{"TCPForward":"tcp://u:SECRET@127.0.0.1:8000"},"8445":{"TCPForward":"[::1]:8000"}},"Web":{"spark.example.net:8443":{"Handlers":{"/":{"Proxy":"http://u:SECRET@127.0.0.1:8000/v1"},"/r":{"Redirect":"301://u:SECRET@127.0.0.1:8000/v1"},"/s":{"Redirect":"//u:SECRET@127.0.0.1:8000/v1"},"/t":{"Text":"key SECRET, see https://docs.example.net"}}}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#,
+            r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"HTTPS":true},"10000":{"TCPForward":"127.0.0.1:8000"},"8444":{"TCPForward":"tcp://u:SECRET@127.0.0.1:8000"},"8445":{"TCPForward":"[::1]:8000"},"8446":{"TCPForward":"admin:SECRET-staple"}},"Web":{"spark.example.net:8443":{"Handlers":{"/":{"Proxy":"http://u:SECRET@127.0.0.1:8000/v1"},"/r":{"Redirect":"301://u:SECRET@127.0.0.1:8000/v1"},"/s":{"Redirect":"//u:SECRET@127.0.0.1:8000/v1"},"/t":{"Text":"key SECRET, see https://docs.example.net"}}}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#,
         )
         .unwrap();
         let error = mismatch(&serve, URL).unwrap();
