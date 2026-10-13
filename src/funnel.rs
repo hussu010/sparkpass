@@ -24,17 +24,44 @@ pub fn mismatch(serve: &Value, public_url: &str) -> Option<String> {
     let host = config::host(public_url);
     // The port of PUBLIC_URL, if it has one: the text between the host and the path. Funnel and Caddy use 443.
     let port = public_url["https://".len() + host.len()..].split(['/', '?', '#']).next().unwrap_or("");
+    // A number, as curl reads it: an empty port is 443 and ":0443" is 443; a port out of range never matches.
+    let port = match port.trim_start_matches(':') {
+        "" => 443,
+        digits => digits.parse::<u16>().unwrap_or(0),
+    };
     // The Funnel name has no user part ("u:PASSWORD@"), so the error text also holds no password.
     let name = host.rsplit_once('@').map_or(host, |(_, name)| name);
     // tailscaled writes the DNS name in lower case; Caddy and TLS compare names with no regard to case.
-    let site = format!("{}{}", name.to_ascii_lowercase(), if port.is_empty() { ":443" } else { port });
+    let site = format!("{}:{port}", name.to_ascii_lowercase());
     let mut expected = json!({"TCP": {"443": {"TCPForward": "127.0.0.1:443"}}, "AllowFunnel": {}});
     expected["AllowFunnel"][&site] = json!(true);
     (*serve != expected).then(|| {
+        let serve = without_user_parts(serve);
         format!(
             "the serve config of tailscaled is {serve}, and it must be exactly {expected}: a stop of the gateway does not close another handler of tailscaled, for example one straight to the model server; see `tailscale funnel status`, then `tailscale funnel reset` and `tailscale funnel --bg --tcp=443 tcp://127.0.0.1:443`"
         )
     })
+}
+
+/// The serve config with the user part of each URL cut ("http://***@127.0.0.1:8000"): a proxy URL of a
+/// handler can hold a password, and the error text goes to the journal and to NOTIFY_URL. tailscaled writes
+/// each proxy target with its scheme (`ExpandProxyTargetValue` in ipn/serve.go).
+fn without_user_parts(value: &Value) -> Value {
+    match value {
+        Value::String(text) => {
+            let Some((scheme, rest)) = text.split_once("://") else {
+                return value.clone();
+            };
+            let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+            match authority.rfind('@') {
+                Some(at) => json!(format!("{scheme}://***@{}", &rest[at + 1..])),
+                None => value.clone(),
+            }
+        }
+        Value::Array(items) => Value::Array(items.iter().map(without_user_parts).collect()),
+        Value::Object(fields) => Value::Object(fields.iter().map(|(key, field)| (key.clone(), without_user_parts(field))).collect()),
+        _ => value.clone(),
+    }
 }
 
 /// Grant step 1: the serve config is the one handler of the inbound route.
@@ -95,6 +122,27 @@ mod tests {
         }
         // A PUBLIC_URL with another port: Caddy and Funnel use 443 only.
         assert!(mismatch(&serve(PROCEDURE), "https://spark.example.net:8443").is_some());
+        // curl reads ":0443" and an empty port as 443, so the setup of the procedure matches them too (Codex, land).
+        assert_eq!(mismatch(&serve(PROCEDURE), "https://spark.example.net:0443"), None);
+        assert_eq!(mismatch(&serve(PROCEDURE), "https://spark.example.net:"), None);
+        assert!(mismatch(&serve(PROCEDURE), "https://spark.example.net:99999").is_some());
+    }
+
+    // Added for the Codex review of the land (2026-10-13).
+    // Value: protects=a password in the proxy URL of another handler stays out of the error text, which goes to
+    // the grant output, the journal and the NOTIFY_URL message; fails_when=the error prints the serve config as
+    // it is; why_new=only the user part of PUBLIC_URL was kept out; seam=none
+    #[test]
+    fn error_text_holds_no_user_part_of_a_handler_url() {
+        let serve = serde_json::from_str::<Value>(
+            r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"HTTPS":true}},"Web":{"spark.example.net:8443":{"Handlers":{"/":{"Proxy":"http://u:SECRET@127.0.0.1:8000/v1"},"/a":{"Proxy":"http://127.0.0.1:8001"}}}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#,
+        )
+        .unwrap();
+        let error = mismatch(&serve, URL).unwrap();
+        assert!(!error.contains("SECRET") && !error.contains("u:"), "{error}");
+        // The rest of the config stays, so the owner can see which handler is wrong.
+        assert!(error.contains(r#""Proxy":"http://***@127.0.0.1:8000/v1""#) && error.contains(r#""Proxy":"http://127.0.0.1:8001""#), "{error}");
+        assert!(error.contains(r#""spark.example.net:8443":true"#), "{error}");
     }
 
     #[test]
