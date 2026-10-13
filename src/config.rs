@@ -29,6 +29,9 @@ pub struct Paths {
     pub gateway_down: PathBuf,
     /// Marker of a sent REVOKE-FAILED notification (one notification for each failed revoke).
     pub revoke_failed: PathBuf,
+    /// Marker of a sent notification of a serve config of tailscaled that is not the one handler of the inbound
+    /// route (src/funnel.rs). It holds that config, so that one config sends one notification.
+    pub funnel_mismatch: PathBuf,
 }
 
 impl Paths {
@@ -46,6 +49,7 @@ impl Paths {
             model_down: state.join("model-down"),
             gateway_down: state.join("gateway-down"),
             revoke_failed: state.join("revoke-failed"),
+            funnel_mismatch: state.join("funnel-mismatch"),
         }
     }
 
@@ -133,7 +137,7 @@ pub fn read_settings(paths: &Paths) -> Result<Settings, String> {
 }
 
 /// The host of an `https://` URL, with a user part if it has one: the text up to the path, with no port.
-fn host(url: &str) -> &str {
+pub fn host(url: &str) -> &str {
     let authority = url["https://".len()..].split(['/', '?', '#']).next().unwrap_or("");
     // A port is digits after the last ":". Another ":" is no port, for example the ":" of a password in a
     // user part ("u:PASSWORD@host."): without the digit test, the host would be "u".
@@ -216,6 +220,7 @@ mod tests {
         assert_eq!(paths.model_down, Path::new("/var/lib/sparkpass/model-down"));
         assert_eq!(paths.gateway_down, Path::new("/var/lib/sparkpass/gateway-down"));
         assert_eq!(paths.revoke_failed, Path::new("/var/lib/sparkpass/revoke-failed"));
+        assert_eq!(paths.funnel_mismatch, Path::new("/var/lib/sparkpass/funnel-mismatch"));
         let expiry = include_str!("../tests/expiry.sh");
         assert!(expiry.contains("\nSTATE=/var/lib/sparkpass\n") && expiry.contains("\nMARKER=$STATE/gateway-open\n"));
         assert!(include_str!("../install.sh").contains("/var/lib/sparkpass/gateway-open"));

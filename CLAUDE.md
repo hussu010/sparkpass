@@ -67,3 +67,7 @@ Rules for tests:
 - The routes of the pass live in `@sparkpass_route` in `gateway/Caddyfile`, in the routes line of
   `pass_text` in `src/grant.rs`, and in `allowed` in `tests/gateway.sh`. Change all of them together.
   A unit test in `src/grant.rs` checks each copy.
+- The Funnel handler lives in `funnel::mismatch` in `src/funnel.rs`, in the procedure that `install.sh` prints
+  (`tailscale funnel --bg --tcp=443 tcp://127.0.0.1:443`), and in the `TCPForward` warning of `install.sh`.
+  Change all of them together. A unit test in `src/funnel.rs` checks each copy. tailscale behavior cannot be
+  tested here: the JSON format of `tailscale serve status --json` comes from `ipn.ServeConfig` in the Tailscale source.

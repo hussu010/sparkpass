@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod funnel;
 mod gateway;
 mod grant;
 mod lease;
@@ -351,8 +352,10 @@ mod tests {
         run(&["grant", "bob", "--ttl", "5m"], &paths, &runner, &|| 1_000).unwrap();
         run(&["reconcile"], &paths, &runner, &|| 1_100).unwrap();
         run(&["revoke", "bob"], &paths, &runner, &|| 1_200).unwrap();
-        // Only the close of `sparkpass revoke` before the lock (eng review D8) runs with no lock.
-        assert_eq!(*free.lock().unwrap(), ["systemctl try-restart caddy"]);
+        // Only the close of `sparkpass revoke` before the lock (eng review D8) and the read of the serve config of
+        // tailscaled after reconcile run with no lock. That read changes no lease and no gateway, and after the
+        // lock it does not make the end timer wait longer for a reconcile run.
+        assert_eq!(*free.lock().unwrap(), ["tailscale serve status --json", "systemctl try-restart caddy"]);
     }
 
     #[test]

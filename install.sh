@@ -276,6 +276,28 @@ if [[ $cert_uid != caddy ]]; then
 	warn "/etc/default/tailscaled has no TS_PERMIT_CERT_UID=caddy. Without it, tailscaled gives Caddy
 no certificate for the ts.net name, and each TLS handshake fails. See step 1 below."
 fi
+# sparkpass grant and reconcile check the whole serve config (src/funnel.rs); this warning names only a
+# missing forward to Caddy.
+serve=$(tailscale serve status --json 2>/dev/null) || true
+if command -v tailscale >/dev/null && ! grep -qE '"TCPForward": *"127\.0\.0\.1:443"' <<<"$serve"; then
+	warn "tailscaled forwards no TCP 443 to 127.0.0.1:443 (tailscale serve status --json). Until the serve
+config is exactly that one Funnel handler, sparkpass grant refuses and reconcile sends a notification.
+See step 1 below."
+fi
+# With accept-dns on, MagicDNS gives the tailnet address of this unit (100.64.0.0/10 or fd7a:115c:a1e0::/48),
+# where Caddy does not listen, and the self-check of grant fails.
+site=$(value_of SPARKPASS_SITE </etc/sparkpass/caddy.env)
+addresses=
+if [[ -n $site ]]; then
+	# One line for each socket type (STREAM, DGRAM, RAW): each address once.
+	addresses=$(getent ahosts "$site" | awk '!seen[$1]++ {print $1}') || true
+fi
+if grep -qE '^(100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:115c:a1e0:)' <<<"$addresses"; then
+	warn "$site resolves to a tailnet address on this unit:
+$addresses
+Run 'tailscale set --accept-dns=false' (step 1 below): the self-check of sparkpass grant must take the
+public route of Funnel."
+fi
 
 cat <<EOF
 sparkpass is installed: /usr/local/bin/sparkpass, $caddyfile, the caddy.service drop-in,

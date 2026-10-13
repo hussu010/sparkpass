@@ -22,6 +22,8 @@
 //!      request did not reach the token check)
 //!    success with an active lease ──▶ model check (one notification at the start and at the end of an outage)
 //!    gateway stopped or not started with an active lease ──▶ one notification; the next successful start ──▶ one more
+//! after the lock: the serve config of tailscaled is not the one handler of the inbound route ──▶ one
+//!   notification for each such config (src/funnel.rs); the result of the run stays
 //! ```
 //!
 //! Build phase 1 has no workspace and no home image. The step order is the safety property:
@@ -29,6 +31,7 @@
 //! the proof that the gateway refuses a wrong token.
 
 use crate::config::{self, Paths, Settings};
+use crate::funnel;
 use crate::gateway;
 use crate::grant::{check_gateway, model_name};
 use crate::lease::{self, Lease, State};
@@ -52,6 +55,7 @@ pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) ->
         Err(e) if !runs.get() => gateway_down(paths, runner, e),
         Err(_) => {}
     }
+    check_funnel(paths, runner);
     result
 }
 
@@ -305,6 +309,37 @@ fn fail_closed(runner: &dyn Runner, cause: String) -> Result<(), String> {
     Err(format!("{cause}; {}", gateway::stop(runner)))
 }
 
+/// The inbound route (src/funnel.rs), after the lock: it changes no lease and no gateway. A stop of Caddy does
+/// not close another handler of tailscaled, so each serve config that is not the one handler of install.sh
+/// sends one notification (the marker holds that config), and the result of the run stays. A failed read goes
+/// to the journal only: with tailscaled down, Funnel serves nothing.
+fn check_funnel(paths: &Paths, runner: &dyn Runner) {
+    // A missing or bad settings file: the run failed for it already.
+    let Ok(settings) = config::read_settings(paths) else {
+        return;
+    };
+    let serve = match funnel::serve_config(runner) {
+        Ok(serve) => serve,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "sparkpass: reconcile: {e}");
+            return;
+        }
+    };
+    let Some(error) = funnel::mismatch(&serve, &settings.public_url) else {
+        let _ = fs::remove_file(&paths.funnel_mismatch);
+        return;
+    };
+    let _ = writeln!(io::stderr(), "sparkpass: reconcile: {error}");
+    let seen = serve.to_string();
+    if fs::read_to_string(&paths.funnel_mismatch).is_ok_and(|text| text.trim() == seen) {
+        return;
+    }
+    // The marker after a sent notification only: a failed send is tried again on the next run.
+    if notify::send(paths, runner, &format!("sparkpass: {error}; grant refuses until the serve config is repaired")) {
+        let _ = fs::write(&paths.funnel_mismatch, format!("{seen}\n"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +360,8 @@ mod tests {
     /// The health check of the model during a lease, after the gateway check.
     const HEALTH: &str = "curl -q --noproxy * -fsS -m 8 http://127.0.0.1:8000/v1/models";
     const REVOKE_FAILED: &str = "the revoke of bob is not complete (state revoke-failed)";
+    /// The read of the serve config of tailscaled: the last command of each run with a readable settings file.
+    const FUNNEL: &str = "tailscale serve status --json";
     /// The check with a wrong token after the start, through the check address of `Paths::temp`.
     const PROBE: &str = "curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ::127.0.0.1: -H Authorization: Bearer 0000000000000000000000000000000000000000000000000000000000000000 https://spark.example.net/v1/models";
     /// The second check with a wrong token: a POST to the route of the model.
@@ -364,7 +401,7 @@ mod tests {
     fn no_lease_starts_the_gateway() {
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
-        assert_eq!(runner.calls(), [FIREWALL, START, PROBE, PROBE_POST]);
+        assert_eq!(runner.calls(), [FIREWALL, START, PROBE, PROBE_POST, FUNNEL]);
     }
 
     #[test]
@@ -375,7 +412,7 @@ mod tests {
             runner.on(START, start);
             let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
             assert!(error.ends_with("; the gateway is stopped"), "{error}");
-            assert_eq!(runner.calls(), [FIREWALL, START, STOP]);
+            assert_eq!(runner.calls(), [FIREWALL, START, STOP, FUNNEL]);
         }
     }
 
@@ -398,7 +435,7 @@ mod tests {
             let head = ["curl", "-q", "--noproxy", "*", "-sS", "-o", "/dev/null", "-m", "8", "-w", "%{http_code}", "--connect-to", connect, "-H", &wrong];
             let chat = url.replace("/v1/models", "/v1/chat/completions");
             assert_eq!(
-                argv[argv.len() - 2..],
+                argv[argv.len() - 3..argv.len() - 1],
                 [[&head[..], &[url]].concat(), [&head[..], &["-H", "Content-Type: application/json", "-d", "{}", &chat]].concat()]
             );
         }
@@ -428,7 +465,7 @@ mod tests {
             let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
             assert!(error.contains(text) && error.contains("; the gateway is stopped"), "{error}");
             let probes: &[&str] = if probe == PROBE { &[PROBE] } else { &[PROBE, PROBE_POST] };
-            assert_eq!(runner.calls(), [&[FIREWALL, &check_timer(2_000), START][..], probes, &[STOP]].concat());
+            assert_eq!(runner.calls(), [&[FIREWALL, &check_timer(2_000), START][..], probes, &[STOP, FUNNEL]].concat());
             assert!(!error.contains(&"ab".repeat(32)), "{error}");
         }
     }
@@ -536,7 +573,7 @@ mod tests {
             drop(lock);
             assert_eq!(reconciler.join().unwrap(), Ok(()));
         });
-        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST]);
+        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST, FUNNEL]);
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
         assert_eq!(end_of_record(&paths), 2_000);
     }
@@ -553,7 +590,7 @@ mod tests {
         assert_eq!(reconcile(&paths, &runner, &clock), Ok(()));
         let calls = runner.calls();
         assert_eq!(runner.count(&create_timer(2_000)), 1, "{calls:?}");
-        assert!(calls.ends_with(&[RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST].map(String::from)), "{calls:?}");
+        assert!(calls.ends_with(&[RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST, FUNNEL].map(String::from)), "{calls:?}");
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
         assert_eq!(end_of_record(&paths), 2_000);
         assert!(gateway::is_deny_all(&paths));
@@ -567,7 +604,7 @@ mod tests {
         assert_eq!(reconcile(&paths, &runner, &clock), Ok(()));
         assert_eq!(
             runner.calls(),
-            [FIREWALL, &check_timer(2_000), RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST]
+            [FIREWALL, &check_timer(2_000), RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST, FUNNEL]
         );
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
 
@@ -580,7 +617,7 @@ mod tests {
         assert_eq!(reconcile(&paths, &runner, &clock), Ok(()));
         assert_eq!(
             runner.calls(),
-            [FIREWALL, &check_timer(2_000), RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST]
+            [FIREWALL, &check_timer(2_000), RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST, FUNNEL]
         );
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
         assert_eq!(end_of_record(&paths), 2_000);
@@ -645,7 +682,7 @@ mod tests {
             seed(&paths, "bob", 1_000, State::Active);
             runner.on(FIREWALL, firewall);
             assert!(reconcile(&paths, &runner, &|| NOW).is_err());
-            assert_eq!(runner.calls(), [FIREWALL, STOP]);
+            assert_eq!(runner.calls(), [FIREWALL, STOP, FUNNEL]);
             assert_eq!(state(&paths), State::Active);
         }
     }
@@ -657,7 +694,7 @@ mod tests {
         fs::write(paths.lease("bob"), "not json").unwrap();
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.contains("bob.json"), "{error}");
-        assert_eq!(runner.calls(), [FIREWALL, STOP]);
+        assert_eq!(runner.calls(), [FIREWALL, STOP, FUNNEL]);
         // Nothing else changed.
         assert_eq!(files(&paths.leases), ["amy.json", "bob.json"]);
     }
@@ -670,7 +707,7 @@ mod tests {
         fs::write(&paths.leases, "").unwrap();
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.contains("cannot take the lock"), "{error}");
-        assert_eq!(runner.calls(), [STOP]);
+        assert_eq!(runner.calls(), [STOP, FUNNEL]);
     }
 
     #[test]
@@ -688,7 +725,7 @@ mod tests {
         });
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.contains("cannot read the lease directory"), "{error}");
-        assert_eq!(runner.calls(), [FIREWALL, STOP]);
+        assert_eq!(runner.calls(), [FIREWALL, STOP, FUNNEL]);
     }
 
     #[test]
@@ -697,7 +734,7 @@ mod tests {
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
         gateway::write_rule(&paths, &gateway::rule(Some(("bob", "abc")))).unwrap();
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
-        assert_eq!(runner.calls(), [FIREWALL, RESTART, START, PROBE, PROBE_POST]);
+        assert_eq!(runner.calls(), [FIREWALL, RESTART, START, PROBE, PROBE_POST, FUNNEL]);
         assert!(gateway::is_deny_all(&paths));
 
         // The deny-all rule cannot be written: the gateway stops and does not start.
@@ -705,7 +742,7 @@ mod tests {
         fs::remove_file(&paths.token).unwrap();
         fs::create_dir(&paths.token).unwrap();
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
-        assert_eq!(runner.calls(), [FIREWALL, STOP, STOP]);
+        assert_eq!(runner.calls(), [FIREWALL, STOP, STOP, FUNNEL]);
         // Extended by the /ship test coverage audit (2026-10-06): the error names the file to repair.
         // Value: protects=the error of a failed deny-all write in gateway::close names the token file path;
         // fails_when=the format in close drops paths.token.display(), and the owner reads "Is a directory" with no file;
@@ -728,7 +765,7 @@ mod tests {
         let calls = runner.calls();
         // The stop after the failed restart, and one more at the end: a failed revoke leaves the cut
         // unproven, so no check follows (review of 2026-10-06, owner decision D13).
-        assert!(calls.ends_with(&[RESTART.into(), STOP.into(), stop_timer(2_000), check_timer(2_000), STOP.into()]), "{calls:?}");
+        assert!(calls.ends_with(&[RESTART.into(), STOP.into(), stop_timer(2_000), check_timer(2_000), STOP.into(), FUNNEL.into()]), "{calls:?}");
         assert_eq!(runner.count(START), 0);
         assert_eq!(state(&paths), State::RevokeFailed);
         assert!(gateway::is_deny_all(&paths));
@@ -761,7 +798,7 @@ mod tests {
             assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()), "{text:?}");
             // The gate revokes the lease before step 3, because its key is dead: no end timer.
             let calls = runner.calls();
-            assert!(calls.ends_with(&[START, PROBE, PROBE_POST].map(String::from)), "{text:?}");
+            assert!(calls.ends_with(&[START, PROBE, PROBE_POST, FUNNEL].map(String::from)), "{text:?}");
             assert_eq!(runner.count("systemd-run"), 0, "{calls:?}");
             assert_eq!(runner.count(&stop_timer(2_000)), 1, "{calls:?}");
             assert_eq!(runner.count(RESTART), 1, "{calls:?}");
@@ -776,7 +813,7 @@ mod tests {
         runner.exit(&check_timer(2_000), 0);
         fs::write(&paths.token, &rule_of_bob).unwrap();
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
-        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH]);
+        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH, FUNNEL]);
         assert_eq!(fs::read_to_string(&paths.token).unwrap(), rule_of_bob);
     }
 
@@ -790,7 +827,7 @@ mod tests {
         assert!(reconcile(&paths, &runner, &|| NOW).is_err());
         // The revoke of the dead key closes the gateway first; its timer stop fails on the hang, so the
         // gateway stops at the end (a failed revoke).
-        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(2_000), &check_timer(2_000), STOP]);
+        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(2_000), &check_timer(2_000), STOP, FUNNEL]);
         assert!(gateway::is_deny_all(&paths));
         assert_eq!(runner.count(START), 0);
         assert_eq!(runner.count("systemd-run"), 0);
@@ -807,7 +844,7 @@ mod tests {
             assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
             assert_eq!(
                 runner.calls(),
-                [FIREWALL, RESTART, &stop_timer(deadline), &check_timer(deadline), START, PROBE, PROBE_POST]
+                [FIREWALL, RESTART, &stop_timer(deadline), &check_timer(deadline), START, PROBE, PROBE_POST, FUNNEL]
             );
             assert!(gateway::is_deny_all(&paths));
             assert_eq!(files(&paths.leases), [] as [&str; 0]);
@@ -822,7 +859,7 @@ mod tests {
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
         assert_eq!(
             runner.calls(),
-            [FIREWALL, RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST]
+            [FIREWALL, RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST, FUNNEL]
         );
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
         assert_eq!(files(&paths.history), ["bob-1000.json"]);
@@ -842,7 +879,7 @@ mod tests {
             let timer = format!(
                 "systemd-run --collect --unit=sparkpass-end-bob-2000 --on-calendar=1970-01-01 00:33:20 UTC --on-active={on_active} --timer-property=AccuracySec=1s --timer-property=RemainAfterElapse=no --property=Type=oneshot --property=TimeoutStartSec=240 /usr/local/bin/sparkpass revoke bob --deadline 2000"
             );
-            assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), &timer, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH]);
+            assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), &timer, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH, FUNNEL]);
             // The lease and its access stay.
             assert_eq!(state(&paths), State::Active);
             assert!(!gateway::is_deny_all(&paths));
@@ -856,7 +893,7 @@ mod tests {
         gateway::write_rule(&paths, &gateway::rule(Some(("bob", &"ab".repeat(32))))).unwrap();
         runner.exit(&check_timer(2_000), 0);
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
-        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH]);
+        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), START, PROBE, PROBE_POST, HEALTH, FUNNEL]);
     }
 
     #[test]
@@ -868,7 +905,7 @@ mod tests {
         assert!(gateway::is_deny_all(&paths));
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
         let calls = runner.calls();
-        assert!(calls.ends_with(&[START, PROBE, PROBE_POST].map(String::from)), "{calls:?}");
+        assert!(calls.ends_with(&[START, PROBE, PROBE_POST, FUNNEL].map(String::from)), "{calls:?}");
         assert_eq!(runner.count("systemd-run"), 0, "{calls:?}");
         assert_eq!(runner.count(&stop_timer(2_000)), 1, "{calls:?}");
         assert_eq!(lease::read(&paths, "bob"), Ok(None));
@@ -886,7 +923,7 @@ mod tests {
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.contains(REVOKE_FAILED) && error.contains("is active after the stop"), "{error}");
         // A failed revoke leaves the cut unproven: the gateway stops, with no check (owner decision D13).
-        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(1_000), &check_timer(1_000), STOP]);
+        assert_eq!(runner.calls(), [FIREWALL, RESTART, &stop_timer(1_000), &check_timer(1_000), STOP, FUNNEL]);
         assert_eq!(state(&paths), State::RevokeFailed);
 
         // The next run with no failure completes the revoke and starts the gateway.
@@ -923,7 +960,7 @@ mod tests {
         runner.on(&check_timer(2_000), hang());
         assert!(reconcile(&paths, &runner, &|| NOW).is_err());
         // No start, and the gateway that runs passes its check, so it stays.
-        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), CADDY_STATE, PROBE, PROBE_POST]);
+        assert_eq!(runner.calls(), [FIREWALL, &check_timer(2_000), CADDY_STATE, PROBE, PROBE_POST, FUNNEL]);
 
         // Step 3: the timer create hangs.
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
@@ -942,7 +979,7 @@ mod tests {
         // The gateway is stopped, and stopped again at the end (a failed revoke), so no check follows.
         assert_eq!(
             runner.calls(),
-            [FIREWALL, RESTART, STOP, &stop_timer(1_000), &check_timer(1_000), STOP]
+            [FIREWALL, RESTART, STOP, &stop_timer(1_000), &check_timer(1_000), STOP, FUNNEL]
         );
         assert_eq!(state(&paths), State::RevokeFailed);
 
@@ -950,7 +987,7 @@ mod tests {
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
         runner.on(START, hang());
         assert!(reconcile(&paths, &runner, &|| NOW).is_err());
-        assert_eq!(runner.calls(), [FIREWALL, START, STOP]);
+        assert_eq!(runner.calls(), [FIREWALL, START, STOP, FUNNEL]);
     }
 
     #[test]
@@ -1008,7 +1045,7 @@ mod tests {
             let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
             assert!(error.contains("the gateway was proven open earlier") && error.ends_with("the gateway is stopped"), "{error}");
             assert_eq!(runner.count(START), 0);
-            assert_eq!(runner.calls().last().map(String::as_str), Some(STOP));
+            assert!(runner.calls().ends_with(&[STOP, FUNNEL].map(String::from)), "{:?}", runner.calls());
         }
     }
 
@@ -1048,7 +1085,7 @@ mod tests {
             runner.on(PROBE, output(0, "200"));
             let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
             assert!(error.contains("answered 200") && error.contains("; the gateway is stopped; each reconcile run stops the gateway"), "{error}");
-            assert!(runner.calls().ends_with(&[CADDY_STATE, PROBE, STOP].map(String::from)), "{:?}", runner.calls());
+            assert!(runner.calls().ends_with(&[CADDY_STATE, PROBE, STOP, FUNNEL].map(String::from)), "{:?}", runner.calls());
             assert!(paths.gateway_open.exists());
             assert_eq!(runner.count(START), 0);
         }
@@ -1058,7 +1095,7 @@ mod tests {
             let (paths, runner) = failed_timer();
             runner.on(CADDY_STATE, output(0, state));
             assert!(reconcile(&paths, &runner, &|| NOW).unwrap_err().ends_with("the gateway was not started"));
-            assert_eq!(runner.calls().last().map(String::as_str), Some(CADDY_STATE));
+            assert!(runner.calls().ends_with(&[CADDY_STATE, FUNNEL].map(String::from)), "{:?}", runner.calls());
             assert_eq!(runner.count(STOP), 0);
             assert!(!paths.gateway_open.exists());
         }
@@ -1071,7 +1108,7 @@ mod tests {
         runner.on(PROBE, hang());
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.contains("failed: curl: no result after 10s") && error.ends_with("the gateway is stopped"), "{error}");
-        assert!(runner.calls().ends_with(&[CADDY_STATE, PROBE, STOP].map(String::from)), "{:?}", runner.calls());
+        assert!(runner.calls().ends_with(&[CADDY_STATE, PROBE, STOP, FUNNEL].map(String::from)), "{:?}", runner.calls());
         assert!(!paths.gateway_open.exists());
     }
 
@@ -1090,7 +1127,7 @@ mod tests {
         assert!(error.ends_with("THE GATEWAY STOP FAILED ALSO: `systemctl stop caddy`: exit code 1: "), "{error}");
         assert_eq!(runner.count(PROBE), 0, "{:?}", runner.calls());
         assert_eq!(runner.count(STOP), 2, "{:?}", runner.calls());
-        assert_eq!(runner.calls().last().map(String::as_str), Some(STOP));
+        assert!(runner.calls().ends_with(&[STOP, FUNNEL].map(String::from)), "{:?}", runner.calls());
         assert_eq!(state(&paths), State::RevokeFailed);
     }
 
@@ -1139,8 +1176,8 @@ mod tests {
         runner.on(PROBE, output(0, "200"));
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         let calls = runner.calls();
-        assert_eq!(calls[calls.len() - 2], STOP, "{calls:?}");
-        assert!(calls[calls.len() - 1].starts_with(&format!("curl -q -fsS -o /dev/null -m 8 --data-binary sparkpass: {error} ")), "{calls:?}");
+        assert_eq!(calls[calls.len() - 3], STOP, "{calls:?}");
+        assert!(calls[calls.len() - 2].starts_with(&format!("curl -q -fsS -o /dev/null -m 8 --data-binary sparkpass: {error} ")), "{calls:?}");
         assert_eq!(runner.count(STOP), 1);
     }
 
@@ -1190,7 +1227,7 @@ mod tests {
             let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
             let want = format!("the state of the gateway is unknown: `systemctl show -p ActiveState --value caddy` {text}; the gateway is stopped");
             assert!(error.ends_with(&want), "{error}");
-            assert!(runner.calls().ends_with(&[CADDY_STATE, STOP].map(String::from)), "{:?}", runner.calls());
+            assert!(runner.calls().ends_with(&[CADDY_STATE, STOP, FUNNEL].map(String::from)), "{:?}", runner.calls());
             assert_eq!(runner.count(PROBE), 0);
         }
     }
@@ -1283,7 +1320,7 @@ mod tests {
         runner.exit(&check_timer(5_000), 0);
         assert_eq!(reconcile(&paths, &runner, &|| NOW + 300), Ok(()));
         let calls = runner.calls();
-        assert!(calls.last().unwrap().contains("the gateway runs again during the lease of bob"), "{calls:?}");
+        assert!(calls[calls.len() - 2].contains("the gateway runs again during the lease of bob"), "{calls:?}");
     }
 
     // Added by the /ship review, pass 2 (2026-10-06, TODO batch 2).
@@ -1359,7 +1396,7 @@ mod tests {
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.contains("the gateway was proven open earlier") && error.ends_with("the gateway is stopped"), "{error}");
         assert_eq!(runner.count(PROBE), 0, "{:?}", runner.calls());
-        assert_eq!(runner.calls().last().map(String::as_str), Some(STOP));
+        assert!(runner.calls().ends_with(&[STOP, FUNNEL].map(String::from)), "{:?}", runner.calls());
     }
 
     // Added by the /ship review, pass 3 (2026-10-06, TODO batch 2).
@@ -1377,7 +1414,7 @@ mod tests {
             runner.on(command, answer);
             assert!(reconcile(&paths, &runner, &|| NOW).is_err());
             let calls = runner.calls();
-            assert!(calls.last().unwrap().starts_with(&format!("{NOTIFY_CALL}sparkpass: the gateway does not run during the lease of bob")), "{calls:?}");
+            assert!(calls[calls.len() - 2].starts_with(&format!("{NOTIFY_CALL}sparkpass: the gateway does not run during the lease of bob")), "{calls:?}");
             assert_eq!(fs::read_to_string(&paths.gateway_down).unwrap(), "bob\n");
         }
     }
@@ -1395,7 +1432,7 @@ mod tests {
             runner.exit(&create_timer(deadline), 1);
             let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
             assert_eq!(runner.count(PROBE), usize::from(!stops), "{deadline}: {:?}", runner.calls());
-            assert_eq!(runner.calls().last().map(String::as_str) == Some(STOP), stops, "{deadline}: {error}");
+            assert_eq!(runner.calls().ends_with(&[STOP, FUNNEL].map(String::from)), stops, "{deadline}: {error}");
             assert_eq!(state(&paths), State::Active);
         }
     }
@@ -1415,5 +1452,60 @@ mod tests {
         for key in ["Wants", "Requires", "BindsTo", "Upholds"] {
             assert!(!values(key).contains(&"tailscaled.service"), "{key}= starts tailscaled at each run:\n{unit}");
         }
+    }
+
+    // Added for the TODO item "Check the Funnel setup in reconcile and install.sh" (2026-10-13).
+    // Value: protects=a handler of tailscaled that a stop of Caddy does not close (for example Funnel straight to
+    // the model server) reaches the owner once for each config, and the run and its gateway stay; fails_when=the
+    // check goes, it sends a message on each run, it changes the result, or a failed read or a failed send
+    // writes the marker; why_new=no run read the serve config of tailscaled; seam=none
+    #[test]
+    fn serve_config_other_than_the_one_handler_sends_one_notification_for_each_config() {
+        let one_handler = r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"}},"AllowFunnel":{"spark.example.net:443":true}}"#;
+        let second = r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"TCPForward":"127.0.0.1:8000"}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#;
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+        // The one handler: no message, and the read comes after the run (after the lock).
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        assert_eq!(runner.calls(), [FIREWALL, START, PROBE, PROBE_POST, FUNNEL]);
+        // A second handler and a failed send: no marker, so the next run sends again.
+        runner.on(FUNNEL, output(0, second));
+        runner.exit(NOTIFY_CALL, 22);
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        assert!(!paths.funnel_mismatch.exists());
+        runner.on(NOTIFY_CALL, output(0, "200"));
+        let sent = |runner: &FakeRunner| -> Vec<String> { runner.calls().into_iter().filter(|call| call.starts_with(NOTIFY_CALL)).collect() };
+        let tail = |runner: &FakeRunner, n: usize| -> Vec<String> { runner.calls().split_off(runner.calls().len() - n) };
+        // The run succeeds, and its gateway starts with its proof: the check changes neither. The message after it.
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        let calls = tail(&runner, 5);
+        assert!(calls[..4] == [START, PROBE, PROBE_POST, FUNNEL] && calls[4].starts_with(NOTIFY_CALL), "{calls:?}");
+        // The same config again: no second message.
+        assert_eq!(reconcile(&paths, &runner, &|| NOW + 300), Ok(()));
+        assert_eq!(tail(&runner, 4), [START, PROBE, PROBE_POST, FUNNEL]);
+        // One failed send and one sent message.
+        assert_eq!(sent(&runner).len(), 2, "{:?}", runner.calls());
+        let text = sent(&runner).pop().unwrap();
+        assert!(text.contains(r#""8443":{"TCPForward":"127.0.0.1:8000"}"#) && text.contains("grant refuses"), "{text}");
+        assert_eq!(fs::read_to_string(&paths.funnel_mismatch).unwrap().trim(), serde_json::from_str::<serde_json::Value>(second).unwrap().to_string());
+        // Another config: one more message. A failed read: none, and the marker stays.
+        runner.on(FUNNEL, output(0, "{}"));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        assert_eq!(sent(&runner).len(), 3);
+        runner.on(FUNNEL, output(1, ""));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        assert_eq!(sent(&runner).len(), 3);
+        assert_eq!(fs::read_to_string(&paths.funnel_mismatch).unwrap(), "{}\n");
+        // The one handler again: the marker goes, with no message, so the next mismatch sends again.
+        runner.on(FUNNEL, output(0, one_handler));
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        assert!(!paths.funnel_mismatch.exists());
+        assert_eq!(sent(&runner).len(), 3);
+        // A failed run gets the check too, and its result stays.
+        runner.on(FUNNEL, output(0, second));
+        runner.exit(FIREWALL, 1);
+        let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
+        assert!(error.starts_with("the firewall rules did not load"), "{error}");
+        assert_eq!(sent(&runner).len(), 4);
     }
 }

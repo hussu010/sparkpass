@@ -5,6 +5,7 @@
 //!  1 validate inputs, no gateway-open marker, no lease, model health, gateway active;
 //!    a wrong token (GET and POST) to the public listener at GATEWAY_CHECK_ADDRESS gets no 401
 //!    ── fail ──▶ stop Caddy, exit non-zero (an answer other than 401 or 421: write gateway-open);
+//!    the serve config of tailscaled is not the one handler of the inbound route ──▶ exit non-zero;
 //!    firewall rules; a token file that is not deny-all (a key with no lease) ──▶ close the gateway;
 //!    end-timer call; then read the clock: deadline = now + TTL (main refuses a TTL shorter than steps 3 to 8, 60 s)
 //!  2 lease file (atomic write)          ── from here, each failure runs revoke
@@ -21,6 +22,7 @@
 //! ```
 
 use crate::config::{self, Paths, Settings};
+use crate::funnel;
 use crate::gateway;
 use crate::lease::{self, Lease, State};
 use crate::notify;
@@ -72,6 +74,9 @@ pub fn grant(paths: &Paths, runner: &dyn Runner, name: &str, ttl: u64, clock: &d
     // lease, and a Caddy that does not listen there (a SPARKPASS_BIND line in caddy.env) would give a pass that
     // works only until the next reconcile stops the gateway. A failed check stops the gateway, as in reconcile.
     check_gateway(paths, runner, &settings)?;
+    // A stop of Caddy does not close another handler of tailscaled (for example a Funnel handler straight to the
+    // model server): no pass while the serve config is not the one handler of the inbound route (src/funnel.rs).
+    funnel::check(runner, &settings.public_url)?;
     run_ok(runner, &[config::FIREWALL]).map_err(|e| format!("the firewall rules did not load: {e}"))?;
     // With no lease, the token file must be the deny-all rule. Other content is a key with no end (a lost
     // lease file) or a cut file: close it here, as the reconcile gate does, with a limit for each command.
@@ -87,7 +92,7 @@ pub fn grant(paths: &Paths, runner: &dyn Runner, name: &str, ttl: u64, clock: &d
     run_ok(runner, &[config::BINARY, "revoke", name, "--deadline", "0"]).map_err(|e| {
         format!("the end timer needs {}, and it does not accept the call of the end timer: {e}; install this build first", config::BINARY)
     })?;
-    // The clock after the lock and after the commands above (up to 7 commands, 70 seconds): neither shortens the TTL,
+    // The clock after the lock and after the commands above (up to 8 commands, 80 seconds): neither shortens the TTL,
     // and the end timer counts the TTL from here, also after a backward clock step.
     let now = clock();
     let deadline = now.checked_add(ttl).ok_or("the TTL is too large")?;
@@ -330,6 +335,8 @@ mod tests {
     const FIREWALL: &str = config::FIREWALL;
     const BINARY_CHECK: &str = "/usr/local/bin/sparkpass revoke bob --deadline 0";
     const CADDY_ACTIVE: &str = "systemctl is-active --quiet caddy";
+    /// The read of the serve config of tailscaled (src/funnel.rs), after the check of step 1.
+    const FUNNEL: &str = "tailscale serve status --json";
     /// The check of step 1 through GATEWAY_CHECK_ADDRESS (the reconcile check).
     const CHECK_GET: &str = "curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ::127.0.0.1: -H Authorization: Bearer 0000000000000000000000000000000000000000000000000000000000000000 https://spark.example.net/v1/models";
     const CHECK_POST: &str = "curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ::127.0.0.1: -H Authorization: Bearer 0000000000000000000000000000000000000000000000000000000000000000 -H Content-Type: application/json -d {} https://spark.example.net/v1/chat/completions";
@@ -457,7 +464,7 @@ mod tests {
         let self_check = format!("{SELF_CHECK}{token} {MODELS}");
         assert_eq!(
             runner.calls(),
-            [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, BINARY_CHECK, TIMER, CHECK_TIMER, RELOAD, &self_check, WRONG_GET, WRONG_POST]
+            [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL, FIREWALL, BINARY_CHECK, TIMER, CHECK_TIMER, RELOAD, &self_check, WRONG_GET, WRONG_POST]
         );
         let argv = runner.argv();
         let (key, wrong) = (format!("Authorization: Bearer {token}"), format!("Authorization: Bearer {WRONG_TOKEN}"));
@@ -471,7 +478,7 @@ mod tests {
             ]
         );
         assert_eq!(argv[0], ["curl", "-q", "--noproxy", "*", "-fsS", "-m", "8", "http://127.0.0.1:8000/v1/models"]);
-        assert_eq!(argv[5], [config::BINARY, "revoke", "bob", "--deadline", "0"]);
+        assert_eq!(argv[6], [config::BINARY, "revoke", "bob", "--deadline", "0"]);
         let lease = Lease { name: "bob".into(), start: NOW, deadline: END, state: State::Active };
         assert_eq!(lease::read(&paths, "bob"), Ok(Some(lease)));
         assert_eq!(files(&paths.history), [] as [&str; 0]);
@@ -973,7 +980,29 @@ mod tests {
             let (paths, runner) = host();
             runner.on(FIREWALL, firewall);
             assert_refused(&paths, &runner, &paths.snapshot());
-            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL]);
+            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL, FIREWALL]);
+        }
+    }
+
+    // Added for the TODO item "Check the Funnel setup in reconcile and install.sh" (2026-10-13).
+    // Value: protects=no pass while tailscaled serves a handler that a stop of Caddy does not close, or while its
+    // serve config cannot be read; fails_when=grant skips the check, or hands out the pass with another handler;
+    // why_new=grant checked the listener at the check address and the public route only; seam=none
+    #[test]
+    fn grant_refuses_when_the_serve_config_is_not_the_one_handler() {
+        let second = r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"TCPForward":"127.0.0.1:8000"}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#;
+        for (answer, cause) in [
+            (output(0, second), "the serve config of tailscaled is"),
+            (output(0, "{}"), "the serve config of tailscaled is"),
+            (output(1, ""), "cannot read the serve config"),
+            (Err(RunError::Timeout(Duration::from_secs(10))), "cannot read the serve config"),
+        ] {
+            let (paths, runner) = host();
+            runner.on(FUNNEL, answer);
+            assert_refused(&paths, &runner, &paths.snapshot());
+            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL]);
+            let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
+            assert!(error.starts_with(cause), "{error}");
         }
     }
 
@@ -984,7 +1013,7 @@ mod tests {
             let (paths, runner) = host();
             runner.on(BINARY_CHECK, check);
             assert_refused(&paths, &runner, &paths.snapshot());
-            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, BINARY_CHECK]);
+            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL, FIREWALL, BINARY_CHECK]);
             let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
             assert!(error.contains(config::BINARY) && error.contains("install this build first"), "{error}");
         }
@@ -1010,19 +1039,21 @@ mod tests {
         // The temporary file of the atomic write cannot be created. `read_all` ignores this name.
         fs::create_dir(paths.leases.join("bob.json.tmp")).unwrap();
         assert_refused(&paths, &runner, &paths.snapshot());
-        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, BINARY_CHECK]);
+        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL, FIREWALL, BINARY_CHECK]);
     }
 
     #[test]
     fn grant_reads_the_model_port_from_the_settings_file() {
         let (paths, runner) = host();
-        fs::write(&paths.config, "PUBLIC_URL=https://10.0.0.5:8443\nMODEL_PORT=9001\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n").unwrap();
+        fs::write(&paths.config, "PUBLIC_URL=https://spark2.tail1234.ts.net\nMODEL_PORT=9001\nGATEWAY_CHECK_ADDRESS=127.0.0.1\n").unwrap();
         runner.on("curl -q --noproxy * -fsS -m 8 http://127.0.0.1:9001/v1/models", output(0, r#"{"data":[{"id":"m2"}]}"#));
+        // The Funnel name of the serve config is the host of this PUBLIC_URL (src/funnel.rs).
+        runner.on(FUNNEL, output(0, r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"}},"AllowFunnel":{"spark2.tail1234.ts.net:443":true}}"#));
         let pass = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap();
-        assert!(pass.contains("Endpoint: https://10.0.0.5:8443/v1\n") && pass.contains("Model:    m2\n"), "{pass}");
+        assert!(pass.contains("Endpoint: https://spark2.tail1234.ts.net/v1\n") && pass.contains("Model:    m2\n"), "{pass}");
         let calls = runner.calls();
         let urls: Vec<_> = calls[calls.len() - 3..].iter().map(|call| call.rsplit(' ').next().unwrap()).collect();
-        assert_eq!(urls, ["https://10.0.0.5:8443/v1/models", "https://10.0.0.5:8443/v1/models", "https://10.0.0.5:8443/v1/chat/completions"]);
+        assert_eq!(urls, ["https://spark2.tail1234.ts.net/v1/models", "https://spark2.tail1234.ts.net/v1/models", "https://spark2.tail1234.ts.net/v1/chat/completions"]);
     }
 
     // Added by the /ship test coverage audit (2026-10-06).
@@ -1154,7 +1185,7 @@ mod tests {
             fs::write(&paths.token, &text).unwrap();
             grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap();
             let calls = runner.calls();
-            assert_eq!(calls[..7], [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, RESTART, BINARY_CHECK], "{text:?}");
+            assert_eq!(calls[..8], [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL, FIREWALL, RESTART, BINARY_CHECK], "{text:?}");
             assert!(gateway::is_rule_of(&paths, "bob"));
             assert_ne!(fs::read_to_string(&paths.token).unwrap(), text);
         }
@@ -1164,7 +1195,7 @@ mod tests {
         runner.exit(RESTART, 1);
         let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
         assert!(error.contains("the token file held a rule with no lease, and the close failed") && error.ends_with("the gateway is stopped"), "{error}");
-        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, RESTART, STOP_CADDY]);
+        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL, FIREWALL, RESTART, STOP_CADDY]);
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
     }
 
@@ -1174,7 +1205,7 @@ mod tests {
         let before = paths.snapshot();
         assert_eq!(grant(&paths, &runner, "bob", 60, &|| u64::MAX - 59), Err("the TTL is too large".into()));
         // The clock is read after the checks of step 1, and they write nothing.
-        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FIREWALL, BINARY_CHECK]);
+        assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL, FIREWALL, BINARY_CHECK]);
         assert_eq!(paths.snapshot(), before);
     }
 
