@@ -1,0 +1,29 @@
+# Head unit only (install.sh): starts the model on both units at each boot, with sparkrun as the owner.
+# install.sh writes @USER@, @HOME@ and @REPO@ (the user who runs `sudo ./install.sh`, and this repository).
+# The model did not start by itself after the power cut of 2026-10-14; this unit closes that gap.
+[Unit]
+Description=sparkpass model on both units (sparkrun run templates/pair.yaml)
+Wants=network-online.target
+# After reconcile: the firewall rules of this unit are loaded before the control ports of vLLM open.
+After=network-online.target docker.service pass-reconcile.service
+# The worker can boot later than this unit: each failed start tries again after 30 s, for up to 20 minutes.
+StartLimitIntervalSec=1200
+StartLimitBurst=20
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@USER@
+WorkingDirectory=@REPO@
+# SPARKRUN_MGMT_IFACE (README, "Set up the pair"): the control traffic of vLLM stays on the ConnectX-7 link.
+EnvironmentFile=-/etc/environment
+Environment=SPARKRUN_NO_TELEMETRY=1
+# A model that answers already is left alone (a start of this unit by hand, for example).
+ExecCondition=/bin/sh -c '! curl -sf -m 3 http://127.0.0.1:8000/health >/dev/null'
+ExecStart=@HOME@/.local/bin/sparkrun run templates/pair.yaml --cluster pair --no-follow
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
