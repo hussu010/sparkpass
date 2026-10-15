@@ -89,7 +89,7 @@ Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j
 
 **Effort:** L
 **Priority:** P2 (after milestone 1)
-**Depends on:** Milestone 1 proven on the units; an owner decision on the licence territories.
+**Depends on:** Milestone 1 proven on the units. The licence is not a blocker: owner decision of 2026-10-15, local use only for now.
 
 ## Setup
 
