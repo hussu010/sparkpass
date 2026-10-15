@@ -284,11 +284,17 @@ trap 'printf "expiry.sh: line %s: the command \"%s\" failed\n" "$LINENO" "$BASH_
 # The body goes to $TMP/body. -q first: root's ~/.curlrc cannot add --insecure, a proxy, or -L.
 # --noproxy: a proxy would skip --connect-to.
 status() {
-  local method=$1 path=$2 body=()
+  local method=$1 path=$2 body=() code
   shift 2
   if [[ $method == POST ]]; then body=(-H 'Content-Type: application/json' -d '{}'); fi
-  rm -f "$TMP/body"
-  curl -q --noproxy '*' -sS -o "$TMP/body" -w '%{http_code}' -m 10 "${VIA[@]}" "${body[@]}" "$@" "$PUBLIC_URL$path" || true
+  # Through the public route a slow relay of Funnel can give no answer within 10 s (000): up to 3 tries, as in
+  # grant step 8. An HTTP answer decides at once.
+  for _ in 1 2 3; do
+    rm -f "$TMP/body"
+    code=$(curl -q --noproxy '*' -sS -o "$TMP/body" -w '%{http_code}' -m 10 "${VIA[@]}" "${body[@]}" "$@" "$PUBLIC_URL$path" || true)
+    [[ $code == 000 && $VIA_PUBLIC == yes ]] || break
+  done
+  printf '%s' "$code"
 }
 
 # answers WANT WHO ROUTE...: true when each route answers WANT to WHO: "none" (no Authorization header),
