@@ -17,6 +17,8 @@ jobs:
       # gateway/Caddyfile with a real Caddy in Docker: the newest 2.x, and 2.6.2 (the Ubuntu 24.04 package).
       - run: bash tests/gateway.sh
       - run: CADDY_IMAGE=caddy:2.6.2 bash tests/gateway.sh
+      # firewall/rules.sh with a real iptables in a privileged container.
+      - run: bash tests/firewall.sh
 
   # The deployable binary comes only from a push to main, never from a pull request. Only this job gets
   # the permissions of the build attestation.

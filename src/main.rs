@@ -242,20 +242,20 @@ mod tests {
         for name in ["", "Bob", "1bob", "-bob", "bob_1", "bob.json", "../bob", "bob smith", "bób", &long] {
             bad.push((name, "5m", 1_000));
         }
-        // "59s": shorter than the steps that hand out the pass. "1m" is the shortest TTL.
-        for ttl in ["", "5", "m", "0m", "-5m", "+5m", "5x", "5M", "1.5h", "99999999999999999999d", "18446744073709551615m", "1s", "59s"] {
+        // "119s": shorter than the steps that hand out the pass. "2m" is the shortest TTL.
+        for ttl in ["", "5", "m", "0m", "-5m", "+5m", "5x", "5M", "1.5h", "99999999999999999999d", "18446744073709551615m", "1s", "1m", "119s"] {
             bad.push(("bob", ttl, 1_000));
         }
         // The end time does not fit.
-        bad.push(("bob", "1m", u64::MAX - 59));
+        bad.push(("bob", "2m", u64::MAX - 119));
         for (name, ttl, now) in bad {
             let result = run(&["grant", name, "--ttl", ttl], &paths, &runner, &|| now);
             assert!(matches!(result, Err((2, _))), "{name:?} {ttl:?}: {result:?}");
             assert_eq!(runner.calls(), [] as [&str; 0]);
             assert_eq!(paths.snapshot(), before);
         }
-        // "1m" is the shortest TTL: it is accepted.
-        assert!(run(&["grant", "bob", "--ttl", "1m"], &paths, &runner, &|| 1_000).is_ok());
+        // "2m" is the shortest TTL: it is accepted.
+        assert!(run(&["grant", "bob", "--ttl", "2m"], &paths, &runner, &|| 1_000).is_ok());
     }
 
     #[test]

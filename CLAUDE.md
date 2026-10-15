@@ -15,7 +15,7 @@ RUN rustup component add clippy
 EOF
 ```
 
-Five checks, the same as `.github/workflows/ci.yml`. Run all five before a push.
+Five checks, the same as `.github/workflows/ci.yml`, and the firewall test. Run all six before a push.
 
 Unit tests:
 
@@ -47,6 +47,13 @@ Gateway, with a real Caddy in Docker (the images `caddy:2` and `caddy:2.6.2`, th
 bash tests/gateway.sh && CADDY_IMAGE=caddy:2.6.2 bash tests/gateway.sh
 ```
 
+Firewall, with a real iptables in a privileged Docker container (network namespaces stand in for the
+interfaces of a unit). `FIREWALL_TEST_IMAGE=<image>` skips the package install when that image has the packages:
+
+```bash
+bash tests/firewall.sh
+```
+
 Rules for tests:
 
 - Unit tests live in `#[cfg(test)]` modules next to the code. They use the `FakeRunner`
@@ -60,6 +67,9 @@ Rules for tests:
   (the Caddyfile, the token rule, the route allowlist, the admin socket, the Host check, and the
   access log filter); its systemd unit (RuntimeDirectory, the reload as the caddy user), the
   certificate from tailscaled, and the inbound path (Tailscale Funnel) are proven only on the units.
+- `firewall/rules.sh` is tested in Docker by `tests/firewall.sh` (each path by interface, the order of the
+  jumps, a second load, the nodivert and Docker checks). tailscaled, the chains of the real Docker, the
+  real interfaces and the UDP services (DHCP, mDNS, WireGuard) are proven only on the units.
 - `install.sh` and `tests/expiry.sh` change the host. Never run them here; they run on the head unit.
 - The token rule format lives in `gateway::rule` in `src/gateway.rs`, the guard in `gateway/Caddyfile`,
   `lease_rule` and `deny_all` in `tests/gateway.sh`, and the deny-all text in `install.sh` and

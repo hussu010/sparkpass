@@ -7,7 +7,7 @@
 //!    ── fail ──▶ stop Caddy, exit non-zero (an answer other than 401 or 421: write gateway-open);
 //!    the serve config of tailscaled is not the one handler of the inbound route ──▶ exit non-zero;
 //!    firewall rules; a token file that is not deny-all (a key with no lease) ──▶ close the gateway;
-//!    end-timer call; then read the clock: deadline = now + TTL (main refuses a TTL shorter than steps 3 to 8, 60 s)
+//!    end-timer call; then read the clock: deadline = now + TTL (main refuses a TTL shorter than steps 3 to 8, 120 s)
 //!  2 lease file (atomic write)          ── from here, each failure runs revoke
 //!  3 end timer for the deadline
 //!  4 token (not active)
@@ -36,10 +36,16 @@ use std::io::{self, Write};
 /// so that curl reports its own error before the runner kills it.
 pub const CURL_LIMIT: &str = "8";
 
-/// The longest time of steps 3 to 8: six commands (systemd-run, the timer check, the reload, and the three
-/// self-check requests), each with the command limit of main.rs. main refuses a shorter TTL, so that a key
-/// never goes live after its end time.
-pub const HAND_OUT_TIME: u64 = 6 * crate::COMMAND_LIMIT.as_secs();
+/// Step 8: each request through the public route runs up to this many times while curl gets no HTTP answer.
+/// On a slow line a relay of Funnel can take longer than CURL_LIMIT (spark-3, 2026-10-15: 1.5 to 7.5 s, some
+/// over 8 s). No answer proves nothing either way: each HTTP answer decides at once, and a failure of the
+/// last try still stops the gateway.
+const PUBLIC_TRIES: u64 = 3;
+
+/// The longest time of steps 3 to 8: three commands (systemd-run, the timer check, the reload) and the three
+/// self-check requests with all their tries, each with the command limit of main.rs. main refuses a shorter
+/// TTL, so that a key never goes live after its end time.
+pub const HAND_OUT_TIME: u64 = (3 + 3 * PUBLIC_TRIES) * crate::COMMAND_LIMIT.as_secs();
 
 /// A token that no grant ever hands out: `new_token` gives 64 random hex characters.
 const WRONG_TOKEN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -159,7 +165,7 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     // proven answer other than 401 to a wrong token at GATEWAY_CHECK_ADDRESS: that writes the gateway-open
     // marker (below).
     let models = format!("{}/v1/models", settings.public_url);
-    match status(runner, &["-H", &format!("Authorization: Bearer {token}")], &models) {
+    match status_tries(PUBLIC_TRIES, runner, &["-H", &format!("Authorization: Bearer {token}")], &models) {
         Ok(code) if code == "200" => {}
         Ok(code) => return Err(format!(
             "the self-check through {models} failed: the gateway answered {code}, and it must answer 200; {}",
@@ -170,7 +176,7 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     // The same requests with a wrong token must get 401, also on the route of the model. A gateway that
     // does not import the token file, or a rule that checks only that a header exists, passes the
     // request above for everyone, and only these requests show it.
-    match wrong_token_answer(runner, &[], &settings.public_url) {
+    match wrong_token_answer(PUBLIC_TRIES, runner, &[], &settings.public_url) {
         None => {}
         // An answer other than 401 through the public route is no proof by itself: the route can end at
         // another listener, for example tailscaled when Funnel runs in HTTPS mode, not TCP (a setup error; the
@@ -222,7 +228,8 @@ struct Notified(bool);
 fn check(paths: &Paths, runner: &dyn Runner, settings: &Settings) -> Result<(), (String, Notified)> {
     // Always 127.0.0.1 (config::CHECK_ADDRESS), so no IPv6 brackets.
     let address = settings.gateway_check_address;
-    match wrong_token_answer(runner, &["--connect-to", &format!("::{address}:")], &settings.public_url) {
+    // One try: this check runs under the lock in reconcile, and 127.0.0.1 has no relay.
+    match wrong_token_answer(1, runner, &["--connect-to", &format!("::{address}:")], &settings.public_url) {
         None => Ok(()),
         // Caddy answers 421 (strict_sni_host) before the site block when the Host header is not the TLS name,
         // for example for a PUBLIC_URL host with a trailing dot (TODO item "Review follow-ups of the Funnel
@@ -267,17 +274,29 @@ fn other_listener(url: &str, code: &str) -> String {
 /// with a wrong token and with `extra` first. The URL and the answer of the first request that did not
 /// get 401, or `None` when both got 401. Grant and reconcile send the same requests: after each start,
 /// reconcile stops again a gateway that grant stopped (when both reach the same listener).
-fn wrong_token_answer(runner: &dyn Runner, extra: &[&str], public_url: &str) -> Option<(String, Result<String, String>)> {
+fn wrong_token_answer(tries: u64, runner: &dyn Runner, extra: &[&str], public_url: &str) -> Option<(String, Result<String, String>)> {
     let wrong = format!("Authorization: Bearer {WRONG_TOKEN}");
     let post = ["-H", &wrong, "-H", "Content-Type: application/json", "-d", "{}"];
     for (args, route) in [(&post[..2], "models"), (&post[..], "chat/completions")] {
         let url = format!("{public_url}/v1/{route}");
-        match status(runner, &[extra, args].concat(), &url) {
+        match status_tries(tries, runner, &[extra, args].concat(), &url) {
             Ok(code) if code == "401" => {}
             answer => return Some((url, answer)),
         }
     }
     None
+}
+
+/// [`status`], run again after each curl failure (no HTTP answer), at most `tries` times in all.
+fn status_tries(tries: u64, runner: &dyn Runner, args: &[&str], url: &str) -> Result<String, String> {
+    let mut answer = status(runner, args, url);
+    for _ in 1..tries {
+        if answer.is_ok() {
+            break;
+        }
+        answer = status(runner, args, url);
+    }
+    answer
 }
 
 /// Step 8 and the reconcile check: the HTTP status of one request through curl, with `args` before the
@@ -498,6 +517,8 @@ mod tests {
             (Err(RunError::Spawn("No such file or directory".into())), "curl: the command did not start"),
         ] {
             let (paths, runner) = host();
+            // An HTTP answer decides at once; a curl failure (no answer) runs PUBLIC_TRIES times.
+            let tries = if matches!(check, Ok(Output { code: Some(0), .. })) { 1 } else { 3 };
             // Also the rule of the wrong-key requests, but they must not run.
             runner.on(SELF_CHECK, check);
             let result = grant(&paths, &runner, "bob", TTL, &|| NOW);
@@ -510,7 +531,7 @@ mod tests {
             assert!(error.contains(&format!("the self-check through {MODELS} failed: {text}")), "{error}");
             // No argv and no stderr of curl in the error.
             assert!(!error.contains(token) && !error.contains("Failed to connect"), "{error}");
-            assert_eq!(runner.count(SELF_CHECK), 1);
+            assert_eq!(runner.count(SELF_CHECK), tries);
             // No proof that the gateway refuses a wrong token: it stops before the revoke.
             assert_eq!(runner.count(STOP_CADDY), 1);
             // Extended by the /ship test coverage audit (2026-10-06, TODO batch 2): no marker.
@@ -526,7 +547,8 @@ mod tests {
     // close a gateway that ignores the token file: grant stops the gateway, then revokes.
     #[test]
     fn self_check_with_a_wrong_token_fails_when_curl_fails() {
-        for (request, url, runs) in [(WRONG_GET, MODELS, 2), (WRONG_POST, CHAT, 3)] {
+        // The failed request runs PUBLIC_TRIES (3) times.
+        for (request, url, runs) in [(WRONG_GET, MODELS, 4), (WRONG_POST, CHAT, 5)] {
             for (check, text) in [
                 (output(7, "000"), "curl exit code 7"),
                 (output(28, "000"), "curl exit code 28"),
@@ -548,6 +570,37 @@ mod tests {
                 assert!(!paths.gateway_open.exists(), "{error}");
                 assert_revoked(&paths, &runner, result);
             }
+        }
+    }
+
+    // Value: protects=a request through the public route that gets no answer in time runs again, so one slow relay
+    // of Funnel does not fail the grant; fails_when=PUBLIC_TRIES is 1, or status_tries stops after the first failure;
+    // why_new=grant failed about 1 time in 3 on the slow line of spark-3 (2026-10-15, curl exit code 28); seam=none
+    #[test]
+    fn self_check_runs_again_after_no_answer() {
+        for request in [SELF_CHECK, WRONG_GET, WRONG_POST] {
+            let (paths, runner) = (Paths::temp(), Arc::new(FakeRunner::healthy()));
+            runner.on(request, output(28, "000"));
+            // Two failed tries, then the rules of a healthy gateway again.
+            let seen = std::sync::atomic::AtomicUsize::new(0);
+            runner.hook({
+                // Weak: the hook lives in the runner.
+                let runner = Arc::downgrade(&runner);
+                move |argv| {
+                    if argv.join(" ").starts_with(request)
+                        && seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2
+                        && let Some(runner) = runner.upgrade()
+                    {
+                        runner.on(SELF_CHECK, output(0, "200"));
+                        runner.on(WRONG_GET, output(0, "401"));
+                        runner.on(WRONG_POST, output(0, "401"));
+                    }
+                }
+            });
+            assert!(grant(&paths, &*runner, "bob", TTL, &|| NOW).is_ok(), "{request}");
+            assert_eq!(runner.count(STOP_CADDY), 0, "{request}");
+            // The three requests, and two more tries of the one with no answer.
+            assert_eq!(runner.count(SELF_CHECK), 5, "{request}");
         }
     }
 

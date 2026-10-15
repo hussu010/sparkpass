@@ -63,7 +63,7 @@ Options:
                       header timeout of the gateway: about 5 minutes. With --via-public, that
                       request is silent for 300 s on a relay of Funnel, so it also proves that
                       the relay keeps a silent connection open (a long prefill).
-  --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m; at least 60s, and
+  --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m; at least 120s, and
                       at least 180s with --via-public).
   --via-public        send each request through PUBLIC_URL: public DNS and a relay of
                       Tailscale Funnel (the inbound-path run of the Success Criteria). It
@@ -79,7 +79,8 @@ Options:
   -h, --help          print this text and the manual procedures.
 
 Environment:
-  EXPIRY_MAX_TOKENS   max_tokens of the stream to the real model (default 32768). The
+  EXPIRY_MAX_TOKENS   max_tokens of the stream to the real model (default 131072: the pinned
+                      Qwen ended 32768 tokens before a 5-minute end time). The
                       stream also sends "ignore_eos": true (vLLM, SGLang). The stream must
                       run past the end time: if the context limit refuses the request,
                       set a lower value.
@@ -167,10 +168,10 @@ TTL_S=$((10#${BASH_REMATCH[1]}))
 if [[ ${BASH_REMATCH[2]} == m ]]; then TTL_S=$((TTL_S * 60)); fi
 # Through a relay of Funnel each request takes a few round trips, and step 2 sends 58 requests before the
 # end time (owner decision D9 of the /ship review, 2026-10-07).
-MIN_TTL=60
+MIN_TTL=120
 if [[ $VIA_PUBLIC == yes ]]; then MIN_TTL=180; fi
 ((TTL_S >= MIN_TTL)) || usage_error "--ttl must be at least ${MIN_TTL}s$([[ $VIA_PUBLIC == yes ]] && echo ' with --via-public')"
-MAX_TOKENS=${EXPIRY_MAX_TOKENS:-32768}
+MAX_TOKENS=${EXPIRY_MAX_TOKENS:-131072}
 [[ $MAX_TOKENS =~ ^[1-9][0-9]{0,6}$ ]] || usage_error "EXPIRY_MAX_TOKENS must be a positive number"
 
 end_timers() { systemctl list-timers --all --no-legend 'sparkpass-end-*' 2>/dev/null || true; }
@@ -283,11 +284,17 @@ trap 'printf "expiry.sh: line %s: the command \"%s\" failed\n" "$LINENO" "$BASH_
 # The body goes to $TMP/body. -q first: root's ~/.curlrc cannot add --insecure, a proxy, or -L.
 # --noproxy: a proxy would skip --connect-to.
 status() {
-  local method=$1 path=$2 body=()
+  local method=$1 path=$2 body=() code
   shift 2
   if [[ $method == POST ]]; then body=(-H 'Content-Type: application/json' -d '{}'); fi
-  rm -f "$TMP/body"
-  curl -q --noproxy '*' -sS -o "$TMP/body" -w '%{http_code}' -m 10 "${VIA[@]}" "${body[@]}" "$@" "$PUBLIC_URL$path" || true
+  # Through the public route a slow relay of Funnel can give no answer within 10 s (000): up to 3 tries, as in
+  # grant step 8. An HTTP answer decides at once.
+  for _ in 1 2 3; do
+    rm -f "$TMP/body"
+    code=$(curl -q --noproxy '*' -sS -o "$TMP/body" -w '%{http_code}' -m 10 "${VIA[@]}" "${body[@]}" "$@" "$PUBLIC_URL$path" || true)
+    [[ $code == 000 && $VIA_PUBLIC == yes ]] || break
+  done
+  printf '%s' "$code"
 }
 
 # answers WANT WHO ROUTE...: true when each route answers WANT to WHO: "none" (no Authorization header),
