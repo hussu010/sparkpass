@@ -172,5 +172,8 @@ mod tests {
         let install = include_str!("../install.sh");
         assert!(install.contains("tailscale funnel --bg --tcp=443 tcp://127.0.0.1:443\n"));
         assert!(install.contains(r#"'"TCPForward": *"127\.0\.0\.1:443"'"#));
+        let setup = include_str!("../setup.sh");
+        assert!(setup.contains("tailscale funnel --bg --tcp=443 tcp://127.0.0.1:443\n"));
+        assert!(setup.contains(r#"'"TCPForward": *"127\.0\.0\.1:443"'"#));
     }
 }
