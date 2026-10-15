@@ -97,6 +97,8 @@ Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j
 
 ### One setup command for other owners
 
+**Status (2026-10-15):** done: `setup.sh` (owner decision D15). Proven only by a second run on spark-3 and spark-4, where each step found its work done. A first run on a fresh pair is not proven.
+
 **What:** A `setup.sh` on the head unit that runs the steps of "Set up the pair" in README.md in order: the sparkrun install and its setup commands (SSH between the units, the Docker group, earlyoom), linger on both units, `sparkrun run templates/pair.yaml`, `install.sh`, and the Funnel procedure that install.sh prints. It cannot change the tailnet, so it checks the three admin settings from the unit with no API token and stops with the console link when one is missing: `tailscale status --json` shows the certificate name in `CertDomains` (HTTPS on), `funnel` in `Self.CapMap` (the node attribute), and no `KeyExpiry` in `Self` (key expiry off; checked on spark-3, 2026-10-14). It also stops when `/proc/cmdline` of a 7.0 kernel has no `kho=off`, and it names the licence clause before it starts the model.
 
 **Why:** The first setup on spark-3 and spark-4 (2026-10-14) took about 15 separate steps: three admin settings, five sparkrun and host commands on two units, the self-SSH of the head, and checks of the kernel and the licence. An owner without that history gets stuck on them.

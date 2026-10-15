@@ -5,10 +5,15 @@ ends at a fixed time. The design, with the reason for each safety rule, is in `d
 
 ## Set up the pair
 
-These are the commands of the first setup (spark-3 head, spark-4 worker, 2026-10-14). Steps 1 to 3 ran on
-the units. The later steps (the firewall, `install.sh` and its Funnel procedure, `tests/expiry.sh`) are not
-proven on the units yet; see TODOS.md. A one-command `setup.sh` comes after that
-(TODOS.md, "One setup command for other owners").
+These are the commands of the first setup (spark-3 head, spark-4 worker, 2026-10-14). After "Before you
+start" and step 1, one command on the head unit, as your user, runs steps 2 to 5 and ends with checks:
+
+```bash
+git clone https://github.com/hussu010/sparkpass && cd sparkpass
+./setup.sh <worker-cx7>        # for example 10.100.0.2; run it again at any time: it skips what is done
+```
+
+It prints the editor and guest URLs at the end. The steps below are what it does, and why.
 
 Before you start:
 

@@ -36,7 +36,7 @@ The goal of the build is learning and fun, not revenue.
 
 ## Premises
 
-1. Own pair only. No installer for other owners in this build.
+1. Own pair first. `setup.sh` runs the setup steps of README.md on a new pair (owner decision D15, 2026-10-15).
 2. One system timer forces the end of each slot. It removes the API key, closes open connections, stops the guest workspace, and erases the data. The timer exists before the guest gets any credential. No custom daemon, no database, no web page. (Revised after the cross-model challenge. Simplified again after the spec review: there is no SSH certificate authority. The guest's public key exists only inside the workspace of that lease, so it stops when the workspace stops.)
 3. The guest gets an API key and an SSH login into a separate workspace container: non-root, no GPU, no Docker socket, no host network, no path to the model server port or the cluster control ports. The only host mount is the home image of that lease. The guest uses the model only through the gateway.
 4. One template first. A template is one file: the model, its recipe, and its settings.
