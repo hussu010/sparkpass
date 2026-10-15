@@ -77,19 +77,19 @@ Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j
 **Priority:** P1 (before the first guest)
 **Depends on:** nothing more (the ports and bind addresses were listed on 2026-10-15).
 
-## Video mode
+## Models
 
-### MiniMax H3 as a second model
+### Model profiles and one command
 
-**What:** The owner switches the pair between the text model (Qwen) and MiniMax H3 (text, image, video or audio in; a 4–15 s 768p video with stereo audio out). One model runs at a time. Parts: a recipe for H3 (public: joeynyc/MiniMax-H3-DGX-Spark for one unit; joeynyc/MiniMax-H3-2x-DGX-Spark for two, experimental, with a patched vLLM-Omni and Ray), a switch command, the video routes in the three route lists (`@sparkpass_route` in gateway/Caddyfile, `pass_text` in src/grant.rs, `allowed` in tests/gateway.sh), the response size and time limits of the gateway for a video, a load test for video, and the pass text.
+**What:** `sparkpass model use <model>`: find a tested recipe (the sparkrun registries or templates/), check the memory (`sparkrun recipe vram`), refuse while a lease is active, stop the old model, start the new one, select the API profile of its task type, write the route list of the gateway from that profile and reload Caddy, run the smoke test of the profile, and give the pass text the routes of the profile. A model with no tested recipe: stop with a message, not a guess. One profile for each task type (text now; image, video and audio later): the allowed routes, the body and time limits, the smoke test, and the clean-up at the end of a lease. The route lists in gateway/Caddyfile, src/grant.rs and tests/gateway.sh come from the profile. A route that shares state between guests stays closed or gets a clean-up: in the vLLM-Omni video API, `GET /v1/videos` lists every stored job and `GET /v1/videos/{id}/content` downloads any of them, so the video profile blocks the list and deletes the stored jobs at each revoke (as the text profile blocks LoRA loading, D14). One model runs at a time. The first non-text profile is video, with MiniMax H3; sparkrun 0.3.10 has no vLLM-Omni runtime and no image or video recipe, so the first video model also adds that runtime one time.
 
-**Why:** Owner requirement of 2026-10-15 ("we need video mode"; both models together are not needed).
+**Why:** Owner requirement of 2026-10-15: text, image and video models, one at a time, with one command and no code for each model. Owner decision D12: design it after Phase 3 (tests/expiry.sh) passes on the units.
 
-**Context:** Public numbers, not measured here: 33B video transformer plus a Qwen3-VL-32B encoder, about 135 GiB on disk; one unit loads 89 GiB, is ready in about 9 minutes and gives a clip in 80–111 s; two units, 31–47 s. With Qwen loaded, each unit has 12–15 GB free, so H3 replaces Qwen. Licence (MiniMax H3 Community License): it excludes the EU, the UK, South Korea and the US, also for the display of outputs there; decide how a pass handles guests from those places before the first video guest. The Ray ports of the two-unit recipe are on the host network; firewall/rules.sh covers them by interface.
+**Context:** vLLM and vLLM-Omni give each task type a fixed set of OpenAI-style routes (text: /v1/chat/completions, /v1/completions, /v1/models; image: /v1/images/generations, /v1/images/edits; video: /v1/videos jobs and /v1/videos/sync; audio: /v1/audio/speech, /v1/audio/generate), so the routes follow the type, not the model. A model still needs its own recipe: on a DGX Spark many models need a specific image, quantization or patch (Qwen needed the shard-35 prefetch and the management interface; H3 needs a patched vLLM-Omni). MiniMax H3, public numbers, not measured here: a 33B video transformer plus a Qwen3-VL-32B encoder, about 135 GiB on disk; one unit loads 89 GiB, is ready in about 9 minutes and gives a 4–15 s 768p clip with stereo audio in 80–111 s; two units (joeynyc/MiniMax-H3-2x-DGX-Spark, experimental, Ray) 31–47 s. With Qwen loaded, each unit has 12–15 GB free, so H3 replaces Qwen. The Ray ports of the two-unit recipe are on the host network; firewall/rules.sh covers them by interface. The H3 licence excludes the EU, the UK, South Korea and the US; owner decision of 2026-10-15: local use only for now, so it is not a blocker.
 
 **Effort:** L
 **Priority:** P2 (after milestone 1)
-**Depends on:** Milestone 1 proven on the units. The licence is not a blocker: owner decision of 2026-10-15, local use only for now.
+**Depends on:** Phase 3 passes on the units (tests/expiry.sh).
 
 ## Setup
 
