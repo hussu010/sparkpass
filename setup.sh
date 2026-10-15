@@ -166,8 +166,9 @@ allow_patterns=['$shard', 'model.safetensors.index.json'])\""
 done
 health() { curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$port/health" || true; }
 if [[ $(health) != 200 ]]; then
-	# The first run downloads the image and the model (about 140 GB), then copies them to the worker.
-	(cd "$repo" && sparkrun run templates/pair.yaml --cluster pair --no-follow)
+	# Old containers of a failed start hold GPU memory (systemd/sparkpass-model.service). The first run downloads
+	# the image and the model (about 140 GB), then copies them to the worker.
+	(cd "$repo" && { sparkrun stop --all --cluster pair || true; } && sparkrun run templates/pair.yaml --cluster pair --no-follow)
 	for _ in $(seq 1 90); do
 		[[ $(health) == 200 ]] && break
 		sleep 10
