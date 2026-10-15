@@ -1222,7 +1222,7 @@ flock
    ── fail ──▶ stop Caddy, exit non-zero (an answer other than 401 or 421: write gateway-open);
    free space (D11), firewall rules; a token file that is not deny-all (a key with no lease)
    ──▶ close the gateway; end-timer call;
-   then read the clock: deadline = now + TTL (main refuses a TTL shorter than steps 3 to 8, 60 s)
+   then read the clock: deadline = now + TTL (main refuses a TTL shorter than steps 3 to 8, 120 s; step 8 runs each public request up to 3 times while curl gets no answer)
  2 lease file (atomic write)          ── from here, each failure runs revoke
  3 end timer for the deadline
  4 token (not active)

@@ -63,7 +63,7 @@ Options:
                       header timeout of the gateway: about 5 minutes. With --via-public, that
                       request is silent for 300 s on a relay of Funnel, so it also proves that
                       the relay keeps a silent connection open (a long prefill).
-  --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m; at least 60s, and
+  --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m; at least 120s, and
                       at least 180s with --via-public).
   --via-public        send each request through PUBLIC_URL: public DNS and a relay of
                       Tailscale Funnel (the inbound-path run of the Success Criteria). It
@@ -168,7 +168,7 @@ TTL_S=$((10#${BASH_REMATCH[1]}))
 if [[ ${BASH_REMATCH[2]} == m ]]; then TTL_S=$((TTL_S * 60)); fi
 # Through a relay of Funnel each request takes a few round trips, and step 2 sends 58 requests before the
 # end time (owner decision D9 of the /ship review, 2026-10-07).
-MIN_TTL=60
+MIN_TTL=120
 if [[ $VIA_PUBLIC == yes ]]; then MIN_TTL=180; fi
 ((TTL_S >= MIN_TTL)) || usage_error "--ttl must be at least ${MIN_TTL}s$([[ $VIA_PUBLIC == yes ]] && echo ' with --via-public')"
 MAX_TOKENS=${EXPIRY_MAX_TOKENS:-131072}
