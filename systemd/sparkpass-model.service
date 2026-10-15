@@ -6,7 +6,8 @@ Description=sparkpass model on both units (sparkrun run templates/pair.yaml)
 Wants=network-online.target
 # After reconcile: the firewall rules of this unit are loaded before the control ports of vLLM open.
 After=network-online.target docker.service pass-reconcile.service
-# The worker can boot later than this unit: each failed start tries again after 30 s, for up to 20 minutes.
+# The worker can boot later than this unit, and an engine can fail after the launch: each failed start tries
+# again after 30 s.
 StartLimitIntervalSec=1200
 StartLimitBurst=20
 
@@ -20,10 +21,15 @@ EnvironmentFile=-/etc/environment
 Environment=SPARKRUN_NO_TELEMETRY=1
 # A model that answers already is left alone (a start of this unit by hand, for example).
 ExecCondition=/bin/sh -c '! curl -sf -m 3 http://127.0.0.1:8000/health >/dev/null'
+# A reboot of the head alone leaves the old worker container on the other unit, with its GPU memory, and the
+# new engine then fails (spark-3, 2026-10-15). The model does not answer here, so no container is in use.
+ExecStartPre=-@HOME@/.local/bin/sparkrun stop --all --cluster pair
 ExecStart=@HOME@/.local/bin/sparkrun run templates/pair.yaml --cluster pair --no-follow
+# sparkrun returns after the launch; a start counts only when the model answers (about 3 minutes after it).
+ExecStartPost=/usr/bin/timeout 720 /bin/sh -c 'until curl -sf -m 3 http://127.0.0.1:8000/health >/dev/null; do sleep 10; done'
 Restart=on-failure
 RestartSec=30
-TimeoutStartSec=600
+TimeoutStartSec=1000
 
 [Install]
 WantedBy=multi-user.target
