@@ -79,7 +79,8 @@ Options:
   -h, --help          print this text and the manual procedures.
 
 Environment:
-  EXPIRY_MAX_TOKENS   max_tokens of the stream to the real model (default 32768). The
+  EXPIRY_MAX_TOKENS   max_tokens of the stream to the real model (default 131072: the pinned
+                      Qwen ended 32768 tokens before a 5-minute end time). The
                       stream also sends "ignore_eos": true (vLLM, SGLang). The stream must
                       run past the end time: if the context limit refuses the request,
                       set a lower value.
@@ -170,7 +171,7 @@ if [[ ${BASH_REMATCH[2]} == m ]]; then TTL_S=$((TTL_S * 60)); fi
 MIN_TTL=60
 if [[ $VIA_PUBLIC == yes ]]; then MIN_TTL=180; fi
 ((TTL_S >= MIN_TTL)) || usage_error "--ttl must be at least ${MIN_TTL}s$([[ $VIA_PUBLIC == yes ]] && echo ' with --via-public')"
-MAX_TOKENS=${EXPIRY_MAX_TOKENS:-32768}
+MAX_TOKENS=${EXPIRY_MAX_TOKENS:-131072}
 [[ $MAX_TOKENS =~ ^[1-9][0-9]{0,6}$ ]] || usage_error "EXPIRY_MAX_TOKENS must be a positive number"
 
 end_timers() { systemctl list-timers --all --no-legend 'sparkpass-end-*' 2>/dev/null || true; }
