@@ -94,4 +94,19 @@ Before you start:
    5 minutes.
 
 5. The gateway: `sudo ./install.sh` on the head unit, then the steps that it prints (the Tailscale Funnel
-   procedure and the settings files).
+   procedure and the settings files). It also installs `sparkpass-model.service`, which starts the model at
+   each boot (run it with `sudo` as the user of sparkrun).
+
+## Use the model from your own editor
+
+Point the editor's OpenAI-compatible provider at `http://localhost:8000/v1`, model `qwen3.8-flash-next`, no
+key (streaming, tool calls and `/v1/completions` work). The port comes from SSH to the head unit over the
+tailnet, not through Funnel, and it uses no guest pass:
+
+```bash
+ssh -N -o ServerAliveInterval=30 -L 127.0.0.1:8000:127.0.0.1:8000 <head unit>
+```
+
+On macOS, a LaunchAgent keeps it up (`~/Library/LaunchAgents/com.sparkpass.tunnel.plist` on the first
+setup: that command with `RunAtLoad` and `KeepAlive`). Guests use `https://<name>/v1` with the key of
+`sparkpass grant`.

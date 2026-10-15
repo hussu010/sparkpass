@@ -84,6 +84,7 @@ tests/firewall.sh               firewall/rules.sh with a real iptables in Docker
 systemd/pass-reconcile.service  oneshot: runs at boot and from the retry timer
 systemd/pass-reconcile.timer    every 5 minutes: retry of failed or overdue revokes
 systemd/sparkpass-firewall.service  second unit only: loads the firewall rules at each boot
+systemd/sparkpass-model.service     head unit: starts the model on both units at each boot (sparkrun, as the owner)
 tests/expiry.sh                 forced-end, deny-all, and re-grant tests
 tests/boundary.sh               workspace boundary and resource-limit tests
 tests/stub-model.py             stub model server for the gateway tests (Python standard library)
