@@ -149,7 +149,9 @@ echo "The weights are under the Qwen Community License 1.0: clause 2 needs a lic
 # Shard 35 (the MXFP8 prefill weights of the checkpoint in templates/pair.yaml): the serve command fetches it at
 # start when it is missing, and sparkrun stops a head that is not ready after about 2 minutes.
 image=$(awk '$1 == "container:" {print $2}' "$repo/templates/pair.yaml")
-checkpoint=$(grep -o 'models--[^"]*' "$repo/templates/pair.yaml")
+checkpoint=$(awk -F'"' '$1 ~ /VLLM_B12X_NVFP4_MXFP8_CHECKPOINT:/ {print $2}' "$repo/templates/pair.yaml")
+checkpoint=${checkpoint#/cache/huggingface/hub/}
+[[ $checkpoint == models--*/snapshots/* ]] || die "no VLLM_B12X_NVFP4_MXFP8_CHECKPOINT in templates/pair.yaml"
 model_repo=${checkpoint#models--}
 model_repo=${model_repo%%/*}
 model_repo=${model_repo/--//}
