@@ -87,7 +87,8 @@ if [[ $second_unit == true ]]; then
 	systemctl daemon-reload
 	systemctl enable sparkpass-firewall.service
 	# Load the rules now, not only at the next boot. A failed load stops this script.
-	systemctl restart sparkpass-firewall.service
+	systemctl restart sparkpass-firewall.service ||
+		die "the rules did not load; 'journalctl -u sparkpass-firewall.service' shows why (for example: run 'tailscale set --netfilter-mode=nodivert' first)"
 	warn_on_automatic_updates
 	echo "installed $rules and sparkpass-firewall.service; the rules are loaded and load again at each boot."
 	echo "Check after a reboot: systemctl status sparkpass-firewall.service"
@@ -312,11 +313,12 @@ spark.tail1234.ts.net, with no trailing dot (the DNSName of 'tailscale status --
        In the admin console: MagicDNS and HTTPS certificates on, the funnel node attribute in the
        tailnet policy ('tailscale funnel' prints the link when it is missing), and key expiry off for
        this machine (a node key expires after 180 days by default; then Funnel and the certificate stop).
-       tailscale set --accept-dns=false --auto-update=false
+       tailscale set --accept-dns=false --auto-update=false --netfilter-mode=nodivert
          (this unit then resolves <name> through public DNS, to a relay of Funnel, so that the self-check
          of grant and tests/expiry.sh --via-public take the public route; MagicDNS gives the tailnet
          address of this unit, where Caddy does not listen. An automatic update restarts tailscaled,
-         and each open guest stream ends)
+         and each open guest stream ends. With nodivert, tailscaled adds no rules before the sparkpass
+         firewall, and the firewall rules refuse to load without it: also on the second unit)
        tailscale funnel --bg --tcp=443 tcp://127.0.0.1:443
        tailscale cert --cert-file - <name> >/dev/null
          (tailscaled gets the certificate before the first start of Caddy, so that the first check of

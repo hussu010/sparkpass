@@ -65,15 +65,45 @@ Optional (advisory; done): proven_open can use `local VIA=("${DIRECT[@]}")` (bas
 
 ### Firewall rules with Tailscale on the units
 
-**What:** firewall/rules.sh (Next Step 3 of the design) also refuses the tailnet. In its default netfilter mode, tailscaled puts `-j ts-input` and `-j ts-forward` first in INPUT and FORWARD at each start; ts-input accepts all traffic on tailscale0, and ts-forward ends with `-o tailscale0 -j ACCEPT`. So a control port or the model port that binds 0.0.0.0 is open to each tailnet device, and after a `systemctl restart tailscaled` while Docker runs, ts-forward comes before DOCKER-USER and a container on a Docker bridge can reach the tailnet. Use `tailscale up --netfilter-mode=nodivert` (tailscaled keeps its chains and adds no jumps), and let rules.sh set the order in INPUT and FORWARD, with an explicit rule for the owner's SSH on tailscale0; prove that the Funnel route still reaches Caddy. In the tailnet policy, give tailnet sources no access to the units except the owner's SSH. Run tests/boundary.sh also after `systemctl restart tailscaled`, with one tailnet device in the checks.
+**What:** Done in code (branch feat/firewall-rules, 2026-10-15): firewall/rules.sh decides by interface (loopback and the two ConnectX-7 interfaces; SSH, ICMP, WireGuard 41641, DHCP replies and mDNS elsewhere), drops forwarding to the link, and exits non-zero while tailscaled adds its jumps; tests/firewall.sh tests it with a real iptables in Docker. Left, on the units: `tailscale set --netfilter-mode=nodivert` on both; `install.sh --second-unit` on the worker and a load on the head; then from the LAN (Ethernet and Wi-Fi) and from a tailnet device, port 25000 and a random vLLM port of each unit refuse, SSH and the model still work, the same after `systemctl restart tailscaled` and after a reboot of the worker; remove the temporary `sparkpass-temp-25000` rules on spark-3. In Phase 3, prove that the Funnel route still reaches Caddy (the peer API connection from a tailnet device made no kernel socket on spark-3, so tailscaled takes it before the kernel). In the tailnet policy, give tailnet sources no access to the units except the owner's SSH. Run tests/boundary.sh also after `systemctl restart tailscaled`, with one tailnet device in the checks.
+
+Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j ts-forward` first in INPUT and FORWARD at each start; ts-input accepts all traffic on tailscale0, and ts-forward ends with `-o tailscale0 -j ACCEPT`. So a control port that binds 0.0.0.0 is open to each tailnet device (port 25000 was, on 2026-10-14), and after a `systemctl restart tailscaled` while Docker runs, ts-forward comes before DOCKER-USER and a container on a Docker bridge can reach the tailnet.
 
 **Why:** The boundary rules of the design named the LAN and the internet; the inbound route of 2026-10-07 adds the tailnet. Multi-node serving opens control ports that permit code execution.
 
-**Context:** From the security specialist and the red team of the /ship review of branch feat/tunnel-and-p1-code (owner decision D5, 2026-10-07). The design now says "the LAN, the tailnet, and the internet" in its constraint and its Success Criteria. firewall/rules.sh does not exist yet; install.sh copies it to /usr/local/lib/sparkpass/rules.sh.
+**Context:** From the security specialist and the red team of the /ship review of branch feat/tunnel-and-p1-code (owner decision D5, 2026-10-07). The design now says "the LAN, the tailnet, and the internet" in its constraint and its Success Criteria. install.sh copies firewall/rules.sh to /usr/local/lib/sparkpass/rules.sh.
 
 **Effort:** M
 **Priority:** P1 (before the first guest)
-**Depends on:** Milestone 1 (the open ports of both units and the bind addresses of the model server and its control ports).
+**Depends on:** nothing more (the ports and bind addresses were listed on 2026-10-15).
+
+## Video mode
+
+### MiniMax H3 as a second model
+
+**What:** The owner switches the pair between the text model (Qwen) and MiniMax H3 (text, image, video or audio in; a 4–15 s 768p video with stereo audio out). One model runs at a time. Parts: a recipe for H3 (public: joeynyc/MiniMax-H3-DGX-Spark for one unit; joeynyc/MiniMax-H3-2x-DGX-Spark for two, experimental, with a patched vLLM-Omni and Ray), a switch command, the video routes in the three route lists (`@sparkpass_route` in gateway/Caddyfile, `pass_text` in src/grant.rs, `allowed` in tests/gateway.sh), the response size and time limits of the gateway for a video, a load test for video, and the pass text.
+
+**Why:** Owner requirement of 2026-10-15 ("we need video mode"; both models together are not needed).
+
+**Context:** Public numbers, not measured here: 33B video transformer plus a Qwen3-VL-32B encoder, about 135 GiB on disk; one unit loads 89 GiB, is ready in about 9 minutes and gives a clip in 80–111 s; two units, 31–47 s. With Qwen loaded, each unit has 12–15 GB free, so H3 replaces Qwen. Licence (MiniMax H3 Community License): it excludes the EU, the UK, South Korea and the US, also for the display of outputs there; decide how a pass handles guests from those places before the first video guest. The Ray ports of the two-unit recipe are on the host network; firewall/rules.sh covers them by interface.
+
+**Effort:** L
+**Priority:** P2 (after milestone 1)
+**Depends on:** Milestone 1 proven on the units; an owner decision on the licence territories.
+
+## Setup
+
+### One setup command for other owners
+
+**What:** A `setup.sh` on the head unit that runs the steps of "Set up the pair" in README.md in order: the sparkrun install and its setup commands (SSH between the units, the Docker group, earlyoom), linger on both units, `sparkrun run templates/pair.yaml`, `install.sh`, and the Funnel procedure that install.sh prints. It cannot change the tailnet, so it checks the three admin settings from the unit with no API token and stops with the console link when one is missing: `tailscale status --json` shows the certificate name in `CertDomains` (HTTPS on), `funnel` in `Self.CapMap` (the node attribute), and no `KeyExpiry` in `Self` (key expiry off; checked on spark-3, 2026-10-14). It also stops when `/proc/cmdline` of a 7.0 kernel has no `kho=off`, and it names the licence clause before it starts the model.
+
+**Why:** The first setup on spark-3 and spark-4 (2026-10-14) took about 15 separate steps: three admin settings, five sparkrun and host commands on two units, the self-SSH of the head, and checks of the kernel and the licence. An owner without that history gets stuck on them.
+
+**Context:** Owner decision D7 of 2026-10-14: document the commands now (README.md, "Set up the pair") and write the script only after milestone 1, because the firewall, install.sh, the Funnel procedure and tests/expiry.sh are not proven on the units yet, and a script of unproven steps needs a rewrite. This changes Premise 1 of the design ("Own pair only. No installer for other owners in this build"), so change the premise in the same branch. `sparkrun setup wizard --hosts <head>,<worker>` does the SSH, Docker group, sudoers and earlyoom steps in one call, but it asks questions; the first setup ran the separate sparkrun commands instead, and the wizard is not tested on the units.
+
+**Effort:** M
+**Priority:** P3 (after milestone 1)
+**Depends on:** Milestone 1 proven on the units (the model, the firewall, install.sh, the Funnel procedure, tests/expiry.sh).
 
 ## Completed
 
