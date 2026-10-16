@@ -1,7 +1,57 @@
 # sparkpass
 
-A guest pass for a model that is served on two linked NVIDIA DGX Spark units: a guest gets an API key that
-ends at a fixed time. The design, with the reason for each safety rule, is in `docs/designs/guest-pass-mvp.md`.
+[![ci](https://github.com/hussu010/sparkpass/actions/workflows/ci.yml/badge.svg)](https://github.com/hussu010/sparkpass/actions/workflows/ci.yml)
+
+Time-limited guest API keys for a model that runs on two linked NVIDIA DGX Spark units.
+
+The owner runs one command:
+
+```bash
+sudo sparkpass grant alice --ttl 24h
+```
+
+The guest gets an OpenAI-compatible endpoint, a key, and a fixed end time. At the end time a systemd timer
+removes the key and closes open requests, and the next request gets 401. There is no daemon, no database
+and no web page.
+
+## Status
+
+- Works on the author's pair since 2026-10-15: Qwen3.8-Flash-Next (NVFP4) with tensor parallel 2 across the
+  two units, 262,144 tokens of context, up to 16 requests at the same time, 64 to 73 tokens/s for one stream.
+- API only. The SSH workspace for guests (build phase 2 of the design) is not built.
+- One model at a time, and one owner's pair. `setup.sh` has run on one pair only.
+- The model weights are under the Qwen Community License 1.0. Its clause 2 ("Model as a Service") needs a
+  separate license from Qwen before you charge for a pass.
+
+## How it works
+
+```
+guest ──https──> Tailscale Funnel ──raw TCP──> Caddy on 127.0.0.1:443 ──> vLLM on 127.0.0.1:8000
+                 (relays, ts.net name)          key check, 3 routes          head unit + worker over
+                                                                             the ConnectX-7 link
+```
+
+- [sparkrun](https://pypi.org/project/sparkrun/) and vLLM serve the model across both units
+  (`templates/pair.yaml`). The API listens on the loopback address of the head unit only.
+- Tailscale Funnel carries the guest traffic to Caddy with TLS intact. Caddy ends TLS with the certificate
+  of the ts.net name, checks the key, and permits `GET /v1/models`, `POST /v1/chat/completions` and
+  `POST /v1/completions` only. The access log keeps no client address and no prompt.
+- `sparkpass grant` creates the end timer before it prints the key, then checks the public route with the
+  real key and with a wrong key. Any failure removes the pass.
+- `sparkpass reconcile` runs at boot and every 5 minutes. It revokes passes that are past their end time,
+  keeps the gateway stopped until the clock is synchronized, loads the firewall, and stops the gateway when
+  a wrong key gets an answer other than 401.
+- `firewall/rules.sh` lets the control ports of vLLM (which permit code execution) accept connections only
+  from the ConnectX-7 link, not from the LAN or the tailnet.
+
+The design, with the reason for each safety rule, is in
+[`docs/designs/guest-pass-mvp.md`](docs/designs/guest-pass-mvp.md). Open work is in [`TODOS.md`](TODOS.md).
+
+## Requirements
+
+- Two DGX Spark units with the ConnectX-7 ports cabled back to back (DGX OS, Ubuntu 24.04).
+- A Tailscale account on which you can enable HTTPS certificates and Funnel.
+- Wired Ethernet on the head unit, and about 140 GB of download for the image and the model.
 
 ## Set up the pair
 
@@ -24,8 +74,6 @@ Before you start:
   (`cat /proc/cmdline`). NVIDIA's update adds it with `/etc/default/grub.d/nvidia-spark-kho.cfg`.
 - Put the head unit on wired Ethernet: it downloads about 140 GB, and it carries the guest traffic. On the
   first setup, Wi-Fi gave 80 Mb/s and Ethernet 220 Mb/s on the same internet line.
-- The weights of the model are under the Qwen Community License 1.0. Its clause 2 ("Model as a Service")
-  needs a separate license from Qwen before a paid pass.
 
 1. In the Tailscale admin console:
    - DNS page: MagicDNS on, then HTTPS Certificates, Enable HTTPS.
@@ -102,6 +150,39 @@ Before you start:
    procedure and the settings files). It also installs `sparkpass-model.service`, which starts the model at
    each boot (run it with `sudo` as the user of sparkrun).
 
+## Give a guest pass
+
+On the head unit:
+
+```bash
+sudo sparkpass grant <name> --ttl <n>s|m|h|d   # for example --ttl 24h; at least 2m
+sudo sparkpass list                            # active passes and their end times
+sudo sparkpass revoke <name>                   # end a pass now
+```
+
+`grant` prints the text to send to the guest, in a private message:
+
+```
+Endpoint: https://<head unit>.<tailnet>.ts.net/v1
+API key:  <key>
+Model:    qwen3.8-flash-next
+End time: 2026-10-16 10:00:00 UTC
+
+Rules:
+- Routes: GET /v1/models, POST /v1/chat/completions and POST /v1/completions only; each other route gets 404.
+...
+```
+
+The end time does not move. When `grant` fails, it hands out nothing, and the error says why. A failed
+public self-check also stops the gateway: run `sudo sparkpass reconcile`, which starts it again after its
+checks, then run `grant` again. Set `NOTIFY_URL` in `/etc/sparkpass/config` (for example an ntfy topic) to
+get a message when something goes wrong during a pass: a failed revoke, a model outage, a stopped gateway,
+or a gateway that accepts a wrong key.
+
+Clients that worked through the gateway: opencode (an agent task with tool calls), and any client that
+uses `/v1/chat/completions` or `/v1/completions` (streaming, tool calls, fill-in-the-middle). Clients that
+need other routes do not work: Codex CLI (`/v1/responses`), Claude Code (the Anthropic API), and embeddings.
+
 ## Use the model from your own editor
 
 Point the editor's OpenAI-compatible provider at `http://localhost:8000/v1`, model `qwen3.8-flash-next`, no
@@ -115,3 +196,16 @@ ssh -N -o ServerAliveInterval=30 -L 127.0.0.1:8000:127.0.0.1:8000 <head unit>
 On macOS, a LaunchAgent keeps it up (`~/Library/LaunchAgents/com.sparkpass.tunnel.plist` on the first
 setup: that command with `RunAtLoad` and `KeepAlive`). Guests use `https://<name>/v1` with the key of
 `sparkpass grant`.
+
+## Development
+
+The tool is one Rust binary with no network library: it calls `curl`, `systemctl` and `systemd-run`. The
+checks run in Docker and need no DGX Spark: unit tests, clippy, shellcheck, the Caddyfile against a real
+Caddy (`tests/gateway.sh`), and the firewall rules against a real iptables (`tests/firewall.sh`). The
+commands and the rules for tests are in [`CLAUDE.md`](CLAUDE.md). `install.sh`, `setup.sh` and
+`tests/expiry.sh` change the host: run them only on the head unit.
+
+## License
+
+The code is under the [MIT License](LICENSE). The model weights that `templates/pair.yaml` names have their
+own license (Qwen Community License 1.0).
