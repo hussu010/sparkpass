@@ -49,31 +49,16 @@ The design, with the reason for each safety rule, is in
 
 ## Requirements
 
-- Two DGX Spark units with the ConnectX-7 ports cabled back to back (DGX OS, Ubuntu 24.04).
-- A Tailscale account on which you can enable HTTPS certificates and Funnel.
-- Wired Ethernet on the head unit, and about 140 GB of download for the image and the model.
-
-## Set up the pair
-
-These are the commands of the first setup (spark-3 head, spark-4 worker, 2026-10-14). After "Before you
-start" and step 1, one command on the head unit, as your user, runs steps 2 to 5 and ends with checks:
-
-```bash
-git clone https://github.com/hussu010/sparkpass && cd sparkpass
-./setup.sh <worker-cx7>        # for example 10.100.0.2; run it again at any time: it skips what is done
-```
-
-It prints the editor and guest URLs at the end. The steps below are what it does, and why.
-
-Before you start:
-
-- The two units have the ConnectX-7 ports cabled back to back, with an address on that link and SSH between
-  the units (the cluster setup of NVIDIA Sync does this). Below, `<head-cx7>` and `<worker-cx7>` are those
-  addresses, for example `10.100.0.1` and `10.100.0.2`.
+- Two DGX Spark units (DGX OS, Ubuntu 24.04) with the ConnectX-7 ports cabled back to back, an address on
+  that link, and SSH between the units (the cluster setup of NVIDIA Sync does this). Below, `<head-cx7>`
+  and `<worker-cx7>` are those addresses, for example `10.100.0.1` and `10.100.0.2`.
 - Kernel `7.0.0-1019-nvidia` breaks NCCL over RoCE unless the kernel command line has `kho=off`
   (`cat /proc/cmdline`). NVIDIA's update adds it with `/etc/default/grub.d/nvidia-spark-kho.cfg`.
-- Put the head unit on wired Ethernet: it downloads about 140 GB, and it carries the guest traffic. On the
-  first setup, Wi-Fi gave 80 Mb/s and Ethernet 220 Mb/s on the same internet line.
+- A Tailscale account on which you can enable HTTPS certificates and Funnel.
+- Wired Ethernet on the head unit: it downloads about 140 GB, and it carries the guest traffic. On the first
+  setup, Wi-Fi gave 80 Mb/s and Ethernet 220 Mb/s on the same internet line.
+
+## Set up the pair
 
 1. In the Tailscale admin console:
    - DNS page: MagicDNS on, then HTTPS Certificates, Enable HTTPS.
@@ -87,68 +72,13 @@ Before you start:
 2. On the head unit, as your user:
 
    ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   uv tool install sparkrun==0.3.10
-   sparkrun setup telemetry --disable
-   sparkrun cluster create pair --hosts <head-cx7>,<worker-cx7> --transfer-mode push --transfer-interface cx7 \
-     --mgmt-interface <cx7-iface>                # for example enp1s0f0np0, the same name on both units
-   sparkrun cluster set-default pair
-   sparkrun setup ssh --cluster pair            # SSH between the units and from the head to itself
-   sparkrun setup docker-group --cluster pair
-   sparkrun setup earlyoom --cluster pair
-   for h in <head-cx7> <worker-cx7>; do
-     ssh -t "$h" "sudo loginctl enable-linger $USER; echo SPARKRUN_MGMT_IFACE=<cx7-iface> | sudo tee -a /etc/environment"
-   done
-   ```
-
-   The head connects to itself over SSH, because it is the first host of the cluster. `sparkrun setup ssh`
-   asks for passwords. On the first setup, the key of NVIDIA Sync was added to the `authorized_keys` of the
-   head and to its `~/.ssh/config` for `<head-cx7>` instead. Linger keeps the shared memory of vLLM when no
-   user is logged in.
-
-   The control traffic of vLLM (the rendezvous on port 25000 and about 15 other ports per unit) must use the
-   ConnectX-7 link: these ports permit code execution, and on the default route they listen on the LAN and
-   are open to the tailnet. `--mgmt-interface` moves most of them. sparkrun 0.3.10 still takes the master
-   address from the default route, because its head-IP check does not get the cluster setting, so
-   `SPARKRUN_MGMT_IFACE` in `/etc/environment` gives it to that check too. Check after a start:
-   `docker exec <head container> grep -m1 master_addr /tmp/sparkrun_serve.log` names the head's ConnectX-7
-   address. Port 25000 still listens on all addresses; only the firewall closes it.
-
-3. Start the model on the head unit (the first run downloads the image and the model, then copies them to
-   the worker over the ConnectX-7 link):
-
-   ```bash
    git clone https://github.com/hussu010/sparkpass && cd sparkpass
-   # Shard 35 of the base model (2.8 GB, the MXFP8 prefill weights): the serve command fetches it at start
-   # when it is missing, and sparkrun stops a head that is not ready after about 2 minutes.
-   I=ghcr.io/ursuciprian/spark-vllm-b12x:k94-20261013-21e0b201-d21d7ade-warm
-   for h in <head-cx7> <worker-cx7>; do ssh "$h" "docker pull -q $I >/dev/null; docker run --rm --user \$(id -u):\$(id -g) \
-     -e HF_HOME=/cache/huggingface -v \$HOME/.cache/huggingface:/cache/huggingface --entrypoint python3 $I -c \
-     \"from huggingface_hub import snapshot_download as d; d('local-inference-lab/Qwen3.8-Flash-Next-NVFP4', \
-     revision='7c4f1bc1a2d6847e0cbc01ac6b823f00251de8dd', \
-     allow_patterns=['model-00035-of-00036.safetensors', 'model.safetensors.index.json'])\""; done
-   sparkrun run templates/pair.yaml --cluster pair --no-follow
-   until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health)" = 200 ]; do sleep 10; done
+   ./setup.sh <worker-cx7>        # for example 10.100.0.2
    ```
 
-   The API listens on `127.0.0.1:8000` of the head unit only. Guests reach it through the gateway. On the
-   first setup: the first start took 6 min 54 s and a later one 4 min 25 s, and one stream gave 64 to 73
-   tokens/s (512 tokens, thinking off).
-
-4. The firewall (`firewall/rules.sh`): new connections from the LAN and the tailnet get no model or control
-   port; SSH stays open. On the worker, from a copy of this repository:
-
-   ```bash
-   sudo tailscale set --netfilter-mode=nodivert   # on both units; the rules refuse to load without it
-   sudo ./install.sh --second-unit                # loads the rules now and at each boot
-   ```
-
-   On the head unit, step 5 installs the same rules, and `sparkpass reconcile` loads them at boot and every
-   5 minutes.
-
-5. The gateway: `sudo ./install.sh` on the head unit, then the steps that it prints (the Tailscale Funnel
-   procedure and the settings files). It also installs `sparkpass-model.service`, which starts the model at
-   each boot (run it with `sudo` as the user of sparkrun).
+   It installs sparkrun, sets up the cluster, the firewall and the gateway, starts the model (the first start
+   downloads about 140 GB), and ends with checks and the URLs. Run it again at any time: it skips what is
+   done. Each step, with the reason for it, is in [`docs/setup-by-hand.md`](docs/setup-by-hand.md).
 
 ## Give a guest pass
 
@@ -182,6 +112,49 @@ or a gateway that accepts a wrong key.
 Clients that worked through the gateway: opencode (an agent task with tool calls), and any client that
 uses `/v1/chat/completions` or `/v1/completions` (streaming, tool calls, fill-in-the-middle). Clients that
 need other routes do not work: Codex CLI (`/v1/responses`), Claude Code (the Anthropic API), and embeddings.
+
+## Run another model
+
+A model for guest passes must serve the OpenAI API (`/v1/models`, `/v1/chat/completions`) and `/health` on
+`127.0.0.1:8000`. The gateway permits only the three guest routes, so a video or image model works for the
+owner only (through the SSH tunnel), not for guests. `grant` reads the model name from `/v1/models`, so the
+pass text names the model that runs.
+
+On the head unit, as the user of sparkrun, in the repository:
+
+1. Find a recipe in the sparkrun registries, and check that it fits in memory:
+
+   ```bash
+   sparkrun search <text>                 # for example: sparkrun search qwen
+   sparkrun show <recipe>
+   sparkrun recipe vram <recipe> --tp 2   # memory for each unit
+   ```
+
+2. Save a copy in `templates/`, then edit it (the header of `templates/pair.yaml` shows these changes):
+
+   ```bash
+   sparkrun export recipe <recipe> --save templates/<name>.yaml
+   ```
+
+   - Set `defaults.host: 127.0.0.1` and `defaults.port: 8000`. Another host opens the model API, with no key,
+     to each network that the firewall does not close.
+   - Pin `model_revision` and the container image: a tag can change.
+   - Remove `--enable-prompt-tokens-details`: with it, the next guest can see which prompt prefix the last
+     guest sent.
+   - Read the licence of the weights, and of any draft model.
+   - Check the file: `sparkrun recipe validate templates/<name>.yaml`.
+
+3. Make sure that no pass is active (`sudo sparkpass list`), then switch:
+
+   ```bash
+   echo RECIPE=templates/<name>.yaml | sudo tee /etc/sparkpass/model.env   # the model of each boot
+   sparkrun stop --all --cluster pair
+   sudo systemctl restart sparkpass-model.service   # starts $RECIPE and waits until it answers (up to 12 min)
+   ```
+
+   To go back to the default model, delete `/etc/sparkpass/model.env` and run the last two commands again.
+   A pass that is active during a switch has no model until the new one answers, and its end time does not
+   move. Recipes for one unit (`min_nodes: 1`) are not tested with sparkpass.
 
 ## Use the model from your own editor
 

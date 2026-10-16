@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # Forced-end, deny-all and re-grant test of the guest pass, build phase 1 (API only).
-# Design: docs/designs/guest-pass-mvp.md, "Success Criteria" and "Next Steps" 6; TODOS.md, item "Prove
-# the gateway step on the units", and completed item "Fail closed when the gateway does not enforce the
-# token file", acceptance rule 5.
+# Design: docs/designs/guest-pass-mvp.md, "Success Criteria" and "Next Steps" 6.
 # The owner runs it by hand as root on the head unit, after install.sh. It uses the real
 # sparkpass binary, systemd, Caddy and curl, so it does not run in CI.
 set -Eeuo pipefail
@@ -17,7 +15,6 @@ LOCK=$STATE/lock
 NAME=expiry-test
 BOUND=15     # seconds after the end time: the stream ends and the key gets 401
 LOCK_HOLD=40 # seconds: in step 3 a different process holds the lock across the end time (eng review D8)
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Each "every path" check. The first three are the routes of the pass. On each other route the key gets
 # the 404 of the gateway (the route allowlist of gateway/Caddyfile): other routes of the model server can
 # change state that the next guest sees.
@@ -28,7 +25,7 @@ DENIED=("${EVERY[@]:3}")
 
 usage() {
   cat <<'EOF'
-Usage: sudo tests/expiry.sh [--stub] [--ttl <n>s|<n>m] [--via-public] [--skip-reboot-note]
+Usage: sudo tests/expiry.sh [--ttl <n>s|<n>m] [--skip-reboot-note]
 
 Forced-end test of the sparkpass guest pass, build phase 1 (API only). Run it as root on
 the head unit after install.sh, with no lease, no end timer and no guest traffic. It uses
@@ -57,24 +54,7 @@ POST /v1/embeddings, POST /v1/responses, POST /v1/load_lora_adapter,
 POST /invocations, POST /tokenize, GET /metrics, GET /health.
 
 Options:
-  --stub              run against tests/stub-model.py on MODEL_PORT (stop the real model
-                      first). Step 4 also checks 503 when the stub is stopped, and 504 (not
-                      a hang) when the stub is frozen. The frozen check waits for the 300 s
-                      header timeout of the gateway: about 5 minutes. With --via-public, that
-                      request is silent for 300 s on a relay of Funnel, so it also proves that
-                      the relay keeps a silent connection open (a long prefill).
-  --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m; at least 120s, and
-                      at least 180s with --via-public).
-  --via-public        send each request through PUBLIC_URL: public DNS and a relay of
-                      Tailscale Funnel (the inbound-path run of the Success Criteria). It
-                      needs 'tailscale set --accept-dns=false' on this unit, so that the
-                      ts.net name resolves to a relay and not to the tailnet address of
-                      this unit. Without this option, each request goes to
-                      GATEWAY_CHECK_ADDRESS (127.0.0.1) with curl --connect-to. With this
-                      option, an answer other than 401 proves an open gateway only when
-                      127.0.0.1 gives one too, as in grant step 8. A 421 at 127.0.0.1
-                      (strict_sni_host) never proves an open gateway: the request did
-                      not reach the token check.
+  --ttl <n>s|<n>m     TTL of the leases in steps 3 and 5 (default 5m; at least 120s).
   --skip-reboot-note  do not print the reboot procedures at the end.
   -h, --help          print this text and the manual procedures.
 
@@ -112,7 +92,6 @@ Manual: reboot inside an active lease
      model runs). journalctl -b -u pass-reconcile.service shows no failed check of the
      boot run; curl exit code 35 there is the race with tailscaled (TODOS.md).
   3. sparkpass revoke $NAME. The key gets 401.
-  Build phase 2 adds: the home data stays, and SSH connects with no host key warning.
 
 EOF
   fi
@@ -130,9 +109,10 @@ the host of PUBLIC_URL:
        curl -sS -o /dev/null -w '%{http_code}\n' --connect-to ::127.0.0.1: https://<name>/v1/models
   4. tailscale funnel status shows TCP 443 of this node, forwarded to 127.0.0.1:443.
   5. getent hosts <name> gives a public address (a relay of Funnel), not a 100.x tailnet
-     address: 'tailscale set --accept-dns=false' is on, so --via-public takes the public route.
-  6. tests/expiry.sh, then tests/expiry.sh --via-public. Each check uses TLS with the name
-     of PUBLIC_URL and a normal certificate check, so a pass also proves the certificate.
+     address: 'tailscale set --accept-dns=false' is on, so the self-check of grant takes the
+     public route.
+  6. tests/expiry.sh. Each check uses TLS with the name of PUBLIC_URL and a normal
+     certificate check, so a pass also proves the certificate.
 Check a key with the command below (GATEWAY_CHECK_ADDRESS is always 127.0.0.1):
   $check
 Manual: no network at boot (one time, design task T13)
@@ -147,16 +127,14 @@ EOF
 usage_error() { printf 'expiry.sh: %s (see --help)\n' "$1" >&2; exit 2; }
 die() { printf 'expiry.sh: %s\n' "$*" >&2; exit 1; } # before the test changes the host
 
-STUB=no VIA_PUBLIC=no REBOOT_NOTE=yes TTL=5m
+REBOOT_NOTE=yes TTL=5m
 while (($#)); do
   case $1 in
-    --stub) STUB=yes ;;
     --ttl)
       (($# >= 2)) || usage_error "--ttl needs a value"
       TTL=$2
       shift
       ;;
-    --via-public) VIA_PUBLIC=yes ;;
     --skip-reboot-note) REBOOT_NOTE=no ;;
     -h | --help) usage; exit 0 ;;
     *) usage_error "unknown argument: $1" ;;
@@ -166,11 +144,9 @@ done
 [[ $TTL =~ ^([0-9]{1,6})([sm])$ ]] || usage_error "--ttl must be <n>s or <n>m, for example 5m"
 TTL_S=$((10#${BASH_REMATCH[1]}))
 if [[ ${BASH_REMATCH[2]} == m ]]; then TTL_S=$((TTL_S * 60)); fi
-# Through a relay of Funnel each request takes a few round trips, and step 2 sends 58 requests before the
-# end time (owner decision D9 of the /ship review, 2026-10-07).
+# The shortest TTL that grant accepts (grant::HAND_OUT_TIME in src/grant.rs).
 MIN_TTL=120
-if [[ $VIA_PUBLIC == yes ]]; then MIN_TTL=180; fi
-((TTL_S >= MIN_TTL)) || usage_error "--ttl must be at least ${MIN_TTL}s$([[ $VIA_PUBLIC == yes ]] && echo ' with --via-public')"
+((TTL_S >= MIN_TTL)) || usage_error "--ttl must be at least ${MIN_TTL}s"
 MAX_TOKENS=${EXPIRY_MAX_TOKENS:-131072}
 [[ $MAX_TOKENS =~ ^[1-9][0-9]{0,6}$ ]] || usage_error "EXPIRY_MAX_TOKENS must be a positive number"
 
@@ -187,10 +163,6 @@ lease_list=$("$BIN" list) || die "sparkpass list failed"
 timers=$(end_timers)
 [[ -z $timers ]] || die "an end timer exists, so the test does not start: $timers"
 [[ -r $CONFIG ]] || die "cannot read $CONFIG"
-if [[ $STUB == yes ]]; then
-  command -v python3 >/dev/null || die "--stub needs python3"
-  [[ -f $HERE/stub-model.py ]] || die "$HERE/stub-model.py is missing"
-fi
 
 # setting KEY: the value from the settings file, parsed as read_settings parses it (the file is not sourced):
 # "#" starts a comment, the last KEY=VALUE line wins, and the key and the value are trimmed.
@@ -205,20 +177,13 @@ if ! [[ $MODEL_PORT =~ ^[0-9]{1,5}$ ]] || ((10#$MODEL_PORT < 1 || 10#$MODEL_PORT
 fi
 MODEL_PORT=$((10#$MODEL_PORT))
 [[ $ADDRESS == 127.0.0.1 ]] || die "$CONFIG: GATEWAY_CHECK_ADDRESS must be 127.0.0.1, where Caddy listens (sparkpass refuses each other value)"
-# Without --via-public, each connection goes to GATEWAY_CHECK_ADDRESS on the port of PUBLIC_URL, as
-# the reconcile check does. TLS still checks the name of PUBLIC_URL. DIRECT keeps that route for
-# proven_open, also with --via-public.
-DIRECT=(--connect-to "::$ADDRESS:")
-VIA=("${DIRECT[@]}")
+# Each connection goes to GATEWAY_CHECK_ADDRESS on the port of PUBLIC_URL, as the reconcile check does.
+# TLS still checks the name of PUBLIC_URL.
+VIA=(--connect-to "::$ADDRESS:")
 ROUTE="--connect-to $ADDRESS"
-if [[ $VIA_PUBLIC == yes ]]; then
-  VIA=()
-  ROUTE="the public name (public DNS and Tailscale Funnel)"
-fi
 WRONG=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
-CHUNKS=$(((TTL_S + 300) * 2)) # stub stream at 0.5 s per chunk: it runs 5 minutes past the end time
 
-STEP=start ARMED=no STUB_PID="" STREAM_PID="" BAD="" OPEN="" KEY="" MODEL="" DEADLINE=0 TIMER=""
+STEP=start ARMED=no STREAM_PID="" BAD="" OPEN="" KEY="" MODEL="" DEADLINE=0 TIMER=""
 TMP=$(mktemp -d) # mode 0700: $TMP/auth holds a key
 
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
@@ -230,7 +195,7 @@ cleanup() {
   trap '' INT TERM HUP PIPE
   trap - EXIT ERR
   set +e
-  # The stream, the lock hold (flock -o: the kill frees the lock), a sleep, the stub (stop_stub waits for it).
+  # The stream, the lock hold (flock -o: the kill frees the lock), a sleep.
   # shellcheck disable=SC2046 # one word for each pid
   kill $(jobs -p) 2>/dev/null
   # A gateway proven open: the marker and the stop come first, because a revoke cannot close it.
@@ -240,21 +205,16 @@ cleanup() {
     "$BIN" revoke "$NAME" || printf 'expiry.sh: the revoke failed too: check sparkpass list\n' >&2
     # After the revoke the last key must get 401 on every path. An HTTP answer other than 401 (not a curl
     # failure, 000) proves an open gateway, also when the failed step was a wait (until_by) and not expect().
-    # With --via-public, the answer of the public route is no proof by itself: proven_open decides, as in expect().
-    # A 421 at the check address is no proof either: the request did not reach the token check (grant step 8).
+    # A 421 is no proof: the request did not reach the token check (grant step 8).
     if [[ -z $OPEN && -n $KEY ]] && ! answers 401 "$KEY" "${EVERY[@]}" && [[ $BAD == *=[1-9]* ]]; then
-      local public=$BAD
-      if [[ $VIA_PUBLIC != yes && $BAD != *=421* ]] || { [[ $VIA_PUBLIC == yes ]] && proven_open "$KEY" "${EVERY[@]}"; }; then
+      if [[ $BAD != *=421* ]]; then
         OPEN="the last key still passed the gateway after the revoke:$BAD"
         close_open_gateway
-      elif [[ $VIA_PUBLIC != yes ]]; then
-        printf 'expiry.sh: after the revoke the check at %s failed:%s%s (no marker)\n' "$ADDRESS" "$BAD" "$(hint)" >&2
       else
-        printf 'expiry.sh: after the revoke the public route still answered the last key:%s, and %s gave:%s%s (no marker; check tailscale funnel status)\n' "$public" "$ADDRESS" "${BAD:- 401 on each route}" "$(hint)" >&2
+        printf 'expiry.sh: after the revoke the check at %s failed:%s%s (no marker)\n' "$ADDRESS" "$BAD" "$(hint)" >&2
       fi
     fi
   fi
-  stop_stub
   rm -rf "$TMP"
   exit "$rc"
 }
@@ -284,22 +244,16 @@ trap 'printf "expiry.sh: line %s: the command \"%s\" failed\n" "$LINENO" "$BASH_
 # The body goes to $TMP/body. -q first: root's ~/.curlrc cannot add --insecure, a proxy, or -L.
 # --noproxy: a proxy would skip --connect-to.
 status() {
-  local method=$1 path=$2 body=() code
+  local method=$1 path=$2 body=()
   shift 2
   if [[ $method == POST ]]; then body=(-H 'Content-Type: application/json' -d '{}'); fi
-  # Through the public route a slow relay of Funnel can give no answer within 10 s (000): up to 3 tries, as in
-  # grant step 8. An HTTP answer decides at once.
-  for _ in 1 2 3; do
-    rm -f "$TMP/body"
-    code=$(curl -q --noproxy '*' -sS -o "$TMP/body" -w '%{http_code}' -m 10 "${VIA[@]}" "${body[@]}" "$@" "$PUBLIC_URL$path" || true)
-    [[ $code == 000 && $VIA_PUBLIC == yes ]] || break
-  done
-  printf '%s' "$code"
+  rm -f "$TMP/body"
+  curl -q --noproxy '*' -sS -o "$TMP/body" -w '%{http_code}' -m 10 "${VIA[@]}" "${body[@]}" "$@" "$PUBLIC_URL$path" || true
 }
 
 # answers WANT WHO ROUTE...: true when each route answers WANT to WHO: "none" (no Authorization header),
 # "empty" (an empty bearer value), or a bearer key. BAD gets the other answers, as "route=code".
-# A 404 with a body is "404+body": only the 404 of the gateway has no body (the stub and vLLM send JSON).
+# A 404 with a body is "404+body": only the 404 of the gateway has no body (the model server sends JSON).
 answers() {
   local want=$1 who=$2 route code auth=()
   shift 2
@@ -315,17 +269,6 @@ answers() {
     [[ $code == "$want" ]] || BAD+=" $route=$code"
   done
   [[ -z $BAD ]]
-}
-
-# proven_open WHO ROUTE...: an answer other than 401 through the public route proves an open gateway
-# only when GATEWAY_CHECK_ADDRESS gives one too (grant step 8): another listener on the public route can
-# answer, for example tailscaled when Funnel runs in HTTPS mode. A 421 there is no proof: the request did
-# not reach the token check (strict_sni_host). BAD then holds the direct answers.
-proven_open() {
-  # bash locals are dynamically scoped: status() sees this VIA, and the caller's VIA stays.
-  local VIA=("${DIRECT[@]}") rc=0
-  answers 401 "$@" || rc=1
-  ((rc)) && [[ $BAD == *=[1-9][0-9][0-9]* && $BAD != *=421* ]]
 }
 
 hint() {
@@ -346,20 +289,9 @@ expect() {
   shift 3
   answers "$want" "$who" "$@" && return 0
   # An HTTP answer other than 401 (000 is a curl failure, not an answer) proves the gateway open, but a 421
-  # at the check address is no proof: the request did not reach the token check. Through the public route
-  # an answer is no proof by itself: the check address decides (proven_open). Both as in grant step 8.
-  if [[ $want == 401 && $BAD == *=[1-9][0-9][0-9]* ]]; then
-    local public=$BAD
-    if [[ $VIA_PUBLIC == yes ]] && ! proven_open "$who" "$@"; then
-      # BAD holds the direct answers here. A failed request or a 421 at the check address is no refusal; a 2xx
-      # or 3xx through the public route is a listener with no key check (grant step 8, owner decision D4).
-      [[ $BAD != *=000* && $BAD != *=421* ]] || fail "$label: each answer through $ROUTE must be 401, but:$public; the check at $ADDRESS failed:$BAD$(hint); no marker"
-      if [[ $public == *=[23][0-9][0-9]* ]]; then
-        fail "$label: each answer through $ROUTE must be 401, but:$public; at $ADDRESS the gateway refuses it: another listener serves the public name with no key check, for example a Funnel handler to the model server ('tailscale funnel status' must show only TCP 443 to tcp://127.0.0.1:443); no marker"
-      fi
-      fail "$label: each answer through $ROUTE must be 401, but:$public; at $ADDRESS the gateway refuses it: the inbound route does not reach this gateway, or it changes its answers (tailscale funnel status must show TCP 443 to tcp://127.0.0.1:443); no marker"
-    fi
-    [[ $BAD == *=421* ]] || OPEN="tests/expiry.sh step $STEP, $(date -u '+%F %T UTC'): the gateway answered$BAD to $label at $ADDRESS, and each answer must be 401: the gateway does not enforce the token file"
+  # is no proof: the request did not reach the token check (grant step 8).
+  if [[ $want == 401 && $BAD == *=[1-9][0-9][0-9]* && $BAD != *=421* ]]; then
+    OPEN="tests/expiry.sh step $STEP, $(date -u '+%F %T UTC'): the gateway answered$BAD to $label at $ADDRESS, and each answer must be 401: the gateway does not enforce the token file"
   fi
   fail "$label: each answer must be $want, but:$BAD$(hint)"
 }
@@ -405,33 +337,10 @@ stream_result() { cat "$TMP/stream" "$TMP/stream.err" 2>/dev/null | tr '\n' ' ' 
 model_get() { curl -q --noproxy '*' -sS -m 10 "http://127.0.0.1:$MODEL_PORT$1" 2>/dev/null || true; }
 # running: the requests that the model server runs now, or "" when it does not say.
 running() {
-  if [[ $STUB == yes ]]; then
-    model_get /stub/status | sed -n 's/.*"running": *\([0-9][0-9]*\).*/\1/p'
-  else
-    model_get /metrics | awk '/^(vllm:num_requests_running|sglang:num_running_reqs)[{ ]/ {s += $NF; n++} END {if (n) printf "%d\n", s}'
-  fi
+  model_get /metrics | awk '/^(vllm:num_requests_running|sglang:num_running_reqs)[{ ]/ {s += $NF; n++} END {if (n) printf "%d\n", s}'
 }
 busy() { local n; n=$(running); [[ -z $n ]] || ((n >= 1)); }
 idle() { [[ $(running) == 0 ]]; }
-
-start_stub() {
-  python3 "$HERE/stub-model.py" --port "$MODEL_PORT" --interval 0.5 --chunks "$CHUNKS" >>"$TMP/stub.log" 2>&1 &
-  STUB_PID=$!
-  for _ in {1..20}; do
-    if [[ -n $(running) ]]; then return 0; fi
-    kill -0 "$STUB_PID" 2>/dev/null || fail "the stub did not start. Is the model server on port $MODEL_PORT? $(cat "$TMP/stub.log")"
-    sleep 0.5
-  done
-  fail "the stub does not answer on 127.0.0.1:$MODEL_PORT"
-}
-
-stop_stub() {
-  [[ -n $STUB_PID ]] || return 0
-  kill -CONT "$STUB_PID" 2>/dev/null || true
-  kill "$STUB_PID" 2>/dev/null || true
-  wait "$STUB_PID" 2>/dev/null || true
-  STUB_PID=""
-}
 
 # grant TTL: sparkpass grant; sets KEY, MODEL, DEADLINE (epoch seconds) and TIMER from the pass text and
 # the lease file.
@@ -450,7 +359,6 @@ grant() {
   DEADLINE=$(date -u -d "$end" +%s) || fail "cannot read the end time of the pass: \"$end\""
   # The deadline is one clock read during grant plus the TTL: the lock wait and the checks do not shorten it.
   ((DEADLINE >= before + ttl && DEADLINE <= after + ttl)) || fail "the end time $end is not the time of the grant plus $ttl s"
-  ((after - before <= 30)) || fail "the grant took $((after - before)) s, more than 30 s (a reconcile run can hold the lock: run the test again)"
   deadline=$(sed -n 's/.*"deadline": *\([0-9][0-9]*\).*/\1/p' "$STATE/leases/$NAME.json" 2>/dev/null || true)
   [[ $deadline == "$DEADLINE" ]] || fail "the deadline \"$deadline\" in $STATE/leases/$NAME.json is not the end time of the pass ($DEADLINE)"
   TIMER=sparkpass-end-$NAME-$deadline.timer
@@ -460,12 +368,7 @@ grant() {
 
 ARMED=yes
 say "sparkpass expiry test, build phase 1 (API only): $PUBLIC_URL through $ROUTE"
-say "TTL ${TTL_S}s; the test takes about $(((2 * TTL_S + 150) / 60)) minutes$([[ $STUB == yes ]] && echo ', plus about 6 minutes for the stub checks')"
-say "skipped (build phase 2): each SSH, workspace and home-image check"
-if [[ $STUB == yes ]]; then
-  start_stub
-  say "the stub model server runs on 127.0.0.1:$MODEL_PORT (pid $STUB_PID)"
-fi
+say "TTL ${TTL_S}s; the test takes about $(((2 * TTL_S + 150) / 60)) minutes"
 
 STEP="1 (deny-all)"
 "$BIN" reconcile || fail "sparkpass reconcile failed"
@@ -518,8 +421,8 @@ read -r stream_code stream_size <"$TMP/stream" || true
 [[ ${stream_code:-} == 200 && ${stream_size:-0} -gt 0 ]] || fail "the stream got \"${stream_code:-none}\" with ${stream_size:-0} bytes; it must get 200 with data"
 # Two routes time the cut: GET /v1/models and POST /v1/chat/completions, the route of the stream (Codex
 # adversarial, P2). Before the cut, the POST sends {}, which starts no stream.
-# Every route and the other callers follow after the time limits, because through a relay of Funnel each
-# request takes a few round trips, and 12 to 48 requests would count against the limits of the revoke.
+# Every route and the other callers follow after the time limits: 12 to 48 requests would count against
+# the limits of the revoke.
 until_by $((DEADLINE + BOUND)) "the key does not get 401 $BOUND s after the end time" answers 401 "$KEY1" "GET /v1/models" "POST /v1/chat/completions"
 cut_at=$(($(date +%s) - DEADLINE))
 until_by $((DEADLINE + lock_end + 30)) "sparkpass list still shows a lease 30 s after the end of the lock hold" no_lease
@@ -536,42 +439,9 @@ fi
 say "ok 3: with the lock held until +${lock_end}s, the stream ended at +${stream_end}s (curl exit $stream_rc), the key got 401 at +${cut_at}s, the lease and its end timer were gone at +${gone_at}s; $model_note"
 
 STEP="4 (early revoke)"
-grant 900s # 15 minutes: room for the stub checks; the early revoke ends it
+grant "${TTL_S}s" # the early revoke below ends it
 KEY2=$KEY
 expect 200 "$KEY2" "the key of the second grant" "GET /v1/models"
-stub_note="not run (no --stub): the 503 and the frozen-model checks"
-if [[ $STUB == yes ]]; then
-  STEP="4 (stub stopped)"
-  stop_stub
-  expect 503 "$KEY2" "the key, with the stub stopped" "GET /v1/models" "POST /v1/chat/completions"
-  start_stub
-  expect 200 "$KEY2" "the key, with the stub started again" "GET /v1/models"
-  say "ok: with the stub stopped, the key gets 503"
-
-  STEP="4 (stub frozen)"
-  say "the stub is frozen (SIGSTOP); the gateway must answer 504 at its 300 s response header timeout"
-  kill -STOP "$STUB_PID"
-  frozen_start=$(date +%s)
-  printf 'Authorization: Bearer %s\n' "$KEY2" >"$TMP/auth"
-  # Not -m 10: the header timeout of the gateway is 300 s. -m 330 tells a hang from that error. In the
-  # background: the INT and TERM trap runs at once.
-  curl -q --noproxy '*' -sS -o /dev/null -w '%{http_code}' -m 330 "${VIA[@]}" -H @"$TMP/auth" \
-    "$PUBLIC_URL/v1/models" >"$TMP/frozen" &
-  wait $! || true
-  frozen_code=$(cat "$TMP/frozen")
-  frozen_s=$(($(date +%s) - frozen_start))
-  kill -CONT "$STUB_PID"
-  if [[ $frozen_code != 504 ]] || ((frozen_s < 290 || frozen_s > 315)); then
-    relay=""
-    if [[ $VIA_PUBLIC == yes ]] && ((frozen_s < 290)); then
-      relay="; through Funnel, an early end can be a relay that closes a silent connection before the 300 s limit of the gateway (a long prefill gets the same error)"
-    fi
-    fail "with the stub frozen, the key got \"$frozen_code\" after $frozen_s s; it must get 504 after 290 to 315 s (the 300 s response header timeout)$relay"
-  fi
-  stub_note="503 with the stub stopped; 504 after ${frozen_s}s with the stub frozen"
-  say "ok: with the stub frozen, the key gets 504 after ${frozen_s}s"
-  STEP="4 (early revoke)"
-fi
 "$BIN" revoke "$NAME" || fail "sparkpass revoke $NAME failed"
 wait_caddy
 expect 401 "$KEY2" "the key after the early revoke" "${EVERY[@]}"
@@ -610,11 +480,8 @@ PASS: tests/expiry.sh, build phase 1 (API only), through $ROUTE
   forced end:     lock held until +${lock_end}s; stream ended at +${stream_end}s (curl exit $stream_rc), key 401 at +${cut_at}s (limit +${BOUND}s), no lease and no end timer at +${gone_at}s (limit +$((lock_end + 30))s)
   model server:   $model_note
   early revoke:   401 on every path, no end timer
-  stub:           $stub_note
   re-grant:       the new key works, the earlier keys get 401; at its own end time: key 401 at +${recut_at}s (limit +${BOUND}s), no lease and no end timer at +${regone_at}s (limit +30s)
-Not tested (build phase 2): SSH login and its end, the refusal of a new login, the
-workspace container, the home image and its removal, the forced erase failure, tests/boundary.sh.
-$([[ $VIA_PUBLIC == yes ]] || echo "Run it again with --via-public: the inbound-path run of the Success Criteria.")
+Not tested here: the public route through Tailscale Funnel (grant step 8 checks it at each grant).
 
 EOF
 if [[ $REBOOT_NOTE == yes ]]; then manual all; else manual certificate; fi

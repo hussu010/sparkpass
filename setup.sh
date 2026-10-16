@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One command for the pair: the steps of "Set up the pair" in README.md, on the head unit, as the user of
+# One command for the pair: the steps of docs/setup-by-hand.md, on the head unit, as the user of
 # sparkrun (not root; it uses sudo, and ssh -t to the worker, where a step needs root).
 # Idempotent: each step checks first and skips what is done, so a second run changes nothing except
 # install.sh, which runs again with no lease (it picks up an update of this repository).
@@ -92,11 +92,11 @@ need_docker=
 need_earlyoom=
 for h in "$head" "$worker"; do
 	ssh -n -o BatchMode=yes "$h" '[[ $(uname -r) != 7.0.0-1019-nvidia ]] || grep -qw kho=off /proc/cmdline' ||
-		die "$h: kernel 7.0.0-1019-nvidia breaks NCCL over RoCE without kho=off (README, Before you start)"
+		die "$h: kernel 7.0.0-1019-nvidia breaks NCCL over RoCE without kho=off (README, Requirements)"
 	ssh -n -o BatchMode=yes "$h" 'id -nG | grep -qw docker' || need_docker=yes
 	ssh -n -o BatchMode=yes "$h" 'systemctl is-active --quiet earlyoom' || need_earlyoom=yes
 	# Linger keeps the shared memory of vLLM with no login. SPARKRUN_MGMT_IFACE keeps the control ports of vLLM
-	# on the link (README, step 2). nodivert: the firewall rules refuse to load without it. ssh -t: sudo asks
+	# on the link (docs/setup-by-hand.md, step 2). nodivert: the firewall rules refuse to load without it. ssh -t: sudo asks
 	# for the password of that unit, only when a setting is missing.
 	ssh -t "$h" "set -e
 loginctl show-user \$USER -p Linger --value | grep -qx yes || sudo loginctl enable-linger \$USER

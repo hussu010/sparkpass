@@ -300,23 +300,15 @@ mod tests {
     }
 
     #[test]
-    fn real_runner_reads_200_kb_on_each_pipe_without_a_deadlock() {
-        let script = "head -c 200000 /dev/zero | tr '\\0' x; head -c 200000 /dev/zero | tr '\\0' y >&2";
-        let out = real(20_000).run(&["sh", "-c", script]).unwrap();
-        assert_eq!(out.code, Some(0));
-        assert_eq!(out.stdout, "x".repeat(200_000));
-        assert_eq!(out.stderr, "y".repeat(200_000));
-    }
-
-    #[test]
     fn real_runner_keeps_the_first_1_mib_of_each_pipe_and_discards_the_rest() {
-        // 2 MiB on each pipe: 1 MiB of x, then 1 MiB of z.
-        let script = "for c in x z; do head -c 1048576 /dev/zero | tr '\\0' $c; head -c 1048576 /dev/zero | tr '\\0' $c >&2; done";
+        // 2 MiB on each pipe, more than a pipe holds: 1 MiB of x on stdout and y on stderr, then 1 MiB of z and w.
+        // Distinct letters for the two pipes: their contents must not swap.
+        let script = "for p in xy zw; do head -c 1048576 /dev/zero | tr '\\0' ${p%?}; head -c 1048576 /dev/zero | tr '\\0' ${p#?} >&2; done";
         // A result in the limit: the child did not block on a full pipe after the first 1 MiB.
         let out = real(20_000).run(&["sh", "-c", script]).unwrap();
         assert_eq!(out.code, Some(0));
         assert!(out.stdout == "x".repeat(1 << 20), "stdout has {} bytes", out.stdout.len());
-        assert!(out.stderr == "x".repeat(1 << 20), "stderr has {} bytes", out.stderr.len());
+        assert!(out.stderr == "y".repeat(1 << 20), "stderr has {} bytes", out.stderr.len());
     }
 
     #[test]

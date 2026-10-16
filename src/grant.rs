@@ -11,8 +11,7 @@
 //!  2 lease file (atomic write)          ── from here, each failure runs revoke
 //!  3 end timer for the deadline
 //!  4 token (not active)
-//!  5 home image                         [build phase 2]
-//!  6 workspace container                [build phase 2]
+//!  5, 6 none (the SSH workspace of the design is not built)
 //!  7 activate the token, reload Caddy
 //!  8 self-check (D5) through PUBLIC_URL: 200 with the token, 401 with a wrong token (GET and POST)
 //!    ── fail ──▶ stop Caddy, revoke, exit non-zero; an answer other than 401 is no proof by itself (the
@@ -145,7 +144,7 @@ fn hand_out(paths: &Paths, runner: &dyn Runner, settings: &Settings, lease: &Lea
     lease::create_end_timer(runner, lease, clock().max(lease.start))?;
     // 4. Token. It is not active yet.
     let token = gateway::new_token().map_err(|e| format!("cannot make a token: {e}"))?;
-    // 5 and 6 are build phase 2: home image and workspace container.
+    // 5 and 6: none (the SSH workspace of the design is not built).
     // 7. Activate the token. The model server is not touched. A sync stall in step 2 or a forward clock
     // step can pass the deadline before this point; when it passed before systemd-run, the monotonic time
     // of the timer is 0, and its revoke waits for the lock. The key must not go live after its end time.
@@ -326,7 +325,7 @@ Rules:
 - Routes: GET /v1/models, POST /v1/chat/completions and POST /v1/completions only; each other route gets 404.
 - The end time does not move. A model failure or a restart of the host adds no time.
 - At the end time the key stops, and open requests close.
-- Prompts and completions are not logged. The delete at the end is not a secure erase: the model server can hold recent prompts in its memory until it restarts.
+- Prompts and completions are not logged. The model server can hold recent prompts in its memory until it restarts.
 - The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).
 - The connection goes through the relays of Tailscale (Tailscale Funnel). Tailscale sees your IP address and the time and size of the traffic. The Tailscale service on the host can log your IP address for a connection that arrives while the gateway restarts or is stopped.
 - Acceptable use: no unlawful use, no attack on other systems, and no resale of the access.",
@@ -467,7 +466,6 @@ mod tests {
             "The end time does not move",
             "the key stops, and open requests close",
             "not logged",
-            "not a secure erase",
             "until it restarts",
             // The log filter of gateway/Caddyfile deletes the client address (tests/gateway.sh, case "access log").
             "The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).",
