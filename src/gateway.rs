@@ -233,15 +233,6 @@ mod tests {
     }
 
     #[test]
-    fn close_writes_deny_all_and_then_restarts() {
-        let (paths, runner) = (Paths::temp(), FakeRunner::default());
-        write_rule(&paths, &rule(Some(("bob", "abc")))).unwrap();
-        assert_eq!(close(&paths, &runner), Ok(()));
-        assert!(is_deny_all(&paths));
-        assert_eq!(runner.calls(), ["systemctl try-restart caddy"]);
-    }
-
-    #[test]
     fn close_reports_a_failed_stop() {
         let (paths, runner) = (Paths::temp(), FakeRunner::default());
         runner.exit("systemctl try-restart caddy", 1);
@@ -266,6 +257,8 @@ mod tests {
         });
         assert_eq!(close(&paths, &runner), Ok(()));
         assert_eq!(*seen.lock().unwrap(), rule(None));
+        assert!(is_deny_all(&paths));
+        assert_eq!(runner.calls(), ["systemctl try-restart caddy"]);
     }
 
     #[test]

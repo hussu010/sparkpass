@@ -196,7 +196,7 @@ install -m 0644 "$repo/gateway/Caddyfile" "$caddyfile"
 mkdir -p "$units/caddy.service.d"
 install -m 0644 "$repo/systemd/caddy-sparkpass.conf" "$units/caddy.service.d/sparkpass.conf"
 install -m 0644 "$repo/systemd/pass-reconcile.service" "$repo/systemd/pass-reconcile.timer" "$units/"
-# The model starts at each boot, with sparkrun as the user who runs sudo (README, "Set up the pair").
+# The model starts at each boot, with sparkrun as the user who runs sudo (docs/setup-by-hand.md, step 2).
 model_unit=$units/sparkpass-model.service
 owner_home=
 if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
@@ -247,7 +247,7 @@ if [[ -e $model_unit ]]; then
 	systemctl enable sparkpass-model.service
 else
 	warn "sparkpass-model.service is not installed: run this script with sudo as the user of sparkrun
-(\$HOME/.local/bin/sparkrun, README \"Set up the pair\"). Until then, the model does not start after a reboot."
+(\$HOME/.local/bin/sparkrun, docs/setup-by-hand.md, step 2). Until then, the model does not start after a reboot."
 fi
 
 warn_on_automatic_updates
@@ -332,7 +332,7 @@ spark.tail1234.ts.net, with no trailing dot (the DNSName of 'tailscale status --
        this machine (a node key expires after 180 days by default; then Funnel and the certificate stop).
        tailscale set --accept-dns=false --auto-update=false --netfilter-mode=nodivert
          (this unit then resolves <name> through public DNS, to a relay of Funnel, so that the self-check
-         of grant and tests/expiry.sh --via-public take the public route; MagicDNS gives the tailnet
+         of grant takes the public route; MagicDNS gives the tailnet
          address of this unit, where Caddy does not listen. An automatic update restarts tailscaled,
          and each open guest stream ends. With nodivert, tailscaled adds no rules before the sparkpass
          firewall, and the firewall rules refuse to load without it: also on the second unit)

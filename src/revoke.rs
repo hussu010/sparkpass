@@ -12,8 +12,7 @@
 //!    close before the lock failed, token file is not deny-all, or lease is REVOKE-FAILED?
 //!      ──▶ repeat the two steps above (D8)
 //!    stop the end timer
-//!    docker rm -f workspace                        (SSH sessions end)        [build phase 2]
-//!    unmount and delete the home image                                       [build phase 2]
+//!    (the SSH workspace of the design is not built: no container and no home image to remove)
 //!    each step ok? ── yes ──▶ record to history/, delete the lease file
 //!                 └── no ───▶ mark REVOKE-FAILED, exit non-zero, journal, one NOTIFY_URL message
 //! ```
@@ -55,7 +54,7 @@ pub fn revoke(paths: &Paths, runner: &dyn Runner, name: &str, now: u64, closed: 
     if let Err(e) = lease::stop_end_timer(runner, &lease) {
         failed.push(e);
     }
-    // 4 and 5 are build phase 2: remove the workspace container, unmount and delete the home image.
+    // 4 and 5: none (the SSH workspace of the design is not built).
     // 6. History record, then delete the lease file. A retry after a failed delete replaces the record
     // of the first try (one record for each lease).
     if failed.is_empty() {

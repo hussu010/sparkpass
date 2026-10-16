@@ -2,13 +2,13 @@
 //!
 //! ```text
 //! flock, then read the clock
-//!  1 firewall rules ── fail ──▶ stop workspace, stop Caddy, exit non-zero
-//!    unreadable lease file ──▶ stop Caddy and workspace, exit non-zero (D7)
+//!  1 firewall rules ── fail ──▶ stop Caddy, exit non-zero
+//!    unreadable lease file ──▶ stop Caddy, exit non-zero (D7)
 //!  2 lease overdue or REVOKE-FAILED ──▶ revoke
 //!    token file not deny-all and no lease ──▶ close the gateway
 //!    token file not the rule of the active lease ──▶ revoke that lease (its key is dead)
 //!    settings file missing or bad ──▶ stop Caddy, exit non-zero
-//!  3 lease still active ──▶ attach image, create end timer, start workspace
+//!  3 lease still active ──▶ create end timer
 //!  4 read the clock again, revoke each lease that is overdue now
 //!    gateway-open marker ──▶ stop Caddy, exit non-zero
 //!    a failed revoke or close in 2 or 4, or no end timer in 3 for a lease that ends before the next run
@@ -26,7 +26,7 @@
 //!   notification for each such config (src/funnel.rs); the result of the run stays
 //! ```
 //!
-//! Build phase 1 has no workspace and no home image. The step order is the safety property:
+//! The step order is the safety property:
 //! only this command starts the gateway, only after each overdue lease is revoked, and only with
 //! the proof that the gateway refuses a wrong token.
 
@@ -64,15 +64,8 @@ fn steps(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64, runs: &Cel
         Ok(lock) => lock,
         Err(e) => return fail_closed(runner, format!("cannot take the lock {}: {e}", paths.lock.display())),
     };
-    // The clock never goes back within one run: a lease that one read sees as overdue stays overdue, also
-    // after a backward step of the system clock. Step 3 counts on this.
-    let latest = Cell::new(0);
-    let clock = || {
-        let t = clock().max(latest.get());
-        latest.set(t);
-        t
-    };
-    // After the lock: a lease whose deadline passed during the wait is overdue.
+    // After the lock: a lease whose deadline passed during the wait is overdue. `clock` never goes back (the
+    // steady_clock of main.rs), so a lease that one read sees as overdue stays overdue; step 3 counts on this.
     let now = clock();
     // 1. Firewall rules.
     if let Err(e) = run_ok(runner, &[config::FIREWALL]) {
@@ -608,20 +601,6 @@ mod tests {
         );
         assert_eq!(files(&paths.leases), [] as [&str; 0]);
 
-        // The same, and then the clock steps back before step 4: the lease is still overdue for this run.
-        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
-        seed(&paths, "bob", 2_000, State::Active);
-        write_rule_of_bob(&paths);
-        let reads = AtomicU64::new(0);
-        let clock = || [NOW, 2_000, 1_999][(reads.fetch_add(1, Ordering::SeqCst) as usize).min(2)];
-        assert_eq!(reconcile(&paths, &runner, &clock), Ok(()));
-        assert_eq!(
-            runner.calls(),
-            [FIREWALL, &check_timer(2_000), RESTART, &stop_timer(2_000), &check_timer(2_000), START, PROBE, PROBE_POST, FUNNEL]
-        );
-        assert_eq!(files(&paths.leases), [] as [&str; 0]);
-        assert_eq!(end_of_record(&paths), 2_000);
-
         // The revoke fails: no start.
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
         seed(&paths, "bob", 2_000, State::Active);
@@ -867,9 +846,9 @@ mod tests {
 
     #[test]
     fn active_lease_gets_its_end_timer_when_the_timer_does_not_exist() {
-        // The timer counts from the clock before systemd-run: 60 seconds after the first read, or the
-        // first read when the clock stepped back by 1000 seconds.
-        for (later, on_active) in [(NOW, 500), (NOW + 60, 440), (NOW - 1_000, 500)] {
+        // The timer counts from the clock before systemd-run: 60 seconds after the first read. (A clock that steps
+        // back is the steady_clock test in main.rs: reconcile gets no other clock.)
+        for (later, on_active) in [(NOW, 500), (NOW + 60, 440)] {
             let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
             seed(&paths, "bob", 2_000, State::Active);
             gateway::write_rule(&paths, &gateway::rule(Some(("bob", "abc")))).unwrap();
@@ -1452,6 +1431,17 @@ mod tests {
         for key in ["Wants", "Requires", "BindsTo", "Upholds"] {
             assert!(!values(key).contains(&"tailscaled.service"), "{key}= starts tailscaled at each run:\n{unit}");
         }
+    }
+
+    // Added for the Codex review of 2026-10-16 (F1).
+    // Value: protects=the model unit loads the firewall rules as root before vLLM opens its control ports, so a
+    // boot whose reconcile run failed to load them does not start the model; fails_when=the ExecStartPre line
+    // goes, loses its "+", or names another script; why_new=no test read systemd/sparkpass-model.service; seam=none
+    #[test]
+    fn model_unit_loads_the_firewall_as_root_before_the_model_starts() {
+        let unit = include_str!("../systemd/sparkpass-model.service");
+        let want = format!("+{}", config::FIREWALL);
+        assert_eq!(gateway::unit_values(unit, "ExecStartPre").first().copied(), Some(want.as_str()), "{unit}");
     }
 
     // Added for the TODO item "Check the Funnel setup in reconcile and install.sh" (2026-10-13).
