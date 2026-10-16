@@ -80,6 +80,12 @@ The design, with the reason for each safety rule, is in
    downloads about 140 GB), and ends with checks and the URLs. Run it again at any time: it skips what is
    done. Each step, with the reason for it, is in [`docs/setup-by-hand.md`](docs/setup-by-hand.md).
 
+   It asks for passwords: `sudo` on each unit (more than once), and `sparkrun setup ssh` for the SSH
+   password of each unit when the units have no SSH keys yet.
+
+   To update later: `git pull`, then `./setup.sh <worker-cx7>` again. It installs the new version only when
+   no pass is active.
+
 ## Give a guest pass
 
 On the head unit:
@@ -144,17 +150,26 @@ On the head unit, as the user of sparkrun, in the repository:
    - Read the licence of the weights, and of any draft model.
    - Check the file: `sparkrun recipe validate templates/<name>.yaml`.
 
-3. Make sure that no pass is active (`sudo sparkpass list`), then switch:
+3. Make sure that no pass is active (`sudo sparkpass list`), then start the new model by hand. The first
+   start downloads the weights and copies them to the worker, and that can take longer than the time limit
+   of `sparkpass-model.service` (about 16 min). The firewall needs no change: it closes each port except SSH.
 
    ```bash
-   echo RECIPE=templates/<name>.yaml | sudo tee /etc/sparkpass/model.env   # the model of each boot
    sparkrun stop --all --cluster pair
-   sudo systemctl restart sparkpass-model.service   # starts $RECIPE and waits until it answers (up to 12 min)
+   sparkrun run templates/<name>.yaml --cluster pair --no-follow
+   until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health)" = 200 ]; do sleep 10; done   # Ctrl-C if it never ends: sparkrun logs --cluster pair
    ```
 
-   To go back to the default model, delete `/etc/sparkpass/model.env` and run the last two commands again.
-   A pass that is active during a switch has no model until the new one answers, and its end time does not
-   move. Recipes for one unit (`min_nodes: 1`) are not tested with sparkpass.
+4. Make it the model of each boot:
+
+   ```bash
+   echo RECIPE=templates/<name>.yaml | sudo tee /etc/sparkpass/model.env
+   ```
+
+   To go back to the default model, delete `/etc/sparkpass/model.env`, then run
+   `sparkrun stop --all --cluster pair` and `sudo systemctl restart sparkpass-model.service` (about 5 min:
+   its weights are on disk). A pass that is active during a switch has no model until the new one answers,
+   and its end time does not move. Recipes for one unit (`min_nodes: 1`) are not tested with sparkpass.
 
 ## Use the model from your own editor
 
