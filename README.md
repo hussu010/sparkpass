@@ -16,12 +16,14 @@ and no web page.
 
 ## Status
 
-- Works on the author's pair since 2026-10-15: Qwen3.8-Flash-Next (NVFP4) with tensor parallel 2 across the
-  two units, 262,144 tokens of context, up to 16 requests at the same time, 64 to 73 tokens/s for one stream.
+- Works on the author's pair since 2026-10-15. The default recipe, `templates/pair.yaml`: Qwen3.8-Flash-Next
+  (NVFP4) with tensor parallel 2 across the two units, 262,144 tokens of context, up to 16 requests at the same
+  time, 64 to 73 tokens/s for one stream. Since 2026-10-17 the author's pair serves GLM-5.3-Flash instead
+  (`templates/glm53-flash.yaml`, see "Run another model").
 - API only. The SSH workspace for guests (build phase 2 of the design) is not built.
 - One model at a time, and one owner's pair. `setup.sh` has run on one pair only.
-- The model weights are under the Qwen Community License 1.0. Its clause 2 ("Model as a Service") needs a
-  separate license from Qwen before you charge for a pass.
+- The Qwen weights are under the Qwen Community License 1.0. Its clause 2 ("Model as a Service") needs a
+  separate license from Qwen before you charge for a pass. The GLM-5.3-Flash weights permit commercial use.
 
 ## How it works
 
@@ -180,7 +182,8 @@ path on the worker before the first start.
 
 ## Use the model from your own editor
 
-Point the editor's OpenAI-compatible provider at `http://localhost:8000/v1`, model `qwen3.8-flash-next`, no
+Point the editor's OpenAI-compatible provider at `http://localhost:8000/v1`, model `qwen3.8-flash-next` (the
+name that `GET /v1/models` gives for another recipe), no
 key (streaming, tool calls and `/v1/completions` work). The port comes from SSH to the head unit over the
 tailnet, not through Funnel, and it uses no guest pass:
 

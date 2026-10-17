@@ -39,7 +39,7 @@
 **Context:** Split from "Fail closed when the gateway does not enforce the token file" (TODO batch 2 of 2026-10-06). The review notes of the batch are in the PR of the branch. The code parts landed on branch feat/tunnel-and-p1-code (2026-10-07), with the owner decisions of that day: the inbound method is Tailscale Funnel with raw TCP passthrough (TLS ends at Caddy, the certificate comes from tailscaled, Caddy listens on 127.0.0.1 only and has no port-80 listener, and the access log keeps no client address); the admin API is on `unix//run/caddy/admin.sock` with `RuntimeDirectory=caddy` (the reloads of tests/gateway.sh go over the socket, on 2.6.2 and 2.11); a guest key reaches only GET /v1/models, POST /v1/chat/completions and POST /v1/completions, and each other route gets the gateway's 404 (D14); reconcile reads `systemctl show -p ActiveState --value caddy` after a failed step (activating and deactivating stop Caddy); `GATEWAY_CHECK_ADDRESS` must be 127.0.0.1, where Caddy listens (rule 3 of the completed item "Fail closed when the gateway does not enforce the token file"; owner decision D3 of the /ship review); and grant step 8 confirms an answer other than 401 of the public route through the loopback check before it writes the marker. The /ship review of the branch added (owner decisions D4 and D5): a Host header other than the TLS name gets 421 (`strict_sni_host`), and the default logger keeps the same filtered fields as the site log, also for a served request with the site name in other letter case (D7); grant step 8 names a listener with no key check for a 2xx or 3xx public answer and notifies; tests/expiry.sh --via-public confirms a non-401 answer through 127.0.0.1 before it writes the marker, and each cut is timed on one route (two routes since item 4 of "Review follow-ups of the Funnel branch", 2026-10-13); pass-reconcile.service starts after tailscaled (After= only, so that an owner's stop of tailscaled lasts; D8); tests/expiry.sh needs --ttl 180s or more with --via-public (D9); the pass text names the relays of Tailscale and the journal of tailscaled (D10).
 
 **Effort:** M
-**Priority:** P1 (before the first guest)
+**Priority:** done (2026-10-15). Open: one real NOTIFY_URL message (below) and the 300 s question ("Long requests through the gateway").
 **Depends on:** Milestone 1 (Next Steps 1 to 3 of the design: the model on the pair, the Funnel setup, firewall/rules.sh).
 
 ### Review follow-ups of the Funnel branch
@@ -59,9 +59,29 @@ Optional (advisory; done): proven_open can use `local VIA=("${DIRECT[@]}")` (bas
 **Context:** From cycle 3 and Step 11 of the /ship review of branch feat/tunnel-and-p1-code (specialists, red team, the Claude adversarial pass, the Codex adversarial challenge; 2026-10-07). A /ship run stops before the push when a third fixing cycle edits a file, so the owner moved these items to the next branch (owner decisions D11 and D12). Item 5 matters on the unit now: put the ts.net name with no trailing dot in PUBLIC_URL and SPARKPASS_SITE.
 
 **Effort:** S
-**Priority:** P1 (with the milestone-1 PR, before the first guest)
+**Priority:** done, except item 7 (now "Long requests through the gateway")
 **Depends on:** None (items 4 and 7 run on the head unit).
 **Completed (items 1, 2, 3, 5 and 6):** branch fix/funnel-review-followups (2026-10-08). Item 4 in code: branch fix/funnel-check-and-expiry-items (2026-10-13); steps 3 and 5 of tests/expiry.sh time the cut on GET /v1/models and POST /v1/chat/completions (the POST sends `{}`, which starts no stream), and a run on the unit proves it. Item 7 and the optional advisories: the same branch (2026-10-13). The frozen-stub request of `tests/expiry.sh --stub --via-public` is silent for 300 s on a relay of Funnel, so that run proves item 7; its failure text names a relay that closes a silent connection, and --help says so. proven_open uses `local VIA=("${DIRECT[@]}")`, and the script refuses a GATEWAY_CHECK_ADDRESS other than 127.0.0.1 before it arms. Item 1: the test helper `gateway::unit_values` reads a unit key as systemd does (split at "=", the key trimmed), both unit-file tests use it, and the test of the caddy drop-in honors an empty `RuntimeDirectory=` (a reset; a dependency such as Wants= has no reset). Item 2: the comment names proven_open for --via-public. Item 3: the pass text has the routes line, and `routes_of_the_pass_text_are_the_routes_of_the_caddyfile` compares it with `@sparkpass_route` of gateway/Caddyfile. Item 5, both ways: `read_settings` refuses a PUBLIC_URL host with a trailing dot and names the fix, and the gateway check (grant steps 1 and 8, reconcile) counts a 421 as a failed check (stop, no marker), and so does tests/expiry.sh at the check address (in proven_open, expect and the cleanup check); etc/config.example, etc/caddy.env.example and install.sh say "no trailing dot". Item 6: each stop of step 8 for a public answer other than 401 sends one notification after the stop, with a text that names the case (also a 400 or 422 to the POST: a listener with no key check); a proven answer sends only the notification of the marker.
+
+### Long requests through the gateway
+
+**What:** Find out whether a long request reaches the guest through Tailscale Funnel, then fix the limit or tell the guest. Caddy gives 504 when the model server sends no response header within 300 s (`response_header_timeout 300s` in gateway/Caddyfile). A request that is not streamed sends its header only at the end; a streamed one sends it at once, and then nothing until the first token. Measure through a pinned relay address: one streamed request of about 470k prompt tokens (about 230 s of silence), two at the same time (about 460 s), and one request that is not streamed and ends after about 290 s. If the relay keeps a silent connection, raise the Caddy limit (the guest gets the answer); if not, add a pass-text line that long prompts must use streaming.
+
+**Why:** With GLM-5.3-Flash (default since 2026-10-17), one prompt of 472k tokens took 229 s on the server alone, and up to 4 requests share the prefill, so a request that is not streamed can wait longer than 300 s. Whether a relay closes a silent connection was never proven (item 7 of "Review follow-ups of the Funnel branch").
+
+**Effort:** S
+**Priority:** P1 (GLM is the default model)
+**Depends on:** a test pass on the head unit (needs the owner's sudo).
+
+### One real NOTIFY_URL message
+
+**What:** Set NOTIFY_URL in /etc/sparkpass/config (for example an ntfy topic), force one notification (a revoke of an end timer that is gone, or a model outage during a test pass), and check that the message arrives.
+
+**Why:** No alert during a pass has ever reached the owner; the code is tested only with fakes.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** nothing.
 
 ## Firewall (milestone 1)
 
@@ -76,7 +96,7 @@ Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j
 **Context:** From the security specialist and the red team of the /ship review of branch feat/tunnel-and-p1-code (owner decision D5, 2026-10-07). The design now says "the LAN, the tailnet, and the internet" in its constraint and its Success Criteria. install.sh copies firewall/rules.sh to /usr/local/lib/sparkpass/rules.sh.
 
 **Effort:** M
-**Priority:** P1 (before the first guest)
+**Priority:** done (2026-10-15). Left (P2): the tailnet policy (tailnet sources get only the owner's SSH) and the boundary checks after a `systemctl restart tailscaled` from a tailnet device.
 **Depends on:** nothing more (the ports and bind addresses were listed on 2026-10-15).
 
 ### The worker starts vLLM even when its firewall rules did not load
@@ -86,14 +106,14 @@ Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j
 **Why:** The control ports of vLLM permit code execution. On a worker with no rules they accept connections from the LAN and the tailnet.
 
 **Effort:** S
-**Priority:** P2
+**Priority:** done (2026-10-17): `firewall/check-workers.sh` runs as the second ExecStartPre of sparkpass-model.service. It reads the hosts of the sparkrun cluster (`sparkrun cluster show pair --json`), skips the addresses of the head, and needs `systemctl is-active sparkpass-firewall.service` over SSH on each other host; a failure stops the start, and the unit tries again in 30 s. Tested by tests/check-workers.sh (fakes) and by hand on spark-3.
 **Depends on:** nothing.
 
 ## Models
 
 ### Model profiles and one command
 
-**Status (2026-10-16):** a text model can be switched by hand: README "Run another model" (sparkrun search, export and validate; `RECIPE=` in /etc/sparkpass/model.env; a restart of sparkpass-model.service). MiniMax H3 ran on spark-3 alone, for the owner only, with the joeynyc/MiniMax-H3-DGX-Spark recipe on port 8100 (measured: ready 11 min after a cold start, 90.5 GiB for the process, a 2.4 s 768x448 clip with stereo audio in 127 to 133 s). Still open: the command, the profiles and the non-text routes below.
+**Status (2026-10-16):** a text model can be switched by hand: README "Run another model" (sparkrun search, export and validate; `RECIPE=` in /etc/sparkpass/model.env; a restart of sparkpass-model.service). MiniMax H3 ran on spark-3 alone, for the owner only, with the joeynyc/MiniMax-H3-DGX-Spark recipe on port 8100 (measured: ready 11 min after a cold start, 90.5 GiB for the process, a 2.4 s 768x448 clip with stereo audio in 127 to 133 s). Since 2026-10-17 the pair serves GLM-5.3-Flash (`templates/glm53-flash.yaml`, RECIPE= in /etc/sparkpass/model.env on spark-3): warm start 304 s; one stream 23-28 tokens/s; 4 requests at the same time; 4 x 126k and 1 x 472k prompt tokens passed with at least 5.96 GiB free (earlyoom kills near 2.4 GiB). Its loader needs io_uring, so the recipe names `templates/seccomp-io-uring.json`. Still open: the command, the profiles and the non-text routes below.
 
 **What:** `sparkpass model use <model>`: find a tested recipe (the sparkrun registries or templates/), check the memory (`sparkrun recipe vram`), refuse while a lease is active, stop the old model, start the new one, select the API profile of its task type, write the route list of the gateway from that profile and reload Caddy, run the smoke test of the profile, and give the pass text the routes of the profile. A model with no tested recipe: stop with a message, not a guess. One profile for each task type (text now; image, video and audio later): the allowed routes, the body and time limits, the smoke test, and the clean-up at the end of a lease. The route lists in gateway/Caddyfile, src/grant.rs and tests/gateway.sh come from the profile. A route that shares state between guests stays closed or gets a clean-up: in the vLLM-Omni video API, `GET /v1/videos` lists every stored job and `GET /v1/videos/{id}/content` downloads any of them, so the video profile blocks the list and deletes the stored jobs at each revoke (as the text profile blocks LoRA loading, D14). One model runs at a time. The first non-text profile is video, with MiniMax H3; sparkrun 0.3.10 has no vLLM-Omni runtime and no image or video recipe, so the first video model also adds that runtime one time.
 
@@ -118,8 +138,18 @@ Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j
 **Context:** Owner decision D7 of 2026-10-14: document the commands now (README.md, "Set up the pair") and write the script only after milestone 1, because the firewall, install.sh, the Funnel procedure and tests/expiry.sh are not proven on the units yet, and a script of unproven steps needs a rewrite. This changes Premise 1 of the design ("Own pair only. No installer for other owners in this build"), so change the premise in the same branch. `sparkrun setup wizard --hosts <head>,<worker>` does the SSH, Docker group, sudoers and earlyoom steps in one call, but it asks questions; the first setup ran the separate sparkrun commands instead, and the wizard is not tested on the units.
 
 **Effort:** M
-**Priority:** P3 (after milestone 1)
-**Depends on:** Milestone 1 proven on the units (the model, the firewall, install.sh, the Funnel procedure, tests/expiry.sh).
+**Priority:** P2: prove it on the second pair (owner decisions D24 = the owner runs the README as a new user, D25 = a new Tailscale account). Waiting for: the address of each unit, the user name, and the Mac's SSH key on both units. Rules of the run: follow only the README, fix the repo (not the unit) at each stop, then a 2m pass from outside and a reboot.
+**Depends on:** Milestone 1 proven on the units (done).
+
+### Power for the pair
+
+**What:** A UPS for both units (and the router), or at least a note in the pass text of the risk.
+
+**Why:** Both units share one power source, and it failed at 07:04 on 2026-10-14 and at 07:20 on 2026-10-16. The units come back by themselves (the boot path is proven), but an active pass loses the time, and the end time does not move.
+
+**Effort:** hardware
+**Priority:** P2
+**Depends on:** nothing.
 
 ## Completed
 

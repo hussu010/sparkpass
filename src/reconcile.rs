@@ -1444,6 +1444,18 @@ mod tests {
         assert_eq!(gateway::unit_values(unit, "ExecStartPre").first().copied(), Some(want.as_str()), "{unit}");
     }
 
+    // Added for TODOS "The worker starts vLLM even when its firewall rules did not load" (2026-10-17).
+    // Value: protects=the model does not start while a worker has no active firewall unit; fails_when=the check line
+    // goes, gets a "-" (a failure that does not count), moves after the start, or names a script that is not in the
+    // repo; why_new=the check is new; seam=none (tests/check-workers.sh tests the script itself)
+    #[test]
+    fn model_unit_checks_the_worker_firewall_before_the_model_starts() {
+        let unit = include_str!("../systemd/sparkpass-model.service");
+        let pre = gateway::unit_values(unit, "ExecStartPre");
+        assert_eq!(pre.get(1).copied(), Some("@REPO@/firewall/check-workers.sh pair"), "{unit}");
+        assert!(include_str!("../firewall/check-workers.sh").contains("sparkpass-firewall.service"));
+    }
+
     // Added for the TODO item "Check the Funnel setup in reconcile and install.sh" (2026-10-13).
     // Value: protects=a handler of tailscaled that a stop of Caddy does not close (for example Funnel straight to
     // the model server) reaches the owner once for each config, and the run and its gateway stay; fails_when=the

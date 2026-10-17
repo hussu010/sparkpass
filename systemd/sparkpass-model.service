@@ -27,6 +27,9 @@ ExecCondition=/bin/sh -c '! curl -sf -m 3 http://127.0.0.1:8000/health >/dev/nul
 # The firewall first, as root ("+"): vLLM opens control ports that permit code execution, and After= does not
 # wait for a reconcile run that failed to load the rules. A failed load stops this start; it tries again in 30 s.
 ExecStartPre=+/usr/local/lib/sparkpass/rules.sh
+# Each worker too (firewall/check-workers.sh, as this user over SSH): its rules come from sparkpass-firewall.service at
+# its boot, and sparkrun starts the worker container also when that load failed.
+ExecStartPre=@REPO@/firewall/check-workers.sh pair
 # A reboot of the head alone leaves the old worker container on the other unit, with its GPU memory, and the
 # new engine then fails (spark-3, 2026-10-15). The model does not answer here, so no container is in use.
 ExecStartPre=-@HOME@/.local/bin/sparkrun stop --all --cluster pair

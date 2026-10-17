@@ -19,6 +19,8 @@ jobs:
       - run: CADDY_IMAGE=caddy:2.6.2 bash tests/gateway.sh
       # firewall/rules.sh with a real iptables in a privileged container.
       - run: bash tests/firewall.sh
+      # firewall/check-workers.sh (the worker check of sparkpass-model.service) with fake sparkrun, ssh and ip.
+      - run: bash tests/check-workers.sh
 
   # The deployable binary comes only from a push to main, never from a pull request. Only this job gets
   # the permissions of the build attestation.
