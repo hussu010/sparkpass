@@ -171,6 +171,13 @@ On the head unit, as the user of sparkrun, in the repository:
    its weights are on disk). A pass that is active during a switch has no model until the new one answers,
    and its end time does not move. Recipes for one unit (`min_nodes: 1`) are not tested with sparkpass.
 
+`templates/glm53-flash.yaml` is a second tested recipe: GLM-5.3-Flash (NVIDIA FP4 build, 166 GB). Its license
+permits paid passes, but it is slower: about 25 tokens/s for one stream and 4 requests at the same time, where
+`pair.yaml` gives about 65 tokens/s and 16. Its weight loader needs `io_uring`, which Docker's default seccomp
+profile refuses, so the recipe names `templates/seccomp-io-uring.json` (that profile plus the three `io_uring`
+calls) by an absolute path. Change `/home/spark` in the recipe to your home, and copy the file to the same
+path on the worker before the first start.
+
 ## Use the model from your own editor
 
 Point the editor's OpenAI-compatible provider at `http://localhost:8000/v1`, model `qwen3.8-flash-next`, no

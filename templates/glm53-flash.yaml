@@ -1,0 +1,109 @@
+# sparkpass: GLM-5.3-Flash (NVIDIA FP4 build) on the pair, for a measurement against templates/pair.yaml.
+# First start by hand (README, "Run another model"): sparkrun run templates/glm53-flash.yaml --cluster pair --no-follow
+# Source: the sparkrun registry recipe @eugr/glm-5.3-flash (sparkrun 0.3.10, 2026-10-17), which serves the
+# local-inference-lab build, and the "2 x NVIDIA DGX Spark" launch of the nvidia/GLM-5.3-Flash-FP4-Local card.
+# Weights: NVIDIA Open Model Agreement ("Works are commercially usable"); the base model is MIT.
+# Changes to the source, nothing else:
+#   - model: the NVIDIA FP4 build (165 GiB), pinned; its scale format needs the image below, not upstream vLLM.
+#   - container: the image that the NVIDIA card names (eugr/spark-vllm-b12x:latest, nightly-20261015, 9.7 GB,
+#     arm64), pinned by digest, so no local build (the source builds vllm-node-b12x with the eugr builder).
+#   - env: the 4 settings of the NVIDIA card that the source lacks (NCCL_BUFFSIZE, NCCL_MAX_CTAS,
+#     VLLM_B12X_MOE_FP4_FORCE_A16, B12X_W4A16_A4_PREFILL).
+#   - host 127.0.0.1 (the source binds 0.0.0.0), a served name, and cluster_only with exactly 2 nodes.
+#   - executor_config: a seccomp profile that permits io_uring (see the comment there).
+# Measured on the pair, 2026-10-17 (direct on the head, reasoning_effort low): first start 10.8 min (kernel
+#   compilation); one stream 23-28 tokens/s (pair.yaml: 61-69); 2/4 requests 36/45 tokens/s in total; 64k cold
+#   context 31 s to the first token; opencode 3-bug task 2/2 in 45 s. Memory then 114/121 GiB used on the head
+#   (7 GiB available): load-test long requests before a guest uses it. Not measured through the gateway.
+# The model thinks at reasoning_effort "max" by default; a client sends reasoning_effort "low" or "high" for
+# shorter answers.
+
+recipe_version: "1"
+name: glm-5.3-flash-fp4-2x-dgx-spark
+description: "GLM-5.3-Flash (nvidia/GLM-5.3-Flash-FP4-Local) on two DGX Sparks, OpenAI-compatible API on port 8000"
+
+model: nvidia/GLM-5.3-Flash-FP4-Local
+model_revision: 76348ddb2be2e35e39ecfc00e75dc07703f4f3d5
+container: eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595
+runtime: vllm-distributed
+
+build_args: []
+
+cluster_only: true
+min_nodes: 2
+max_nodes: 2
+
+# The b12x weight loader of this image reads the checkpoint through io_uring, and Docker's default seccomp profile
+# refuses io_uring_setup (EPERM): both workers then fail at weight loading, and the containers stay up with no
+# server. templates/seccomp-io-uring.json is Docker's default profile (moby/profiles) plus io_uring_enter,
+# io_uring_register and io_uring_setup, nothing else; the container stays unprivileged, with no added capability.
+# NVIDIA's launch uses --privileged instead. The path must exist on both units (each docker CLI reads it).
+executor_config:
+  security_opt:
+    - no-new-privileges
+    - seccomp=/home/spark/sparkpass/templates/seccomp-io-uring.json
+
+defaults:
+  port: 8000
+  host: 127.0.0.1
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  decode_context_parallel: 1
+  block_size: 256
+  max_model_len: 500000
+  max_num_seqs: 4
+  max_num_batched_tokens: 4096
+  num_speculative_tokens: 5
+  gpu_memory_utilization: 0.87
+
+env:
+  CUTE_DSL_ARCH: sm_121a
+  SAFETENSORS_FAST_GPU: "1"
+  VLLM_ENABLE_ROCE_ALLREDUCE: "1"
+  VLLM_ROCE_ALLREDUCE_MAX_SIZE: 2MB
+  NCCL_BUFFSIZE: "1048576"
+  NCCL_MAX_CTAS: "8"
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_ENABLE_PCIE_ALLREDUCE: "0"
+  B12X_POLICY_MODE: auto
+  VLLM_B12X_MOE_FP4_FORCE_A16: "1"
+  B12X_W4A16_A4_PREFILL: "1"
+  INSTANTTENSOR_BACKEND: BUFFERED
+  INSTANTTENSOR_BUFFER_SIZE: "67108864"
+  INSTANTTENSOR_CHUNK_SIZE: "8388608"
+  INSTANTTENSOR_CONCURRENCY: "1"
+  INSTANTTENSOR_IO_DEPTH: "3"
+
+command: |
+  vllm serve nvidia/GLM-5.3-Flash-FP4-Local \
+    --revision 76348ddb2be2e35e39ecfc00e75dc07703f4f3d5 \
+    --served-model-name glm-5.3-flash nvidia/GLM-5.3-Flash-FP4-Local \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --decode-context-parallel-size {decode_context_parallel} \
+    --mamba-cache-mode align \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --dtype bfloat16 \
+    --kv-cache-dtype fp8 \
+    --quantization modelopt_mixed \
+    --attention-backend B12X \
+    --block-size {block_size} \
+    --moe-backend b12x \
+    --linear-backend b12x \
+    --no-enable-flashinfer-autotune \
+    --load-format b12x \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens},"moe_backend":"humming","attention_backend":"B12X"}}' \
+    --reasoning-parser glm45 \
+    --tool-call-parser glm47 \
+    --enable-auto-tool-choice \
+    --gpu-memory-utilization {gpu_memory_utilization}
