@@ -15,7 +15,7 @@ RUN rustup component add clippy
 EOF
 ```
 
-Five checks, the same as `.github/workflows/ci.yml`, and the firewall test. Run all six before a push.
+Five checks, the same as `.github/workflows/ci.yml`, and the firewall and worker-check tests. Run all seven before a push.
 
 Unit tests:
 
@@ -52,6 +52,12 @@ interfaces of a unit). `FIREWALL_TEST_IMAGE=<image>` skips the package install w
 
 ```bash
 bash tests/firewall.sh
+```
+
+The worker check of `sparkpass-model.service` (`firewall/check-workers.sh`), with fake `sparkrun`, `ssh` and `ip`:
+
+```bash
+bash tests/check-workers.sh
 ```
 
 Rules for tests:
