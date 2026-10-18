@@ -79,6 +79,8 @@ Installed on spark-3 on 2026-10-18 during the pass of 2026-10-17 (a copy of gate
 
 **What:** Set NOTIFY_URL in /etc/sparkpass/config (for example an ntfy topic), force one notification (a revoke of an end timer that is gone, or a model outage during a test pass), and check that the message arrives.
 
+**Status (2026-10-18):** NOTIFY_URL (an ntfy.sh topic) is set on spark-3, and a test message with the same kind of request (a plain-text POST with curl) was sent; reconcile passed after the change. Still open: one message from sparkpass's own code.
+
 **Why:** No alert during a pass has ever reached the owner; the code is tested only with fakes.
 
 **Effort:** S
