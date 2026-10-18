@@ -71,22 +71,11 @@ fn steps(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64, runs: &Cel
     if let Err(e) = run_ok(runner, &[config::FIREWALL]) {
         return fail_closed(runner, format!("the firewall rules did not load: {e}"));
     }
-    // An unreadable lease can be an overdue lease (eng review D7).
-    let leases = match lease::read_all(paths) {
-        Ok(all) => all
-            .into_iter()
-            .map(|(_, lease)| lease)
-            .collect::<Result<Vec<Lease>, String>>()
-            .map_err(|e| format!("unreadable lease file {e}")),
-        Err(e) => Err(format!("cannot read the lease directory {}: {e}", paths.leases.display())),
-    };
-    let leases = match leases {
+    let leases = match read_leases(paths) {
         Ok(leases) => leases,
         Err(e) => return fail_closed(runner, e),
     };
-    let (ended, mut active): (Vec<&Lease>, Vec<&Lease>) = leases
-        .iter()
-        .partition(|lease| lease.deadline <= now || lease.state == State::RevokeFailed);
+    let (ended, mut active): (Vec<&Lease>, Vec<&Lease>) = leases.iter().partition(|lease| is_ended(lease, now));
     let mut failed = Vec::new();
     // A failed revoke or close (the access cut is not proven), or an active lease with no end timer near
     // its end: the gateway must stop (see step 4).
@@ -333,6 +322,36 @@ fn check_funnel(paths: &Paths, runner: &dyn Runner) {
     }
 }
 
+/// Each lease file. An unreadable lease can be an overdue lease (eng review D7), so it is an error.
+fn read_leases(paths: &Paths) -> Result<Vec<Lease>, String> {
+    match lease::read_all(paths) {
+        Ok(all) => all
+            .into_iter()
+            .map(|(_, lease)| lease)
+            .collect::<Result<Vec<Lease>, String>>()
+            .map_err(|e| format!("unreadable lease file {e}")),
+        Err(e) => Err(format!("cannot read the lease directory {}: {e}", paths.leases.display())),
+    }
+}
+
+/// Step 2 revokes this lease.
+fn is_ended(lease: &Lease, now: u64) -> bool {
+    lease.deadline <= now || lease.state == State::RevokeFailed
+}
+
+/// `sparkpass check`, for install.sh during a lease (owner decision D35): fails when the first reconcile of
+/// this build would stop the gateway or revoke an active lease because it cannot read the state (an
+/// unreadable lease file, or a token file that is not the rule of the active lease). No lock and no change:
+/// install.sh holds the lock while it runs this.
+pub fn check(paths: &Paths, now: u64) -> Result<String, String> {
+    let leases = read_leases(paths)?;
+    let active: Vec<&Lease> = leases.iter().filter(|lease| !is_ended(lease, now)).collect();
+    if !active.is_empty() && !active.iter().any(|lease| gateway::is_rule_of(paths, &lease.name)) {
+        return Err("the token file is not the rule of the active lease; reconcile would revoke it".into());
+    }
+    Ok(String::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +407,24 @@ mod tests {
     fn end_of_record(paths: &Paths) -> serde_json::Value {
         let record = fs::read_to_string(paths.history.join("bob-1000.json")).unwrap();
         serde_json::from_str::<serde_json::Value>(&record).unwrap()["end"].clone()
+    }
+
+    // Value: an install during a pass (owner decision D35) refuses a build whose first reconcile would end the pass.
+    // protects=check fails for an active lease whose rule is not in the token file and for an unreadable lease
+    // file, and passes for an overdue lease (reconcile ends that one anyway); fails_when=check skips one of these
+    // cases; why_new=install.sh had no way to ask the new build about the live state; seam=Paths::temp, no runner.
+    #[test]
+    fn check_fails_only_when_reconcile_would_end_an_active_lease() {
+        let paths = Paths::temp();
+        seed(&paths, "bob", 2_000, State::Active);
+        let error = check(&paths, NOW).unwrap_err();
+        assert!(error.contains("not the rule of the active lease"), "{error}");
+        assert_eq!(check(&paths, 2_000), Ok(String::new()));
+        write_rule_of_bob(&paths);
+        assert_eq!(check(&paths, NOW), Ok(String::new()));
+        fs::write(paths.lease("eve"), "{").unwrap();
+        let error = check(&paths, NOW).unwrap_err();
+        assert!(error.starts_with("unreadable lease file"), "{error}");
     }
 
     #[test]

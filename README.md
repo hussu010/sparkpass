@@ -85,8 +85,9 @@ The design, with the reason for each safety rule, is in
    It asks for passwords: `sudo` on each unit (more than once), and `sparkrun setup ssh` for the SSH
    password of each unit when the units have no SSH keys yet.
 
-   To update later: `git pull`, then `./setup.sh <worker-cx7>` again. It installs the new version only when
-   no pass is active.
+   To update later: `git pull`, then `./setup.sh <worker-cx7>` again. It also installs during a pass: the
+   key of the pass stays, and the gateway reloads instead of a stop. A build that cannot read the pass
+   refuses; then revoke the pass first, or wait for its end.
 
 ## Give a guest pass
 

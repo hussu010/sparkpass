@@ -2,7 +2,7 @@
 # One command for the pair: the steps of docs/setup-by-hand.md, on the head unit, as the user of
 # sparkrun (not root; it uses sudo, and ssh -t to the worker, where a step needs root).
 # Idempotent: each step checks first and skips what is done, so a second run changes nothing except
-# install.sh, which runs again with no lease (it picks up an update of this repository).
+# install.sh, which runs again (it picks up an update of this repository, also during a lease).
 set -euo pipefail
 
 usage() {
@@ -121,12 +121,8 @@ if [[ -z $binary ]]; then
 	"${docker[@]}" run --rm --user "$(id -u):$(id -g)" -e CARGO_HOME=/work/target/cargo-home -v "$repo":/work -w /work \
 		rust:1-slim-bookworm cargo build --locked --release
 fi
-if [[ ! -x /usr/local/bin/sparkpass || $(sudo /usr/local/bin/sparkpass list) == "no lease" ]]; then
-	# Its next steps are steps 5 and 7 here.
-	sudo "$repo/install.sh" --binary "$binary" | sed '/^Next steps/,$d'
-else
-	echo "a lease is active: install.sh skipped (it runs only with no lease)"
-fi
+# Its next steps are steps 5 and 7 here. During a lease it keeps the key (install.sh, owner decision D35).
+sudo "$repo/install.sh" --binary "$binary" | sed '/^Next steps/,$d'
 
 step "5. Funnel and the settings"
 sudo tailscale set --accept-dns=false --auto-update=false --netfilter-mode=nodivert
