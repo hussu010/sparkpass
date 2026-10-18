@@ -1,5 +1,5 @@
-# sparkpass: GLM-5.3-Flash (NVIDIA FP4 build) on the pair, for a measurement against templates/pair.yaml.
-# First start by hand (README, "Run another model"): sparkrun run templates/glm53-flash.yaml --cluster pair --no-follow
+# sparkpass: GLM-5.3-Flash (NVIDIA FP4 build) on the pair, the default recipe (owner decision D38, 2026-10-18).
+# setup.sh starts it the first time; by hand: sparkrun run templates/glm53-flash.yaml --cluster pair --no-follow
 # Source: the sparkrun registry recipe @eugr/glm-5.3-flash (sparkrun 0.3.10, 2026-10-17), which serves the
 # local-inference-lab build, and the "2 x NVIDIA DGX Spark" launch of the nvidia/GLM-5.3-Flash-FP4-Local card.
 # Weights: NVIDIA Open Model Agreement ("Works are commercially usable"); the base model is MIT.
@@ -37,11 +37,12 @@ max_nodes: 2
 # refuses io_uring_setup (EPERM): both workers then fail at weight loading, and the containers stay up with no
 # server. templates/seccomp-io-uring.json is Docker's default profile (moby/profiles) plus io_uring_enter,
 # io_uring_register and io_uring_setup, nothing else; the container stays unprivileged, with no added capability.
-# NVIDIA's launch uses --privileged instead. The path must exist on both units (each docker CLI reads it).
+# NVIDIA's launch uses --privileged instead. install.sh (also --second-unit) puts it at this path on both units,
+# where each docker CLI reads it.
 executor_config:
   security_opt:
     - no-new-privileges
-    - seccomp=/home/spark/sparkpass/templates/seccomp-io-uring.json
+    - seccomp=/usr/local/lib/sparkpass/seccomp-io-uring.json
 
 defaults:
   port: 8000

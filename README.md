@@ -16,14 +16,15 @@ and no web page.
 
 ## Status
 
-- Works on the author's pair since 2026-10-15. The default recipe, `templates/pair.yaml`: Qwen3.8-Flash-Next
-  (NVFP4) with tensor parallel 2 across the two units, 262,144 tokens of context, up to 16 requests at the same
-  time, 64 to 73 tokens/s for one stream. Since 2026-10-17 the author's pair serves GLM-5.3-Flash instead
-  (`templates/glm53-flash.yaml`, see "Run another model").
+- Works on the author's pair since 2026-10-15. The default recipe, `templates/glm53-flash.yaml`: GLM-5.3-Flash
+  (NVIDIA FP4 build) with tensor parallel 2 across the two units, 500,000 tokens of context, up to 4 requests at
+  the same time, 23 to 28 tokens/s for one stream. A prompt of 471,835 tokens ran in 229 s. The second tested
+  recipe, `templates/pair.yaml` (Qwen3.8-Flash-Next), is faster (see "Run another model").
 - API only. The SSH workspace for guests (build phase 2 of the design) is not built.
 - One model at a time, and one owner's pair. `setup.sh` has run on one pair only.
-- The Qwen weights are under the Qwen Community License 1.0. Its clause 2 ("Model as a Service") needs a
-  separate license from Qwen before you charge for a pass. The GLM-5.3-Flash weights permit commercial use.
+- The GLM-5.3-Flash weights permit commercial use (NVIDIA Open Model Agreement; the base model is MIT). The Qwen
+  weights of `templates/pair.yaml` are under the Qwen Community License 1.0: its clause 2 ("Model as a Service")
+  needs a separate license from Qwen before you charge for a pass.
 
 ## How it works
 
@@ -34,7 +35,7 @@ guest ──https──> Tailscale Funnel ──raw TCP──> Caddy on 127.0.0.
 ```
 
 - [sparkrun](https://pypi.org/project/sparkrun/) and vLLM serve the model across both units
-  (`templates/pair.yaml`). The API listens on the loopback address of the head unit only.
+  (`templates/glm53-flash.yaml`). The API listens on the loopback address of the head unit only.
 - Tailscale Funnel carries the guest traffic to Caddy with TLS intact. Caddy ends TLS with the certificate
   of the ts.net name, checks the key, and permits `GET /v1/models`, `POST /v1/chat/completions` and
   `POST /v1/completions` only. The access log keeps no client address and no prompt.
@@ -57,7 +58,7 @@ The design, with the reason for each safety rule, is in
 - Kernel `7.0.0-1019-nvidia` breaks NCCL over RoCE unless the kernel command line has `kho=off`
   (`cat /proc/cmdline`). NVIDIA's update adds it with `/etc/default/grub.d/nvidia-spark-kho.cfg`.
 - A Tailscale account on which you can enable HTTPS certificates and Funnel.
-- Wired Ethernet on the head unit: it downloads about 140 GB, and it carries the guest traffic. On the first
+- Wired Ethernet on the head unit: it downloads about 190 GB, and it carries the guest traffic. On the first
   setup, Wi-Fi gave 80 Mb/s and Ethernet 220 Mb/s on the same internet line.
 
 ## Set up the pair
@@ -79,7 +80,7 @@ The design, with the reason for each safety rule, is in
    ```
 
    It installs sparkrun, sets up the cluster, the firewall and the gateway, starts the model (the first start
-   downloads about 140 GB), and ends with checks and the URLs. Run it again at any time: it skips what is
+   downloads about 190 GB and compiles kernels for about 11 minutes), and ends with checks and the URLs. Run it again at any time: it skips what is
    done. Each step, with the reason for it, is in [`docs/setup-by-hand.md`](docs/setup-by-hand.md).
 
    It asks for passwords: `sudo` on each unit (more than once), and `sparkrun setup ssh` for the SSH
@@ -104,7 +105,7 @@ sudo sparkpass revoke <name>                   # end a pass now
 ```
 Endpoint: https://<head unit>.<tailnet>.ts.net/v1
 API key:  <key>
-Model:    qwen3.8-flash-next
+Model:    glm-5.3-flash
 End time: 2026-10-16 10:00:00 UTC
 
 Rules:
@@ -174,16 +175,19 @@ On the head unit, as the user of sparkrun, in the repository:
    its weights are on disk). A pass that is active during a switch has no model until the new one answers,
    and its end time does not move. Recipes for one unit (`min_nodes: 1`) are not tested with sparkpass.
 
-`templates/glm53-flash.yaml` is a second tested recipe: GLM-5.3-Flash (NVIDIA FP4 build, 166 GB). Its license
-permits paid passes, but it is slower: about 25 tokens/s for one stream and 4 requests at the same time, where
-`pair.yaml` gives about 65 tokens/s and 16. Its weight loader needs `io_uring`, which Docker's default seccomp
-profile refuses, so the recipe names `templates/seccomp-io-uring.json` (that profile plus the three `io_uring`
-calls) by an absolute path. Change `/home/spark` in the recipe to your home, and copy the file to the same
-path on the worker before the first start.
+`templates/pair.yaml` is the second tested recipe: Qwen3.8-Flash-Next (NVFP4, about 140 GB). It is faster:
+about 65 tokens/s for one stream and 16 requests at the same time, where the default gives about 25 and 4, with
+262,144 tokens of context. Its license needs a separate license from Qwen before you charge for a pass. Before
+its first start, fetch its shard 35 on both units (`docs/setup-by-hand.md`, step 3, or `setup.sh` with
+`RECIPE=templates/pair.yaml` in `/etc/sparkpass/model.env`).
+
+The weight loader of the default recipe needs `io_uring`, which Docker's default seccomp profile refuses. The
+recipe names `templates/seccomp-io-uring.json` (that profile plus the three `io_uring` calls), which
+`install.sh` copies to `/usr/local/lib/sparkpass/` on both units.
 
 ## Use the model from your own editor
 
-Point the editor's OpenAI-compatible provider at `http://localhost:8000/v1`, model `qwen3.8-flash-next` (the
+Point the editor's OpenAI-compatible provider at `http://localhost:8000/v1`, model `glm-5.3-flash` (the
 name that `GET /v1/models` gives for another recipe), no
 key (streaming, tool calls and `/v1/completions` work). The port comes from SSH to the head unit over the
 tailnet, not through Funnel, and it uses no guest pass:
@@ -206,5 +210,6 @@ commands and the rules for tests are in [`CLAUDE.md`](CLAUDE.md). `install.sh`, 
 
 ## License
 
-The code is under the [MIT License](LICENSE). The model weights that `templates/pair.yaml` names have their
-own license (Qwen Community License 1.0).
+The code is under the [MIT License](LICENSE). The model weights that the recipes name have their own licenses:
+NVIDIA Open Model Agreement for `templates/glm53-flash.yaml` (base model MIT), Qwen Community License 1.0 for
+`templates/pair.yaml`.

@@ -40,8 +40,22 @@ the worker over the ConnectX-7 link):
 
 ```bash
 git clone https://github.com/hussu010/sparkpass && cd sparkpass
-# Shard 35 of the base model (2.8 GB, the MXFP8 prefill weights): the serve command fetches it at start
-# when it is missing, and sparkrun stops a head that is not ready after about 2 minutes.
+# The seccomp profile of the recipe, on both units (step 4 and step 5 install it the same way).
+for h in <head-cx7> <worker-cx7>; do scp templates/seccomp-io-uring.json "$h": && \
+  ssh -t "$h" 'sudo install -D -m 0644 seccomp-io-uring.json /usr/local/lib/sparkpass/seccomp-io-uring.json'; done
+sparkrun run templates/glm53-flash.yaml --cluster pair --no-follow
+until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health)" = 200 ]; do sleep 10; done
+```
+
+The API listens on `127.0.0.1:8000` of the head unit only. Guests reach it through the gateway. On the
+author's pair: the first start took 10.8 min (kernel compilation) and a later one 5 min, and one stream gave
+23 to 28 tokens/s.
+
+For `templates/pair.yaml` (Qwen) instead, fetch its shard 35 on both units first (2.8 GB, the MXFP8 prefill
+weights: the serve command fetches it at start when it is missing, and sparkrun stops a head that is not ready
+after about 2 minutes):
+
+```bash
 I=ghcr.io/ursuciprian/spark-vllm-b12x:k94-20261013-21e0b201-d21d7ade-warm
 for h in <head-cx7> <worker-cx7>; do ssh "$h" "docker pull -q $I >/dev/null; docker run --rm --user \$(id -u):\$(id -g) \
   -e HF_HOME=/cache/huggingface -v \$HOME/.cache/huggingface:/cache/huggingface --entrypoint python3 $I -c \
@@ -49,12 +63,9 @@ for h in <head-cx7> <worker-cx7>; do ssh "$h" "docker pull -q $I >/dev/null; doc
   revision='7c4f1bc1a2d6847e0cbc01ac6b823f00251de8dd', \
   allow_patterns=['model-00035-of-00036.safetensors', 'model.safetensors.index.json'])\""; done
 sparkrun run templates/pair.yaml --cluster pair --no-follow
-until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health)" = 200 ]; do sleep 10; done
 ```
 
-The API listens on `127.0.0.1:8000` of the head unit only. Guests reach it through the gateway. On the
-first setup: the first start took 6 min 54 s and a later one 4 min 25 s, and one stream gave 64 to 73
-tokens/s (512 tokens, thinking off).
+It gave 64 to 73 tokens/s for one stream (512 tokens, thinking off); its first start took 6 min 54 s.
 
 4. The firewall (`firewall/rules.sh`): new connections from the LAN and the tailnet get no model or control
 port; SSH stays open. On the worker, from a copy of this repository:
