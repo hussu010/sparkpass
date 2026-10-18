@@ -13,7 +13,8 @@ usage: sudo ./install.sh [--binary <path>]
 
   --binary <path>  the sparkpass binary to install
                    (default: target/release/sparkpass of this repository)
-  --second-unit    install only firewall/rules.sh and sparkpass-firewall.service (the second Spark)
+  --second-unit    install only firewall/rules.sh, sparkpass-firewall.service and the seccomp profile
+                   of the model (the second Spark)
   --help           show this text
 EOF
 }
@@ -64,6 +65,8 @@ units=/etc/systemd/system
 install_rules() {
 	mkdir -p "${rules%/*}"
 	install -m 0755 "$rules_source" "$rules"
+	# The seccomp profile of templates/glm53-flash.yaml: the docker CLI of each unit reads it at the model start.
+	install -m 0644 "$repo/templates/seccomp-io-uring.json" "${rules%/*}/"
 }
 
 # Update rule (eng review D4): automatic updates are off on both units. This value is the switch of the

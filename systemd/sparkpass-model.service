@@ -20,7 +20,7 @@ WorkingDirectory=@REPO@
 EnvironmentFile=-/etc/environment
 Environment=SPARKRUN_NO_TELEMETRY=1
 # The recipe to start. RECIPE=<path> in /etc/sparkpass/model.env overrides it (README, "Run another model").
-Environment=RECIPE=templates/pair.yaml
+Environment=RECIPE=templates/glm53-flash.yaml
 EnvironmentFile=-/etc/sparkpass/model.env
 # A model that answers already is left alone (a start of this unit by hand, for example).
 ExecCondition=/bin/sh -c '! curl -sf -m 3 http://127.0.0.1:8000/health >/dev/null'

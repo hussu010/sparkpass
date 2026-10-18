@@ -57,7 +57,7 @@ route=$(ip -o route get "$worker") || die "no route to $worker"
 [[ $route != *" via "* ]] || die "$worker is behind a router; give the ConnectX-7 address of the worker"
 iface=$(awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}' <<<"$route")
 head=$(awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}' <<<"$route")
-# The serve port of templates/pair.yaml (defaults.port).
+# The serve port of the recipes in templates/ (defaults.port).
 port=8000
 export PATH=$HOME/.local/bin:$PATH SPARKRUN_MGMT_IFACE=$iface SPARKRUN_NO_TELEMETRY=1
 echo "head $head, worker $worker, link $iface"
@@ -108,7 +108,8 @@ done
 
 step "3. The firewall on the worker"
 tar -C "$repo" --exclude=.git --exclude=target -cf - . | ssh -o BatchMode=yes "$worker" 'mkdir -p sparkpass && tar -xf - -C sparkpass'
-ssh -t "$worker" 'systemctl is-active --quiet sparkpass-firewall.service && cmp -s sparkpass/firewall/rules.sh /usr/local/lib/sparkpass/rules.sh ||
+ssh -t "$worker" 'systemctl is-active --quiet sparkpass-firewall.service && cmp -s sparkpass/firewall/rules.sh /usr/local/lib/sparkpass/rules.sh &&
+cmp -s sparkpass/templates/seccomp-io-uring.json /usr/local/lib/sparkpass/seccomp-io-uring.json ||
 (cd sparkpass && sudo ./install.sh --second-unit)'
 
 step "4. The gateway (install.sh)"
@@ -141,30 +142,36 @@ sudo systemctl start pass-reconcile.timer
 sudo sparkpass reconcile
 
 step "6. The model"
-echo "The weights are under the Qwen Community License 1.0: clause 2 needs a licence from Qwen before a paid pass."
+# The recipe of the model unit: RECIPE= in /etc/sparkpass/model.env (README, "Run another model"), else the default.
+recipe=$(sed -n 's/^RECIPE=//p' /etc/sparkpass/model.env 2>/dev/null | tail -n 1)
+recipe=${recipe:-templates/glm53-flash.yaml}
+echo "recipe $recipe; its header names the license of its weights"
 # Shard 35 (the MXFP8 prefill weights of the checkpoint in templates/pair.yaml): the serve command fetches it at
 # start when it is missing, and sparkrun stops a head that is not ready after about 2 minutes.
-image=$(awk '$1 == "container:" {print $2}' "$repo/templates/pair.yaml")
-checkpoint=$(awk -F'"' '$1 ~ /VLLM_B12X_NVFP4_MXFP8_CHECKPOINT:/ {print $2}' "$repo/templates/pair.yaml")
-checkpoint=${checkpoint#/cache/huggingface/hub/}
-[[ $checkpoint == models--*/snapshots/* ]] || die "no VLLM_B12X_NVFP4_MXFP8_CHECKPOINT in templates/pair.yaml"
-model_repo=${checkpoint#models--}
-model_repo=${model_repo%%/*}
-model_repo=${model_repo/--//}
-revision=${checkpoint##*/}
-shard="model-00035-of-00036.safetensors"
-for h in "$head" "$worker"; do
-	ssh -n -o BatchMode=yes "$h" "test -f .cache/huggingface/hub/$checkpoint/$shard" && continue
-	ssh -n -o BatchMode=yes "$h" "docker pull -q $image >/dev/null && docker run --rm --user \$(id -u):\$(id -g) \
+checkpoint=$(awk -F'"' '$1 ~ /VLLM_B12X_NVFP4_MXFP8_CHECKPOINT:/ {print $2}' "$repo/$recipe")
+if [[ -n $checkpoint ]]; then
+	image=$(awk '$1 == "container:" {print $2}' "$repo/$recipe")
+	checkpoint=${checkpoint#/cache/huggingface/hub/}
+	[[ $checkpoint == models--*/snapshots/* ]] || die "VLLM_B12X_NVFP4_MXFP8_CHECKPOINT in $recipe is not a snapshot path"
+	model_repo=${checkpoint#models--}
+	model_repo=${model_repo%%/*}
+	model_repo=${model_repo/--//}
+	revision=${checkpoint##*/}
+	shard="model-00035-of-00036.safetensors"
+	for h in "$head" "$worker"; do
+		ssh -n -o BatchMode=yes "$h" "test -f .cache/huggingface/hub/$checkpoint/$shard" && continue
+		ssh -n -o BatchMode=yes "$h" "docker pull -q $image >/dev/null && docker run --rm --user \$(id -u):\$(id -g) \
 -e HF_HOME=/cache/huggingface -v \$HOME/.cache/huggingface:/cache/huggingface --entrypoint python3 $image -c \
 \"from huggingface_hub import snapshot_download as d; d('$model_repo', revision='$revision', \
 allow_patterns=['$shard', 'model.safetensors.index.json'])\""
-done
+	done
+fi
 health() { curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$port/health" || true; }
 if [[ $(health) != 200 ]]; then
 	# Old containers of a failed start hold GPU memory (systemd/sparkpass-model.service). The first run downloads
-	# the image and the model (about 140 GB), then copies them to the worker.
-	(cd "$repo" && { sparkrun stop --all --cluster pair || true; } && sparkrun run templates/pair.yaml --cluster pair --no-follow)
+	# the image and the model (about 190 GB for the default), then copies them to the worker. The first start
+	# of the default compiles kernels for about 11 minutes.
+	(cd "$repo" && { sparkrun stop --all --cluster pair || true; } && sparkrun run "$recipe" --cluster pair --no-follow)
 	for _ in $(seq 1 90); do
 		[[ $(health) == 200 ]] && break
 		sleep 10
