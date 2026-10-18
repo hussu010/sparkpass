@@ -328,7 +328,11 @@ Rules:
 - Prompts and completions are not logged. The model server can hold recent prompts in its memory until it restarts.
 - The owner keeps the lease record (name, start, end) and the gateway access log (time, method, path, status, size; no client address).
 - The connection goes through the relays of Tailscale (Tailscale Funnel). Tailscale sees your IP address and the time and size of the traffic. The Tailscale service on the host can log your IP address for a connection that arrives while the gateway restarts or is stopped.
-- Acceptable use: no unlawful use, no attack on other systems, and no resale of the access.",
+- Acceptable use: no unlawful use, no attack on other systems, and no resale of the access.
+
+Tips:
+- Long prompts or long answers: send \"stream\": true. A request that is not streamed gets its answer only at the end, and the gateway stops a very long wait with 504.
+- A thinking model answers slower. For a short answer, send \"reasoning_effort\": \"low\" (GLM) or \"chat_template_kwargs\": {{\"enable_thinking\": false}} (Qwen).",
         settings.public_url,
         format_utc(deadline)
     )
@@ -474,6 +478,10 @@ mod tests {
             // tailscaled logs the client address of a connection that it cannot forward (owner decision D10).
             "The Tailscale service on the host can log your IP address for a connection that arrives while the gateway restarts or is stopped.",
             "no unlawful use, no attack on other systems, and no resale",
+            // Tips for long and thinking requests (2026-10-18): a request that is not streamed waits for the response
+            // header limit of gateway/Caddyfile; GLM thinks at reasoning_effort "max" unless told otherwise.
+            "send \"stream\": true",
+            "send \"reasoning_effort\": \"low\" (GLM) or \"chat_template_kwargs\": {\"enable_thinking\": false} (Qwen)",
         ] {
             assert!(pass.contains(part), "{part:?} is not in:\n{pass}");
         }
