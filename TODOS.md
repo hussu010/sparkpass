@@ -65,7 +65,7 @@ Optional (advisory; done): proven_open can use `local VIA=("${DIRECT[@]}")` (bas
 
 ### Long requests through the gateway
 
-**Status (2026-10-18):** measured through the pinned relay 103.84.155.217 with no key and no model load: a TLS connection with no request stayed open for 960 s of silence (the test limit), and a keep-alive connection after one 401 closed at 301 s (Caddy's own 5-minute idle limit). So a relay does not close a silent connection within 16 minutes, and the only limit was Caddy's `response_header_timeout 300s`. Raised to 960 s (gateway/Caddyfile, tests/gateway.sh, the design): 4 queued GLM requests of 472k tokens that are not streamed end after about 916 s. A streamed request gets its header at once and is not affected by this limit.
+**Status (2026-10-18):** measured through one pinned relay address of the ts.net name, with no key and no model load: a TLS connection with no request stayed open for 960 s of silence (the test limit), and a keep-alive connection after one 401 closed at 301 s (Caddy's own 5-minute idle limit). So a relay does not close a silent connection within 16 minutes, and the only limit was Caddy's `response_header_timeout 300s`. Raised to 960 s (gateway/Caddyfile, tests/gateway.sh, the design): 4 queued GLM requests of 472k tokens that are not streamed end after about 916 s. A streamed request gets its header at once and is not affected by this limit.
 
 **What is left:** install it (install.sh refuses during a pass), then one real long request with a key through the relay: one request that is not streamed and ends after 300 to 900 s.
 
