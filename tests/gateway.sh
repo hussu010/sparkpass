@@ -115,13 +115,13 @@ echo "ok   start: $(docker exec "$box" caddy version | cut -d' ' -f1), stub on p
 
 case="config"
 config=$(docker exec "$box" caddy adapt --config /etc/caddy/Caddyfile 2>/dev/null)
-for want in '"grace_period":2000000000' '"response_header_timeout":300000000000' '"max_size":4000000'; do
+for want in '"grace_period":2000000000' '"response_header_timeout":960000000000' '"max_size":4000000'; do
 	[[ $config == *"$want"* ]] || fail "$case: the adapted config has no $want"
 done
 # The unit sets no SPARKPASS_BIND: Caddy then listens on loopback only, where tailscaled forwards Funnel's TCP.
 config=$(docker exec "$box" env -u SPARKPASS_BIND caddy adapt --config /etc/caddy/Caddyfile 2>/dev/null)
 [[ $config == *'"listen":["127.0.0.1:8443"]'* ]] || fail "$case: with no SPARKPASS_BIND, the site does not listen on 127.0.0.1 only"
-echo "ok   $case: grace period 2 s, response header timeout 300 s, body limit 4 MB, 127.0.0.1 with no SPARKPASS_BIND"
+echo "ok   $case: grace period 2 s, response header timeout 960 s, body limit 4 MB, 127.0.0.1 with no SPARKPASS_BIND"
 
 case="admin socket"
 # The admin API has no authentication: only the unix socket of the Caddyfile, and no TCP listener for it.

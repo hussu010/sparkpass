@@ -117,7 +117,7 @@ install.sh                      copies units, creates the state directories, dis
 - The admin API of Caddy listens only on the unix socket `/run/caddy/admin.sock` (`RuntimeDirectory=caddy` in the drop-in). The admin API has no authentication, and its default TCP listener (localhost:2019) is open to each local process, also to a model container with host networking. `systemctl reload caddy` reaches the socket as the caddy user. (P1 item of 2026-10-07)
 - Workspace listener: plain HTTP on the address of the workspace bridge, one port, with the same token check.
 - Global option `grace_period 2s`, so a stop or restart closes open requests after 2 seconds. The install step also checks `TimeoutStopSec` of the installed unit.
-- An error handler answers 503 when the model server refuses the connection. The reverse proxy has a response header timeout of 300 seconds, so a request to a frozen server ends with an error and does not hang without limit.
+- An error handler answers 503 when the model server refuses the connection. The reverse proxy has a response header timeout of 960 seconds (300 until 2026-10-18; a request that is not streamed gets its header only at the end, and long GLM requests take up to about 916 s), so a request to a frozen server ends with an error and does not hang without limit.
 - A maximum request body size applies on both listeners (eng review D9). The start value is 4 MB. The owner sets it from the context limit that passed the load test of milestone 1.
 - The access log keeps only: time, method, path, status, and size. It keeps no headers, no bodies, and no client address: behind Funnel each connection comes from tailscaled on 127.0.0.1, and Caddy 2.6.2 has no PROXY protocol listener.
 - A request whose Host header is not its TLS name gets 421 (global option `strict_sni_host`): the site block matches by Host, and a request that no site block takes would get an empty 200, not the 401 of the guard. The default logger keeps the same fields as the site log, because it takes the access line of each request that the site logger does not take: a request that no site block takes (421), and a served request whose Host differs from the site name only in letter case (Caddy serves the site with no regard to case, but picks the access logger by an exact Host match). So no request is left out of the log, and no line keeps a query string, headers, or a client address. (QA and red team of the /ship review, 2026-10-07; owner decisions D4 and D7)
@@ -204,7 +204,7 @@ Fallback trigger: if a boundary check in the Success Criteria still fails after 
 ### Failures during an active lease
 
 - Head-unit reboot or power cut: reconcile runs at boot. It attaches the home image and starts the workspace again with its data. The gateway answers 503 until the model runs.
-- Model server crash, or a freeze of the second unit: the owner starts the model again by hand with sparkrun. In the meantime the guest sees 503, or a request that ends with a timeout error after 300 seconds.
+- Model server crash, or a freeze of the second unit: the owner starts the model again by hand with sparkrun. In the meantime the guest sees 503, or a request that ends with a timeout error after 960 seconds.
 - The deadline does not move. The pass text states this rule.
 
 ### Guest data and retention
