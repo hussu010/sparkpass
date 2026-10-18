@@ -37,6 +37,7 @@ enum Command {
     Revoke { name: String, deadline: Option<u64> },
     List,
     Reconcile,
+    Check,
 }
 
 fn parse(args: &[&str]) -> Result<Command, String> {
@@ -57,6 +58,8 @@ fn parse(args: &[&str]) -> Result<Command, String> {
         }),
         ["list"] => Ok(Command::List),
         ["reconcile"] => Ok(Command::Reconcile),
+        // install.sh only (reconcile::check), thus not in the usage text.
+        ["check"] => Ok(Command::Check),
         _ => Err(USAGE.into()),
     }
 }
@@ -79,6 +82,7 @@ fn run(args: &[&str], paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u6
         Command::Reconcile => reconcile::reconcile(paths, runner, clock)
             .map(|()| String::new())
             .map_err(failure),
+        Command::Check => reconcile::check(paths, clock()).map_err(failure),
     }
 }
 
@@ -196,6 +200,7 @@ mod tests {
         );
         assert_eq!(parse(&["list"]), Ok(Command::List));
         assert_eq!(parse(&["reconcile"]), Ok(Command::Reconcile));
+        assert_eq!(parse(&["check"]), Ok(Command::Check));
     }
 
     #[test]
@@ -358,12 +363,13 @@ mod tests {
         assert_eq!(*free.lock().unwrap(), ["tailscale serve status --json", "systemctl try-restart caddy"]);
     }
 
+    // check: install.sh holds the lock while it runs `sparkpass check` (owner decision D35); a wait is a hang.
     #[test]
-    fn list_does_not_wait_for_the_lock() {
+    fn list_and_check_do_not_wait_for_the_lock() {
         let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
         let lock = paths.lock().unwrap();
         std::thread::scope(|scope| {
-            let list = scope.spawn(|| run(&["list"], &paths, &runner, &|| 1_000));
+            let list = scope.spawn(|| run(&["list"], &paths, &runner, &|| 1_000).and(run(&["check"], &paths, &runner, &|| 1_000)));
             let start = std::time::Instant::now();
             while !list.is_finished() && start.elapsed() < Duration::from_secs(5) {
                 std::thread::sleep(Duration::from_millis(10));

@@ -2,8 +2,8 @@
 # Installs sparkpass on the head unit, or with --second-unit only the firewall rules and their boot unit
 # on the second unit. Design: docs/designs/guest-pass-mvp.md ("Layout", "The gateway", "Locking, start
 # order, and the boot gate", "Distribution Plan").
-# Idempotent: run it again after each update of the repository. It refuses to run while a lease exists
-# (upgrade order: install with no active lease). It never overwrites the token file or a settings file.
+# Idempotent: run it again after each update of the repository, also during a lease (owner decision D35:
+# the key stays). It never overwrites the token file or a settings file.
 set -euo pipefail
 
 usage() {
@@ -120,12 +120,23 @@ caddy_hint="install Caddy 2.6 or newer from the Ubuntu package (apt install cadd
 systemctl cat caddy.service >/dev/null 2>&1 || die "caddy.service does not exist: $caddy_hint"
 getent group caddy >/dev/null || die "the group caddy does not exist: $caddy_hint"
 
-# Upgrade order: install with no active lease. A missing binary is a first install.
+# During a lease (owner decision D35): the token file and the lease file stay, so the key of the pass stays.
+# Caddy reloads instead of a stop, and a reconcile at the end proves the gateway. A missing binary is a first install.
+live=false
 if [[ -x /usr/local/bin/sparkpass ]]; then
-	leases=$(/usr/local/bin/sparkpass list) || die "'sparkpass list' failed; install only when it shows no lease"
-	[[ $leases == "no lease" ]] || die "install only with no lease; 'sparkpass list' shows:
-$leases
-End each lease first with 'sparkpass revoke <name>'."
+	leases=$(/usr/local/bin/sparkpass list) || die "'sparkpass list' failed"
+	if [[ $leases != "no lease" ]]; then
+		live=true
+		# The lock of sparkpass (flock(2), as File::lock): no grant, revoke or reconcile runs until the new files
+		# are in place. Released before the reconcile at the end. pass-reconcile.service waits up to 180 s for it.
+		exec 9>>/var/lib/sparkpass/lock
+		flock -w 60 9 || die "the sparkpass lock is busy (a grant, a revoke or a reconcile runs); run this script again"
+		# The first reconcile of the new build revokes a lease that it cannot match to the token file.
+		"$binary" check || die "this build cannot read the state of the active lease (or it is a build with no check
+command), and its first reconcile could end the lease. Install it only with no lease: 'sparkpass revoke <name>'
+first, or wait for the end. 'sparkpass list':
+$leases"
+	fi
 fi
 
 # time-sync.target waits for a real clock only with the wait service of the time daemon.
@@ -238,10 +249,18 @@ fi
 stop_timeout=$(systemctl show -p TimeoutStopUSec --value caddy.service) || true
 [[ $stop_timeout == 5s ]] || refuse_caddy_unit "caddy.service has TimeoutStopSec=$stop_timeout after the drop-in, expected 5s."
 
-# Only reconcile starts Caddy. No lease is active (checked above), so the stop affects no guest, and the
-# next reconcile starts Caddy with the new files and proves that it refuses a wrong key.
+# Only reconcile starts Caddy. With no lease, the stop affects no guest, and the next reconcile starts Caddy
+# with the new files and proves that it refuses a wrong key.
 systemctl disable caddy.service
-systemctl stop caddy.service
+if [[ $live == true ]]; then
+	# A running Caddy loads the new Caddyfile with the token file in place. A bad file fails the reload, and
+	# Caddy keeps the old config. A new drop-in counts from the next start (reconcile, boot).
+	systemctl try-reload-or-restart caddy.service ||
+		die "the gateway did not reload the new $caddyfile and keeps its old config: 'journalctl -u caddy' shows why"
+	exec 9>&-
+else
+	systemctl stop caddy.service
+fi
 systemctl enable pass-reconcile.service pass-reconcile.timer "$wait_unit"
 if [[ -e $model_unit ]]; then
 	systemctl enable sparkpass-model.service
@@ -315,6 +334,18 @@ if grep -qE '^(100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|fd7a:115c:a1e0:)' <
 $addresses
 Run 'tailscale set --accept-dns=false' (step 1 below): the self-check of sparkpass grant must take the
 public route of Funnel."
+fi
+
+if [[ $live == true ]]; then
+	# reconcile loads the firewall, proves that the gateway refuses a wrong key (D5) and checks the model.
+	/usr/local/bin/sparkpass reconcile || die "sparkpass reconcile failed after the install, so the gateway is
+stopped; the key of the pass stays valid. 'journalctl -t sparkpass' shows why; repair it, then run 'sparkpass reconcile'"
+	after=$(/usr/local/bin/sparkpass list)
+	[[ $after == "$leases" ]] || warn "'sparkpass list' changed during the install (an end time can pass):
+before: $leases
+after:  $after"
+	echo "sparkpass is updated during the lease: the gateway reloaded, reconcile passed, and the key is unchanged."
+	exit 0
 fi
 
 cat <<EOF

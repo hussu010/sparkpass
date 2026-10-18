@@ -1432,7 +1432,7 @@ None. Each record in the Decision ledger has an answer.
 ### Suppressed findings
 
 - Performance, confidence 4/10: heavy disk writes in the workspace can fill the page cache, and the page cache shares the unified memory with the model. Not shown as a finding, because no measurement exists. The load test of milestone 1 is the place to look.
-- Code Quality, confidence 4/10: a second run of `install.sh` during an active lease can change unit files under a running lease. Not shown as a finding, because the update rule (D4) already limits changes to times with no lease.
+- Code Quality, confidence 4/10: a second run of `install.sh` during an active lease can change unit files under a running lease. Not shown as a finding, because the update rule (D4) already limits changes to times with no lease. Changed by owner decision D35 (2026-10-18): `install.sh` runs during a lease. It never writes the token file or a lease file, so the key stays; it holds the sparkpass lock while `sparkpass check` of the new build proves that the build reads the lease and its token rule, reloads Caddy instead of a stop, and runs `sparkpass reconcile` at the end. D4 still applies to OS and firmware updates.
 
 ## GSTACK REVIEW REPORT
 
