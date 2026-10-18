@@ -100,7 +100,7 @@ Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j
 **Context:** From the security specialist and the red team of the /ship review of branch feat/tunnel-and-p1-code (owner decision D5, 2026-10-07). The design now says "the LAN, the tailnet, and the internet" in its constraint and its Success Criteria. install.sh copies firewall/rules.sh to /usr/local/lib/sparkpass/rules.sh.
 
 **Effort:** M
-**Priority:** done (2026-10-15). Left (P2): the tailnet policy (tailnet sources get only the owner's SSH) and the boundary checks after a `systemctl restart tailscaled` from a tailnet device.
+**Priority:** done (2026-10-15). Tailnet policy: no change (owner decision of 2026-10-18). The tailnet has two admin accounts, the owner's and a second admin's, so the default policy (each member reaches each device) is correct; the firewall leaves tailnet devices only SSH and, on spark-3, the gateway. SSH on both units accepts keys only since 2026-10-18 (`/etc/ssh/sshd_config.d/10-sparkpass-keys-only.conf`, owner decision D33); the second admin needs a key on both units. Left (P2): the boundary checks after a `systemctl restart tailscaled` from a tailnet device.
 **Depends on:** nothing more (the ports and bind addresses were listed on 2026-10-15).
 
 ### The worker starts vLLM even when its firewall rules did not load
@@ -149,7 +149,9 @@ Background: in its default netfilter mode, tailscaled puts `-j ts-input` and `-j
 
 **What:** A UPS for both units (and the router), or at least a note in the pass text of the risk.
 
-**Why:** Both units share one power source, and it failed at 07:04 on 2026-10-14 and at 07:20 on 2026-10-16. The units come back by themselves (the boot path is proven), but an active pass loses the time, and the end time does not move.
+**Why:** Both units share one power source. Cuts from the boot logs (both units at the same minute, no shutdown lines): 2026-10-15 07:03 (about 1 min), 2026-10-16 07:20 (about 8 min), 2026-10-16 20:32 (about 1 min), 2026-10-18 06:53 (about 45 min, during a pass: the boot path brought GLM back at 07:46, so the guest had no model for about 53 min). The units come back by themselves, but an active pass loses the time, and the end time does not move.
+
+**Sizing (estimate, not measured):** each unit has a 240 W adapter; plan 300 to 500 W with the router, pure sine output. 15 min covers 3 of the 4 cuts; the 45-minute cut needs about 1 h at 400 W, about 400 Wh usable (in Nepal, a home inverter with a 150 Ah battery). Measure the real draw with a plug-in meter. Three of the four cuts came between 06:53 and 07:20: ask whether they are scheduled.
 
 **Effort:** hardware
 **Priority:** P2
