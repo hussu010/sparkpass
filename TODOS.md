@@ -65,13 +65,13 @@ Optional (advisory; done): proven_open can use `local VIA=("${DIRECT[@]}")` (bas
 
 ### Long requests through the gateway
 
-**What:** Find out whether a long request reaches the guest through Tailscale Funnel, then fix the limit or tell the guest. Caddy gives 504 when the model server sends no response header within 300 s (`response_header_timeout 300s` in gateway/Caddyfile). A request that is not streamed sends its header only at the end; a streamed one sends it at once, and then nothing until the first token. Measure through a pinned relay address: one streamed request of about 470k prompt tokens (about 230 s of silence), two at the same time (about 460 s), and one request that is not streamed and ends after about 290 s. If the relay keeps a silent connection, raise the Caddy limit (the guest gets the answer); if not, add a pass-text line that long prompts must use streaming.
+**Status (2026-10-18):** measured through the pinned relay 103.84.155.217 with no key and no model load: a TLS connection with no request stayed open for 960 s of silence (the test limit), and a keep-alive connection after one 401 closed at 301 s (Caddy's own 5-minute idle limit). So a relay does not close a silent connection within 16 minutes, and the only limit was Caddy's `response_header_timeout 300s`. Raised to 960 s (gateway/Caddyfile, tests/gateway.sh, the design): 4 queued GLM requests of 472k tokens that are not streamed end after about 916 s. A streamed request gets its header at once and is not affected by this limit.
 
-**Why:** With GLM-5.3-Flash (default since 2026-10-17), one prompt of 472k tokens took 229 s on the server alone, and up to 4 requests share the prefill, so a request that is not streamed can wait longer than 300 s. Whether a relay closes a silent connection was never proven (item 7 of "Review follow-ups of the Funnel branch").
+**What is left:** install it (install.sh refuses during a pass), then one real long request with a key through the relay: one request that is not streamed and ends after 300 to 900 s.
 
 **Effort:** S
-**Priority:** P1 (GLM is the default model)
-**Depends on:** a test pass on the head unit (needs the owner's sudo).
+**Priority:** P2
+**Depends on:** a gap between passes (the pass of 2026-10-17 ends on 2026-11-16).
 
 ### One real NOTIFY_URL message
 
