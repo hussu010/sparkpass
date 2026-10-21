@@ -169,6 +169,8 @@ pub mod fake {
                 "tailscale serve status --json",
                 output(0, r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"}},"AllowFunnel":{"spark.example.net:443":true}}"#),
             );
+            // tailscaled runs (the state is read only after a serve config that does not match).
+            runner.on("tailscale status --json --peers=false", output(0, r#"{"BackendState":"Running"}"#));
             runner
         }
 

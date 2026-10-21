@@ -1,6 +1,8 @@
 //! `sparkpass reconcile` (at boot and each 5 minutes). Diagram from the design document:
 //!
 //! ```text
+//! before the run: pass-reconcile.service waits up to 10 s for tailscaled to run (`tailscale wait`; a failed
+//!   wait counts for nothing), so that the boot run gets the certificate of Caddy and the serve config
 //! flock, then read the clock
 //!  1 firewall rules ── fail ──▶ stop Caddy, exit non-zero
 //!    unreadable lease file ──▶ stop Caddy, exit non-zero (D7)
@@ -23,7 +25,8 @@
 //!    success with an active lease ──▶ model check (one notification at the start and at the end of an outage)
 //!    gateway stopped or not started with an active lease ──▶ one notification; the next successful start ──▶ one more
 //! after the lock: the serve config of tailscaled is not the one handler of the inbound route ──▶ one
-//!   notification for each such config (src/funnel.rs); the result of the run stays
+//!   notification for each such config (src/funnel.rs); the result of the run stays. While tailscaled does not
+//!   run yet (it reads the serve config with its first netmap, and serves nothing before it) ──▶ journal only
 //! ```
 //!
 //! The step order is the safety property:
@@ -42,9 +45,12 @@ use std::cell::Cell;
 use std::fs;
 use std::io::{self, Write};
 
+/// TimeoutStartSec of pass-reconcile.service, in seconds (a unit test compares the two).
+const RUN_LIMIT: u64 = 195;
+
 /// The latest start of the next run, in seconds: pass-reconcile.timer starts a run each 5 minutes, and a
-/// run can take up to TimeoutStartSec of pass-reconcile.service (180 s) before its revoke.
-const NEXT_RUN: u64 = 300 + 180;
+/// run can take up to TimeoutStartSec of pass-reconcile.service before its revoke.
+const NEXT_RUN: u64 = 300 + RUN_LIMIT;
 
 pub fn reconcile(paths: &Paths, runner: &dyn Runner, clock: &dyn Fn() -> u64) -> Result<(), String> {
     // True when a run failed but the gateway still runs with its proof (a failed step, see step 4).
@@ -294,7 +300,9 @@ fn fail_closed(runner: &dyn Runner, cause: String) -> Result<(), String> {
 /// The inbound route (src/funnel.rs), after the lock: it changes no lease and no gateway. A stop of Caddy does
 /// not close another handler of tailscaled, so each serve config that is not the one handler of install.sh
 /// sends one notification (the marker holds that config), and the result of the run stays. A failed read goes
-/// to the journal only: with tailscaled down, Funnel serves nothing.
+/// to the journal only: with tailscaled down, Funnel serves nothing. So does a mismatch while tailscaled does not
+/// run yet: it reads its serve config with its first netmap, and a boot run can come before it (the wait of
+/// pass-reconcile.service has a limit). A `{}` while tailscaled runs (a `tailscale funnel reset`) still counts.
 fn check_funnel(paths: &Paths, runner: &dyn Runner) {
     // A missing or bad settings file: the run failed for it already.
     let Ok(settings) = config::read_settings(paths) else {
@@ -311,6 +319,11 @@ fn check_funnel(paths: &Paths, runner: &dyn Runner) {
         let _ = fs::remove_file(&paths.funnel_mismatch);
         return;
     };
+    // The marker stays: the next run that sees tailscaled run decides.
+    if let Some(cause) = funnel::not_running(runner) {
+        let _ = writeln!(io::stderr(), "sparkpass: reconcile: {cause}; the next run checks the serve config");
+        return;
+    }
     let _ = writeln!(io::stderr(), "sparkpass: reconcile: {error}");
     let seen = serve.to_string();
     if fs::read_to_string(&paths.funnel_mismatch).is_ok_and(|text| text.trim() == seen) {
@@ -374,6 +387,8 @@ mod tests {
     const REVOKE_FAILED: &str = "the revoke of bob is not complete (state revoke-failed)";
     /// The read of the serve config of tailscaled: the last command of each run with a readable settings file.
     const FUNNEL: &str = "tailscale serve status --json";
+    /// The read of the state of tailscaled, after a serve config that does not match.
+    const STATUS: &str = "tailscale status --json --peers=false";
     /// The check with a wrong token after the start, through the check address of `Paths::temp`.
     const PROBE: &str = "curl -q --noproxy * -sS -o /dev/null -m 8 -w %{http_code} --connect-to ::127.0.0.1: -H Authorization: Bearer 0000000000000000000000000000000000000000000000000000000000000000 https://spark.example.net/v1/models";
     /// The second check with a wrong token: a POST to the route of the model.
@@ -464,8 +479,11 @@ mod tests {
             let wrong = format!("Authorization: Bearer {}", "0".repeat(64));
             let head = ["curl", "-q", "--noproxy", "*", "-sS", "-o", "/dev/null", "-m", "8", "-w", "%{http_code}", "--connect-to", connect, "-H", &wrong];
             let chat = url.replace("/v1/models", "/v1/chat/completions");
+            // The two checks come right before the read of the serve config (a PUBLIC_URL other than the name of
+            // the healthy serve config also reads the state of tailscaled after it).
+            let funnel = argv.iter().position(|call| call.join(" ") == FUNNEL).unwrap();
             assert_eq!(
-                argv[argv.len() - 3..argv.len() - 1],
+                argv[funnel - 2..funnel],
                 [[&head[..], &[url]].concat(), [&head[..], &["-H", "Content-Type: application/json", "-d", "{}", &chat]].concat()]
             );
         }
@@ -1517,11 +1535,11 @@ mod tests {
         let tail = |runner: &FakeRunner, n: usize| -> Vec<String> { runner.calls().split_off(runner.calls().len() - n) };
         // The run succeeds, and its gateway starts with its proof: the check changes neither. The message after it.
         assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
-        let calls = tail(&runner, 5);
-        assert!(calls[..4] == [START, PROBE, PROBE_POST, FUNNEL] && calls[4].starts_with(NOTIFY_CALL), "{calls:?}");
+        let calls = tail(&runner, 6);
+        assert!(calls[..5] == [START, PROBE, PROBE_POST, FUNNEL, STATUS] && calls[5].starts_with(NOTIFY_CALL), "{calls:?}");
         // The same config again: no second message.
         assert_eq!(reconcile(&paths, &runner, &|| NOW + 300), Ok(()));
-        assert_eq!(tail(&runner, 4), [START, PROBE, PROBE_POST, FUNNEL]);
+        assert_eq!(tail(&runner, 5), [START, PROBE, PROBE_POST, FUNNEL, STATUS]);
         // One failed send and one sent message.
         assert_eq!(sent(&runner).len(), 2, "{:?}", runner.calls());
         let text = sent(&runner).pop().unwrap();
@@ -1546,5 +1564,56 @@ mod tests {
         let error = reconcile(&paths, &runner, &|| NOW).unwrap_err();
         assert!(error.starts_with("the firewall rules did not load"), "{error}");
         assert_eq!(sent(&runner).len(), 4);
+    }
+
+    // Added for the boot after the power cut of 2026-10-21 (TODOS.md, "Prove the gateway step on the units"; owner
+    // decision D4 of the /ship review). Value: protects=a boot run that reads `{}` before the first netmap of
+    // tailscaled sends no false notification and keeps the marker, while a `{}` of a tailscaled that runs (a
+    // Funnel reset) or whose state cannot be read still sends one; fails_when=the state is not read, a state
+    // other than Running sends the message, or Running hides it; why_new=the check read only the serve config;
+    // seam=none
+    #[test]
+    fn serve_config_of_a_tailscaled_that_does_not_run_yet_sends_no_notification() {
+        let (paths, runner) = (Paths::temp(), FakeRunner::healthy());
+        fs::write(&paths.config, CONFIG_WITH_NOTIFY).unwrap();
+        let sent = |runner: &FakeRunner| runner.count(NOTIFY_CALL);
+        runner.on(FUNNEL, output(0, "{}"));
+        for state in ["NoState", "Starting", "NeedsLogin", "Stopped"] {
+            runner.on(STATUS, output(0, &format!(r#"{{"BackendState":"{state}"}}"#)));
+            assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+            assert!(runner.calls().ends_with(&[FUNNEL, STATUS].map(String::from)), "{:?}", runner.calls());
+            assert_eq!(sent(&runner), 0, "{state}");
+            assert!(!paths.funnel_mismatch.exists());
+        }
+        // The marker of an earlier mismatch stays, so a config that was seen does not send again.
+        fs::write(&paths.funnel_mismatch, "{\"TCP\":{}}\n").unwrap();
+        assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+        assert_eq!(fs::read_to_string(&paths.funnel_mismatch).unwrap(), "{\"TCP\":{}}\n");
+        // tailscaled runs: `{}` is a Funnel reset, and it sends one message. A state that cannot be read: also.
+        for (state, messages) in [(output(0, r#"{"BackendState":"Running"}"#), 1), (output(1, ""), 1)] {
+            let _ = fs::remove_file(&paths.funnel_mismatch);
+            runner.on(STATUS, state);
+            let before = sent(&runner);
+            assert_eq!(reconcile(&paths, &runner, &|| NOW), Ok(()));
+            assert_eq!(sent(&runner) - before, messages, "{:?}", runner.calls());
+            assert_eq!(fs::read_to_string(&paths.funnel_mismatch).unwrap(), "{}\n");
+        }
+    }
+
+    // Added for the boot after the power cut of 2026-10-21. Value: protects=the boot run of reconcile waits for
+    // tailscaled (the certificate of Caddy and the serve config come with its first netmap), with a limit, and a
+    // failed or missing wait does not stop the run (the firewall and the revokes); the time limit of the unit
+    // covers the wait and the commands, and NEXT_RUN follows it; fails_when=the wait goes, loses its "-" or its
+    // limit, or TimeoutStartSec and RUN_LIMIT differ; why_new=no wait existed; seam=none
+    #[test]
+    fn reconcile_unit_waits_for_tailscaled_with_a_limit_and_a_failure_that_does_not_count() {
+        let unit = include_str!("../systemd/pass-reconcile.service");
+        let pre = gateway::unit_values(unit, "ExecStartPre");
+        assert_eq!(pre, ["-/usr/bin/tailscale wait --timeout=10s"], "{unit}");
+        let limit: Vec<u64> = gateway::unit_values(unit, "TimeoutStartSec").iter().map(|v| v.parse().unwrap()).collect();
+        assert_eq!(limit, [RUN_LIMIT], "{unit}");
+        // The budget: the wait, 18 commands of at most 10 s each, and a margin for the wait for the lock.
+        const _: () = assert!(10 + 18 * 10 + 5 <= RUN_LIMIT);
+        assert_eq!(NEXT_RUN, 300 + RUN_LIMIT);
     }
 }
