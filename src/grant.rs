@@ -1050,16 +1050,24 @@ mod tests {
     #[test]
     fn grant_refuses_when_the_serve_config_is_not_the_one_handler() {
         let second = r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:443"},"8443":{"TCPForward":"127.0.0.1:8000"}},"AllowFunnel":{"spark.example.net:443":true,"spark.example.net:8443":true}}"#;
-        for (answer, cause) in [
-            (output(0, second), "the serve config of tailscaled is"),
-            (output(0, "{}"), "the serve config of tailscaled is"),
-            (output(1, ""), "cannot read the serve config"),
-            (Err(RunError::Timeout(Duration::from_secs(10))), "cannot read the serve config"),
+        // A serve config that does not match: grant also reads the state of tailscaled, for the cause of the error.
+        const STATUS: &str = "tailscale status --json --peers=false";
+        for (answer, state, cause) in [
+            (output(0, second), Some("Running"), "the serve config of tailscaled is"),
+            (output(0, "{}"), Some("Running"), "the serve config of tailscaled is"),
+            // The boot of tailscaled (2026-10-21): `{}` before its first netmap.
+            (output(0, "{}"), Some("NoState"), "tailscaled does not run yet"),
+            (output(1, ""), None, "cannot read the serve config"),
+            (Err(RunError::Timeout(Duration::from_secs(10))), None, "cannot read the serve config"),
         ] {
             let (paths, runner) = host();
             runner.on(FUNNEL, answer);
+            if let Some(state) = state {
+                runner.on(STATUS, output(0, &format!(r#"{{"BackendState":"{state}"}}"#)));
+            }
             assert_refused(&paths, &runner, &paths.snapshot());
-            assert_eq!(runner.calls(), [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL]);
+            let calls = [HEALTH, CADDY_ACTIVE, CHECK_GET, CHECK_POST, FUNNEL, STATUS];
+            assert_eq!(runner.calls(), calls[..if state.is_some() { 6 } else { 5 }]);
             let error = grant(&paths, &runner, "bob", TTL, &|| NOW).unwrap_err();
             assert!(error.starts_with(cause), "{error}");
         }

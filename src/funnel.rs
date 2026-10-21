@@ -68,9 +68,30 @@ fn shown(value: &Value) -> Value {
     }
 }
 
-/// Grant step 1: the serve config is the one handler of the inbound route.
+/// The cause of a serve config that does not match, when tailscaled does not run yet: tailscaled reads the serve
+/// config of its profile only with its first netmap, and before it `tailscale serve status --json` prints `{}`
+/// (spark-3, the boot after the power cut of 2026-10-21: the boot run of reconcile came 4 s before the state Running,
+/// and sent a false notification). In each state other than Running, Funnel serves nothing. None: tailscaled runs,
+/// or its state cannot be read; then the mismatch counts.
+pub fn not_running(runner: &dyn Runner) -> Option<String> {
+    // The JSON form prints the state in each state (`--peers=false`: no list of the other nodes).
+    let out = runner.run(&["tailscale", "status", "--json", "--peers=false"]).ok()?;
+    let status: Value = serde_json::from_str(&out.stdout).ok()?;
+    match status["BackendState"].as_str()? {
+        "Running" => None,
+        state => Some(format!(
+            "tailscaled does not run yet (BackendState {state:?}); it reads its serve config with its first netmap, and Funnel serves nothing before that"
+        )),
+    }
+}
+
+/// Grant step 1: the serve config is the one handler of the inbound route. A grant during the start of tailscaled
+/// refuses too, with that cause.
 pub fn check(runner: &dyn Runner, public_url: &str) -> Result<(), String> {
-    mismatch(&serve_config(runner)?, public_url).map_or(Ok(()), Err)
+    let Some(error) = mismatch(&serve_config(runner)?, public_url) else {
+        return Ok(());
+    };
+    Err(not_running(runner).map_or(error, |cause| format!("{cause}; run grant again when `tailscale status` shows that it runs")))
 }
 
 #[cfg(test)]
@@ -149,6 +170,40 @@ mod tests {
         assert!(error.contains(r#""10000":{"TCPForward":"127.0.0.1:8000"}"#) && error.contains(r#""8445":{"TCPForward":"[::1]:8000"}"#), "{error}");
         assert!(error.contains(r#""8444":{"TCPForward":"…"}"#) && error.contains(r#""/r":{"Redirect":"…"}"#), "{error}");
         assert!(error.contains(r#""spark.example.net:8443":true"#) && error.contains("`tailscale serve status --json`"), "{error}");
+    }
+
+    // Added for the boot after the power cut of 2026-10-21 (TODOS.md, "Prove the gateway step on the units").
+    // Value: protects=a serve config of `{}` from a tailscaled that has no netmap yet is named as that, not as a
+    // wrong handler, and a tailscaled that runs (or whose state cannot be read) still gets the mismatch error;
+    // fails_when=the state is not read, a state other than Running hides nothing, or Running hides the mismatch;
+    // why_new=the check read only the serve config; seam=none
+    #[test]
+    fn a_tailscaled_that_does_not_run_yet_is_the_cause_of_a_mismatch() {
+        const STATUS: &str = "tailscale status --json --peers=false";
+        let runner = FakeRunner::default();
+        runner.on("tailscale serve status --json", output(0, "{}"));
+        for (status, cause) in [
+            (output(0, r#"{"BackendState":"NoState","Self":{}}"#), Some("tailscaled does not run yet (BackendState \"NoState\")")),
+            (output(0, r#"{"BackendState":"Starting"}"#), Some("tailscaled does not run yet (BackendState \"Starting\")")),
+            (output(1, r#"{"BackendState":"Stopped"}"#), Some("tailscaled does not run yet (BackendState \"Stopped\")")),
+            (output(0, r#"{"BackendState":"Running"}"#), None),
+            (output(1, ""), None),
+            (output(0, "{}"), None),
+        ] {
+            runner.on(STATUS, status);
+            assert_eq!(not_running(&runner).as_deref().map(|text| &text[..cause.map_or(0, str::len)]), cause);
+            let error = check(&runner, URL).unwrap_err();
+            match cause {
+                Some(cause) => assert!(error.starts_with(cause) && error.contains("run grant again"), "{error}"),
+                None => assert!(error.starts_with("the serve config of tailscaled is {}"), "{error}"),
+            }
+        }
+        // The one handler needs no state: the state is read only for a mismatch.
+        let runner = FakeRunner::default();
+        runner.on("tailscale serve status --json", output(0, PROCEDURE));
+        runner.on(STATUS, output(0, r#"{"BackendState":"NoState"}"#));
+        assert_eq!(check(&runner, URL), Ok(()));
+        assert_eq!(runner.calls(), ["tailscale serve status --json"]);
     }
 
     #[test]

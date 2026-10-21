@@ -131,7 +131,7 @@ if [[ -x /usr/local/bin/sparkpass ]]; then
 	if [[ $leases != "no lease" ]]; then
 		live=true
 		# The lock of sparkpass (flock(2), as File::lock): no grant, revoke or reconcile runs until the new files
-		# are in place. Released before the reconcile at the end. pass-reconcile.service waits up to 180 s for it.
+		# are in place. Released before the reconcile at the end. pass-reconcile.service waits up to 195 s for it.
 		exec 9>>/var/lib/sparkpass/lock
 		flock -w 60 9 || die "the sparkpass lock is busy (a grant, a revoke or a reconcile runs); run this script again"
 		# The first reconcile of the new build revokes a lease that it cannot match to the token file.
