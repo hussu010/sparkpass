@@ -63,8 +63,9 @@ expect() { # <want> <method> <path> [curl arguments]
 # The routes of the pass (the exact match of gateway/Caddyfile), then other routes that a guest can try:
 # other methods and paths under /v1 (some change state that the next guest sees: a LoRA load, a stored
 # response), another case, and paths outside /v1.
-allowed=("GET /v1/models" "POST /v1/chat/completions" "POST /v1/completions")
+allowed=("GET /v1/models" "POST /v1/chat/completions" "POST /v1/completions" "POST /v1/messages")
 denied=("GET /v1/chat/completions" "POST /v1/models" "POST /v1/embeddings" "POST /v1/responses"
+	"GET /v1/messages" "POST /v1/messages/count_tokens"
 	"POST /v1/load_lora_adapter" "GET /v1/models/x" "GET /V1/models"
 	"POST /invocations" "POST /tokenize" "GET /metrics" "GET /" "GET /other")
 paths=("${allowed[@]}" "${denied[@]}")
@@ -147,6 +148,8 @@ case="active rule"
 rule=$(lease_rule bob "$token")$'\n'
 load "$rule"
 for p in "${allowed[@]}"; do expect 200 "${p% *}" "${p#* }" -H "$key"; done
+# The URL of Claude Code: the route allowlist matches the path, with no query.
+expect 200 POST "/v1/messages?beta=true" -H "$key"
 for p in "${denied[@]}"; do
 	expect 404 "${p% *}" "${p#* }" -H "$key"
 	# Only the gateway's own 404 has no body: a 404 of the model server means the route reached it.

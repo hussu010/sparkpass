@@ -15,13 +15,13 @@ LOCK=$STATE/lock
 NAME=expiry-test
 BOUND=15     # seconds after the end time: the stream ends and the key gets 401
 LOCK_HOLD=40 # seconds: in step 3 a different process holds the lock across the end time (eng review D8)
-# Each "every path" check. The first three are the routes of the pass. On each other route the key gets
+# Each "every path" check. The first four are the routes of the pass. On each other route the key gets
 # the 404 of the gateway (the route allowlist of gateway/Caddyfile): other routes of the model server can
 # change state that the next guest sees.
-EVERY=("GET /v1/models" "POST /v1/chat/completions" "POST /v1/completions"
+EVERY=("GET /v1/models" "POST /v1/chat/completions" "POST /v1/completions" "POST /v1/messages"
   "GET /v1/chat/completions" "POST /v1/models" "POST /v1/embeddings" "POST /v1/responses"
   "POST /v1/load_lora_adapter" "POST /invocations" "POST /tokenize" "GET /metrics" "GET /health")
-DENIED=("${EVERY[@]:3}")
+DENIED=("${EVERY[@]:4}")
 
 usage() {
   cat <<'EOF'
@@ -49,7 +49,7 @@ Steps:
      lease and no end timer stay.
   6  a summary.
 "Every path": the routes of the pass (GET /v1/models, POST /v1/chat/completions,
-POST /v1/completions), then GET /v1/chat/completions, POST /v1/models,
+POST /v1/completions, POST /v1/messages), then GET /v1/chat/completions, POST /v1/models,
 POST /v1/embeddings, POST /v1/responses, POST /v1/load_lora_adapter,
 POST /invocations, POST /tokenize, GET /metrics, GET /health.
 

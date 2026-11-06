@@ -322,7 +322,7 @@ Model:    {model}
 End time: {}
 
 Rules:
-- Routes: GET /v1/models, POST /v1/chat/completions and POST /v1/completions only; each other route gets 404.
+- Routes: GET /v1/models, POST /v1/chat/completions, POST /v1/completions and POST /v1/messages only; each other route gets 404.
 - The end time does not move. A model failure or a restart of the host adds no time.
 - At the end time the key stops, and open requests close.
 - Prompts and completions are not logged. The model server can hold recent prompts in its memory until it restarts.
@@ -332,9 +332,11 @@ Rules:
 
 Tips:
 - Long prompts or long answers: send \"stream\": true. A request that is not streamed gets its answer only at the end, and the gateway stops a very long wait with 504.
-- A thinking model answers slower. For a short answer, send \"reasoning_effort\": \"low\" (GLM) or \"chat_template_kwargs\": {{\"enable_thinking\": false}} (Qwen).",
+- GLM thinks only when a request asks for it: for a hard task, send \"reasoning_effort\": \"low\", \"medium\" or \"high\". Qwen thinks unless told: for a short answer, send \"chat_template_kwargs\": {{\"enable_thinking\": false}}.
+- Claude Code: set ANTHROPIC_BASE_URL={}, ANTHROPIC_AUTH_TOKEN=<API key> and ANTHROPIC_MODEL={model}. Not ANTHROPIC_API_KEY: the gateway reads the key from the Authorization header only.",
         settings.public_url,
-        format_utc(deadline)
+        format_utc(deadline),
+        settings.public_url
     )
 }
 
@@ -463,7 +465,7 @@ mod tests {
         for part in [
             "Endpoint: https://spark.example.net/v1\n",
             // The routes of @sparkpass_route in gateway/Caddyfile (routes_of_the_pass_text_are_the_routes_of_the_caddyfile).
-            "\n- Routes: GET /v1/models, POST /v1/chat/completions and POST /v1/completions only; each other route gets 404.\n",
+            "\n- Routes: GET /v1/models, POST /v1/chat/completions, POST /v1/completions and POST /v1/messages only; each other route gets 404.\n",
             &format!("API key:  {token}\n"),
             "Model:    test-model\n",
             "End time: 2024-02-29 12:39:56 UTC\n",
@@ -479,9 +481,16 @@ mod tests {
             "The Tailscale service on the host can log your IP address for a connection that arrives while the gateway restarts or is stopped.",
             "no unlawful use, no attack on other systems, and no resale",
             // Tips for long and thinking requests (2026-10-18): a request that is not streamed waits for the response
-            // header limit of gateway/Caddyfile; GLM thinks at reasoning_effort "max" unless told otherwise.
+            // header limit of gateway/Caddyfile. The boot model (TensorFold recipe 1104, 2026-11-05) thinks only when a
+            // request sends reasoning_effort, "low" included (measured on the pair).
+            // shortcut: the tip describes the TensorFold boot model; the vLLM recipe thinks at the highest effort unless
+            // told. Upgrade when the pass text takes the tips from the model profile (TODOS, "Model profiles").
             "send \"stream\": true",
-            "send \"reasoning_effort\": \"low\" (GLM) or \"chat_template_kwargs\": {\"enable_thinking\": false} (Qwen)",
+            "GLM thinks only when a request asks for it: for a hard task, send \"reasoning_effort\": \"low\", \"medium\" or \"high\".",
+            "send \"chat_template_kwargs\": {\"enable_thinking\": false}",
+            // Claude Code sends ANTHROPIC_API_KEY as x-api-key, which the token rule of the gateway does not read.
+            "Claude Code: set ANTHROPIC_BASE_URL=https://spark.example.net, ANTHROPIC_AUTH_TOKEN=<API key> and ANTHROPIC_MODEL=test-model.",
+            "Not ANTHROPIC_API_KEY",
         ] {
             assert!(pass.contains(part), "{part:?} is not in:\n{pass}");
         }
@@ -812,7 +821,7 @@ mod tests {
         proven.sort();
         assert_eq!(told, served);
         assert_eq!(proven, served, "allowed= of tests/gateway.sh");
-        assert_eq!(served.len(), 3, "{served:?}");
+        assert_eq!(served.len(), 4, "{served:?}");
     }
 
     // Added for the P1 item "Prove the gateway step on the units" (2026-10-07).
