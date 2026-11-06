@@ -106,7 +106,9 @@
 		# The routes of the pass, and no other (owner decision of 2026-10-07): other routes of the model
 		# server can change state that the next guest or the host sees (a LoRA load, a stored response, an
 		# upload). Exact method and path, case-sensitive; the path matcher of Caddy ignores case.
-		@sparkpass_route expression `({method} == "GET" && {http.request.uri.path} == "/v1/models") || ({method} == "POST" && {http.request.uri.path} in ["/v1/chat/completions", "/v1/completions"])`
+		# /v1/messages (the Anthropic API of Claude Code, owner decision of 2026-11-06) is stateless, as chat
+		# completions are; Claude Code posts to /v1/messages?beta=true, and the path has no query.
+		@sparkpass_route expression `({method} == "GET" && {http.request.uri.path} == "/v1/models") || ({method} == "POST" && {http.request.uri.path} in ["/v1/chat/completions", "/v1/completions", "/v1/messages"])`
 		reverse_proxy @sparkpass_route {$SPARKPASS_MODEL_HOST:127.0.0.1}:{$SPARKPASS_MODEL_PORT} {
 			# A frozen model server ends in an error, not a hang. 960 s, not 300: a request that is not streamed gets
 			# its header only at the end, and 4 queued GLM requests of 472k tokens end after about 916 s. A Funnel

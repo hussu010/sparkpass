@@ -4,6 +4,7 @@
   GET  /v1/models              one model, "stub-model"
   POST /v1/chat/completions    one JSON object
   POST /v1/completions         one JSON object
+  POST /v1/messages            one JSON object (the Anthropic API; a query such as ?beta=true is ignored)
   each other route             404 with a JSON body (the 404 of the gateway has no body)
 
 The stub has no failure mode. tests/gateway.sh stops the process to check the 503 of the gateway.
@@ -21,8 +22,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MODEL = "stub-model"
 
 
-def payload(chat):
-    if chat:
+def payload(path):
+    if path == "/v1/messages":
+        return {"id": "stub-1", "type": "message", "role": "assistant", "model": MODEL,
+                "content": [{"type": "text", "text": "stub"}], "stop_reason": "end_turn"}
+    if path == "/v1/chat/completions":
         kind, choice = "chat.completion", {"message": {"role": "assistant", "content": "stub"}}
     else:
         kind, choice = "text_completion", {"text": "stub "}
@@ -54,7 +58,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         # Read the body first, so that a keep-alive connection stays in step. No chunked request bodies.
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        if self.path not in ("/v1/chat/completions", "/v1/completions"):
+        path = self.path.split("?")[0]
+        if path not in ("/v1/chat/completions", "/v1/completions", "/v1/messages"):
             return self.send_json(404, {"error": "not found"})
         try:
             body = json.loads(raw or b"{}")
@@ -62,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
             body = None
         if not isinstance(body, dict):
             return self.send_json(400, {"error": "the body is not a JSON object"})
-        self.send_json(200, payload(self.path == "/v1/chat/completions"))
+        self.send_json(200, payload(path))
 
 
 def make_server(bind, port, verbose):
@@ -90,6 +95,8 @@ def self_test():
     check("chat: one JSON object", r.status == 200 and json.loads(r.read())["object"] == "chat.completion")
     r = call("POST", "/v1/completions", {"prompt": "hi"})
     check("completions: one JSON object", r.status == 200 and json.loads(r.read())["object"] == "text_completion")
+    r = call("POST", "/v1/messages?beta=true", {"messages": []})
+    check("messages: one JSON object", r.status == 200 and json.loads(r.read())["type"] == "message")
     check("400 for a body that is not a JSON object", call("POST", "/v1/completions", []).status == 400)
     r = call("GET", "/nope")
     check("404 with a body", r.status == 404 and r.read() and call("POST", "/v1/nope", {}).status == 404)
