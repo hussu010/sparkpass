@@ -132,11 +132,11 @@ routes do not work: Codex CLI (`/v1/responses`) and embeddings.
 
 The first pair boots GLM-5.3-Flash with the
 [TensorFold recipe 1104](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104) (an EXL3 4-bit checkpoint,
-one rank on each unit over the ConnectX-7 link), not with sparkrun and vLLM. Measured on the pair on 2026-11-05
-with the recipe's `docs/speed/harness/bench2.py` (greedy, thinking off): one stream 40 tokens/s for prose and 60
-for code, 86 in total for 4 streams, prefill about 1,800 tokens/s (35 s for a 64k prompt), 8 requests at the same
-time, a 1,048,576-token context, and 10 GiB free on each unit. The vLLM recipe gives about 25 tokens/s, 4 requests
-and 500k tokens. After the power cut of 2026-11-06, the boot service had the API back in 108 s.
+one rank on each unit over the ConnectX-7 link), not with sparkrun and vLLM. Measured on the pair on 2026-11-08
+with the recipe's `docs/speed/harness/bench2.py` (greedy, thinking off, `DRAFTER=mtp`): one stream 42 tokens/s for
+prose and 49 for code, 73 in total for 4 streams, prefill about 1,750 tokens/s (36 s for a 64k prompt), 8 requests
+at the same time, a 1,048,576-token context, and 10 GiB free on each unit. The vLLM recipe gives about 25
+tokens/s, 4 requests and 500k tokens. After the power cut of 2026-11-06, the boot service had the API back in 108 s.
 
 - It thinks only when a request sends `reasoning_effort`, as the tip of the pass text says. The vLLM recipe
   thinks at the highest effort unless told.
@@ -144,9 +144,10 @@ and 500k tokens. After the power cut of 2026-11-06, the boot service had the API
   guests takes about 2 minutes.
 - Its memory guard stops the model when a unit stays under 2.5 GiB free. Then nothing starts it until a reboot
   or `sudo systemctl restart sparkpass-model.service` (TODOS.md).
-- Licences: Apache 2.0 for the recipe and the engine. The default draft model (DFlash2) is CC BY-NC-ND 4.0: set
-  `DRAFTER=mtp` in its `scripts/local.sh` before a pass for commercial use (slower; not measured here). Do not
-  set `ABLIT=1` for guests.
+- Licences: Apache 2.0 for the recipe and the engine. The recipe's default draft model (DFlash2) is CC BY-NC-ND
+  4.0, so `templates/tf1104-local.sh` sets `DRAFTER=mtp`, the checkpoint's own head. Against DFlash2 on the pair
+  (2026-11-08) it gave the same text and was 2% slower for prose, 10% for code and 19% for 4 streams. Do not set
+  `ABLIT=1` for guests.
 
 On the head unit, as the user of sparkrun, with no active pass, in the repository:
 
@@ -273,4 +274,4 @@ commands and the rules for tests are in [`CLAUDE.md`](CLAUDE.md). `install.sh`, 
 The code is under the [MIT License](LICENSE). The model weights that the recipes name have their own licenses:
 NVIDIA Open Model Agreement for `templates/glm53-flash.yaml` (base model MIT), Qwen Community License 1.0 for
 `templates/pair.yaml`. The TensorFold recipe 1104 and its engine are under Apache 2.0, and its default draft
-model (DFlash2) under CC BY-NC-ND 4.0 ("The boot model: TensorFold 1104").
+model (DFlash2, off in `templates/tf1104-local.sh`) under CC BY-NC-ND 4.0 ("The boot model: TensorFold 1104").

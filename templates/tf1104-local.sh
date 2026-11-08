@@ -6,8 +6,9 @@ WORKER=spark@10.100.0.2 # <user>@<worker-cx7>: the worker on the ConnectX-7 link
 PORT=8000
 HOST=127.0.0.1
 SERVED_NAME=glm-5.3-flash
-# DFlash2 is CC BY-NC-ND 4.0: set DRAFTER=mtp (or none) before a pass for commercial use.
-DRAFTER=dflash2
+# mtp is the checkpoint's own head. The recipe's default, DFlash2, is faster with several streams, but its weights are
+# CC BY-NC-ND 4.0 (non-commercial): set DRAFTER=dflash2 only when no pass is for commercial use.
+DRAFTER=mtp
 PARALLEL=8
 CONTEXT=auto
 KV=fp8
