@@ -110,6 +110,9 @@
 		# completions are; Claude Code posts to /v1/messages?beta=true, and the path has no query.
 		@sparkpass_route expression `({method} == "GET" && {http.request.uri.path} == "/v1/models") || ({method} == "POST" && {http.request.uri.path} in ["/v1/chat/completions", "/v1/completions", "/v1/messages"])`
 		reverse_proxy @sparkpass_route {$SPARKPASS_MODEL_HOST:127.0.0.1}:{$SPARKPASS_MODEL_PORT} {
+			# The engine gets the address that Caddy dials, not the guest's Host: TensorFold answers 403 to any Host
+			# that is not a loopback name on its loopback port (its request guard).
+			header_up Host {upstream_hostport}
 			# A frozen model server ends in an error, not a hang. 960 s, not 300: a request that is not streamed gets
 			# its header only at the end, and 4 queued GLM requests of 472k tokens end after about 916 s. A Funnel
 			# relay kept a silent connection open for 960 s (the test limit, 2026-10-18).

@@ -7,7 +7,9 @@
   POST /v1/messages            one JSON object (the Anthropic API; a query such as ?beta=true is ignored)
   each other route             404 with a JSON body (the 404 of the gateway has no body)
 
-The stub has no failure mode. tests/gateway.sh stops the process to check the 503 of the gateway.
+The stub has no failure mode. tests/gateway.sh stops the process to check the 503 of the gateway. With
+--host-name NAME, a request whose Host is not NAME:<port> gets 403, as TensorFold's loopback guard refuses a
+guest's public name.
 
 Python standard library only. Runs on Python 3.9 and 3.12.
 """
@@ -49,7 +51,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def host_refused(self):
+        name = self.server.host_name
+        if name is None or self.headers.get_all("Host") == ["%s:%d" % (name, self.server.server_address[1])]:
+            return False
+        self.send_json(403, {"error": {"message": "Host header is not allowed", "type": "invalid_request_error"}})
+        return True
+
     def do_GET(self):
+        if self.host_refused():
+            return
         if self.path == "/v1/models":
             self.send_json(200, {"object": "list", "data": [{"id": MODEL, "object": "model"}]})
         else:
@@ -58,6 +69,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         # Read the body first, so that a keep-alive connection stays in step. No chunked request bodies.
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.host_refused():
+            return
         path = self.path.split("?")[0]
         if path not in ("/v1/chat/completions", "/v1/completions", "/v1/messages"):
             return self.send_json(404, {"error": "not found"})
@@ -70,9 +83,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, payload(path))
 
 
-def make_server(bind, port, verbose):
+def make_server(bind, port, verbose, host_name=None):
     srv = ThreadingHTTPServer((bind, port), Handler)
     srv.verbose = verbose
+    srv.host_name = host_name
     return srv
 
 
@@ -80,9 +94,12 @@ def self_test():
     srv = make_server("127.0.0.1", 0, False)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-    def call(method, path, body=None):
-        conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
-        conn.request(method, path, None if body is None else json.dumps(body), {"Connection": "close"})
+    def call(method, path, body=None, server=srv, host=None):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        headers = {"Connection": "close"}
+        if host:
+            headers["Host"] = host
+        conn.request(method, path, None if body is None else json.dumps(body), headers)
         return conn.getresponse()
 
     def check(name, ok):
@@ -100,6 +117,12 @@ def self_test():
     check("400 for a body that is not a JSON object", call("POST", "/v1/completions", []).status == 400)
     r = call("GET", "/nope")
     check("404 with a body", r.status == 404 and r.read() and call("POST", "/v1/nope", {}).status == 404)
+    guarded = make_server("127.0.0.1", 0, False, host_name="127.0.0.1")
+    threading.Thread(target=guarded.serve_forever, daemon=True).start()
+    check("--host-name: its own address", call("GET", "/v1/models", server=guarded).status == 200)
+    check("--host-name: 403 for another Host", call("GET", "/v1/models", server=guarded, host="localhost:8443").status == 403
+          and call("POST", "/v1/messages", {}, server=guarded, host="localhost:8443").status == 403)
+    guarded.shutdown()
     srv.shutdown()
     print("self-test ok")
 
@@ -109,11 +132,12 @@ def main():
     p.add_argument("--bind", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--verbose", action="store_true", help="log each request to stderr")
+    p.add_argument("--host-name", help="answer 403 to a request whose Host is not NAME:<port>")
     p.add_argument("--self-test", action="store_true", help="run the built-in checks and exit")
     args = p.parse_args()
     if args.self_test:
         return self_test()
-    srv = make_server(args.bind, args.port, args.verbose)
+    srv = make_server(args.bind, args.port, args.verbose, args.host_name)
     print("stub-model: http://%s:%d/v1" % (args.bind, srv.server_address[1]), flush=True)
     try:
         srv.serve_forever()
