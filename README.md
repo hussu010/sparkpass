@@ -155,7 +155,7 @@ On the head unit, as the user of sparkrun, with no active pass, in the repositor
 
    ```bash
    git clone https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104 ~/GLM-5.3-Flash-DGX-Sparks-1104
-   git -C ~/GLM-5.3-Flash-DGX-Sparks-1104 checkout 0049d7c9fb41958bbaa577b7a3d8e93e4454cb34
+   git -C ~/GLM-5.3-Flash-DGX-Sparks-1104 checkout 13f2464ee84ab2b5dabf0bb264d1144b02cf5fb7
    cp templates/tf1104-local.sh ~/GLM-5.3-Flash-DGX-Sparks-1104/scripts/local.sh   # then set WORKER in it
    ```
 
