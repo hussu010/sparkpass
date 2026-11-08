@@ -86,7 +86,8 @@ refused_cases() { # on each path: no header, a wrong key, an empty bearer, lower
 	on_each_path 401 -H "Authorization: Bearer ${token}0"
 }
 
-python3 "$repo/tests/stub-model.py" --bind 0.0.0.0 --port 0 >"$work/stub.out" 2>&1 &
+# --host-name: the stub accepts only the address that Caddy dials, as TensorFold accepts only a loopback Host.
+python3 "$repo/tests/stub-model.py" --bind 0.0.0.0 --port 0 --host-name host.docker.internal >"$work/stub.out" 2>&1 &
 stub_pid=$!
 mkdir "$work/etc"
 deny_all >"$work/etc/token.caddy"
